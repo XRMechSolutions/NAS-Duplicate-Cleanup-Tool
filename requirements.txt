@@ -1,0 +1,28 @@
+# DupliCleaner - Core Dependencies
+# Install with: pip install -r requirements.txt
+
+# UI Framework
+dearpygui>=1.11.0
+
+# Image Processing
+pillow>=10.0.0
+imagehash>=4.3.0
+
+# Fast Hashing
+xxhash>=3.4.0
+
+# Metadata Extraction
+exifread>=3.0.0
+python-dateutil>=2.8.0
+
+# Geocoding
+geopy>=2.4.0
+
+# File Operations
+send2trash>=1.8.0
+
+# Version Tracking
+gitpython>=3.1.0
+
+# Video Processing (optional, for video deduplication)
+# ffmpeg-python>=0.2.0

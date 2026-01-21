@@ -1,0 +1,13 @@
+{
+  "groups_affected": 1,
+  "files_to_keep": 1,
+  "files_to_remove": 2,
+  "space_to_recover": 8,
+  "keeper_basenames": [
+    "a.bin"
+  ],
+  "remove_basenames": [
+    "b.bin",
+    "c.bin"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "total_files": 4,
+  "files_to_move": 4,
+  "files_to_rename": 4,
+  "folders_to_create": 2,
+  "folders": {
+    "2020/01-January": 2,
+    "2022/08-August": 2
+  }
+}

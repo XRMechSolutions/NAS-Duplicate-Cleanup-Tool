@@ -1,0 +1,28 @@
+# DupliCleaner - AI/ML Dependencies (Optional)
+# Install with: pip install -r requirements-ai.txt
+# Requires NVIDIA GPU with CUDA support for best performance
+
+# PyTorch (install first, may need specific CUDA version)
+# See: https://pytorch.org/get-started/locally/
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Face Recognition
+insightface>=0.7.0
+onnxruntime-gpu>=1.16.0  # Use onnxruntime for CPU-only
+
+# Scene Classification & Semantic Search
+open-clip-torch>=2.20.0
+
+# Object Detection
+ultralytics>=8.0.0
+
+# OCR
+easyocr>=1.7.0
+
+# Clustering & ML utilities
+scikit-learn>=1.3.0
+numpy>=1.24.0
+
+# OpenCV (required by insightface)
+opencv-python>=4.8.0

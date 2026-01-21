@@ -1,0 +1,12 @@
+[run]
+branch = True
+source = duplicleaner
+
+[report]
+show_missing = True
+skip_covered = True
+omit =
+    tests/*
+    */__main__.py
+    */ui/*
+    */ai/*
