@@ -418,19 +418,33 @@ class DriveManager:
         Returns:
             Unique ID string
         """
-        if is_unc_path(path):
+        normalized = normalize_path(path)
+        if is_unc_path(normalized):
             # For network drives, use normalized path as ID
-            normalized = normalize_path(path).lower()
-            return f"net_{hash(normalized) & 0xFFFFFFFF:08x}"
-        else:
-            # For local drives, try to get volume serial number
-            if os.name == 'nt':
-                serial = self._get_volume_serial(path)
-                if serial:
-                    return f"vol_{serial:08x}"
+            return f"net_{hash(normalized.lower()) & 0xFFFFFFFF:08x}"
 
-            # Fallback to path-based ID
-            return f"loc_{hash(path) & 0xFFFFFFFF:08x}"
+        # For local drives, try to get volume serial number
+        serial: Optional[int] = None
+        if os.name == 'nt':
+            serial = self._get_volume_serial(normalized)
+
+        # Root paths stay volume-based; subfolders get a unique path suffix
+        if serial is not None:
+            if self._is_root_path(normalized):
+                return f"vol_{serial:08x}"
+            path_hash = hash(normalized.lower()) & 0xFFFFFFFF
+            return f"vol_{serial:08x}_{path_hash:08x}"
+
+        # Fallback to path-based ID
+        return f"loc_{hash(normalized.lower()) & 0xFFFFFFFF:08x}"
+
+    def _is_root_path(self, path: str) -> bool:
+        """Return True if the path is a root drive path."""
+        normalized = normalize_path(path)
+        if os.name == 'nt':
+            if len(normalized) >= 2 and normalized[1] == ":":
+                return normalized.rstrip("\\") == normalized[:2]
+        return normalized == normalized.rstrip("\\/")
 
     def _get_volume_serial(self, path: str) -> Optional[int]:
         """Get the volume serial number for a Windows drive.

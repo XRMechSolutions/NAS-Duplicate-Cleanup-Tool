@@ -64,7 +64,6 @@ class ScreenshotHandling(Enum):
 
     MIX = "mix"  # Mix with regular photos
     SEPARATE = "separate"  # Separate folder
-    SEPARATE_BY_APP = "separate_by_app"  # Group by source app
 
 
 class BurstHandling(Enum):
@@ -141,6 +140,8 @@ class OrganizeResult:
     date_source: Optional[str] = None  # "exif", "file", "undated"
     location: Optional[str] = None
     event_name: Optional[str] = None
+    burst_group: Optional[int] = None  # Burst group ID if part of a burst
+    is_live_photo: bool = False  # True if this is part of a Live Photo pair
 
 
 @dataclass
@@ -152,6 +153,8 @@ class OrganizePreview:
     files_to_rename: int = 0
     files_to_skip: int = 0
     folders_to_create: int = 0
+    bursts_detected: int = 0  # Number of burst groups found
+    live_photos_detected: int = 0  # Number of Live Photo pairs found
     changes: list[OrganizeResult] = field(default_factory=list)
     folders: dict[str, int] = field(default_factory=dict)  # folder -> count
     errors: list[str] = field(default_factory=list)
@@ -287,6 +290,9 @@ class Organizer:
             try:
                 with open(file_path, 'rb') as f:
                     tags = exifread.process_file(f, details=False)
+                if not tags:
+                    ext = Path(file_path).suffix.lower() or "no extension"
+                    logger.warning("EXIF format not recognized for %s (%s)", file_path, ext)
 
                 for tag in ['EXIF DateTimeOriginal', 'EXIF DateTimeDigitized', 'Image DateTime']:
                     if tag in tags:
@@ -357,6 +363,9 @@ class Organizer:
         try:
             with open(file_path, 'rb') as f:
                 tags = exifread.process_file(f, details=False)
+            if not tags:
+                ext = Path(file_path).suffix.lower() or "no extension"
+                logger.warning("EXIF format not recognized for %s (%s)", file_path, ext)
 
             lat = tags.get('GPS GPSLatitude')
             lat_ref = tags.get('GPS GPSLatitudeRef')
@@ -570,6 +579,54 @@ class Organizer:
 
         return events
 
+    def detect_live_photos(
+        self,
+        files: list[str]
+    ) -> list[tuple[str, str]]:
+        """Detect Live Photo pairs (matching image + video files).
+
+        iPhone Live Photos consist of a HEIC/JPG image with a matching MOV video.
+        They share the same base filename and are created within milliseconds.
+
+        Args:
+            files: List of file paths
+
+        Returns:
+            List of (image_path, video_path) tuples for each Live Photo pair
+        """
+        # Group files by base name (without extension)
+        by_stem: dict[str, list[str]] = {}
+        for path in files:
+            p = Path(path)
+            stem = p.stem.lower()
+            if stem not in by_stem:
+                by_stem[stem] = []
+            by_stem[stem].append(path)
+
+        live_photos = []
+        image_exts = {'.jpg', '.jpeg', '.heic', '.heif', '.png'}
+        video_exts = {'.mov', '.mp4'}
+
+        for stem, paths in by_stem.items():
+            if len(paths) < 2:
+                continue
+
+            # Find image and video pairs
+            images = [p for p in paths if Path(p).suffix.lower() in image_exts]
+            videos = [p for p in paths if Path(p).suffix.lower() in video_exts]
+
+            if images and videos:
+                # Check if they're in the same folder and likely taken together
+                for img in images:
+                    img_path = Path(img)
+                    for vid in videos:
+                        vid_path = Path(vid)
+                        if img_path.parent == vid_path.parent:
+                            live_photos.append((img, vid))
+                            break
+
+        return live_photos
+
     def generate_folder_path(
         self,
         date: datetime,
@@ -716,6 +773,27 @@ class Organizer:
             dated_files = [(p, d) for p, d, s in files_with_dates if d != datetime.min]
             events = self.detect_events(dated_files)
 
+        # Detect bursts
+        burst_map: dict[str, int] = {}  # file_path -> burst_group_id
+        if self.settings.burst_handling != BurstHandling.KEEP_ALL:
+            dated_files = [(p, d) for p, d, s in files_with_dates if d != datetime.min]
+            bursts = self.detect_bursts(dated_files)
+            preview.bursts_detected = len(bursts)
+            for group_id, burst_files in enumerate(bursts, start=1):
+                for path in burst_files:
+                    burst_map[path] = group_id
+
+        # Detect live photos
+        live_photo_videos: set[str] = set()  # video paths that are part of Live Photos
+        live_photo_images: set[str] = set()  # image paths that are part of Live Photos
+        if self.settings.live_photo_handling != LivePhotoHandling.KEEP_TOGETHER:
+            all_paths = [p for p, d, s in files_with_dates]
+            live_photos = self.detect_live_photos(all_paths)
+            preview.live_photos_detected = len(live_photos)
+            for img_path, vid_path in live_photos:
+                live_photo_images.add(img_path)
+                live_photo_videos.add(vid_path)
+
         # Process each file
         folder_sequences: dict[str, int] = {}
         folders_to_create: set[str] = set()
@@ -754,6 +832,18 @@ class Organizer:
                 if self.is_screenshot(file_path):
                     folder = "Screenshots/" + folder
 
+            # Handle burst photos
+            burst_group = burst_map.get(file_path)
+            if burst_group is not None:
+                if self.settings.burst_handling == BurstHandling.SUBFOLDER:
+                    folder = f"{folder}/Burst_{burst_group:03d}"
+
+            # Handle Live Photo videos
+            is_live_photo = file_path in live_photo_videos or file_path in live_photo_images
+            if file_path in live_photo_videos:
+                if self.settings.live_photo_handling == LivePhotoHandling.VIDEO_SUBFOLDER:
+                    folder = f"{folder}/LivePhoto_Videos"
+
             # Generate sequence number
             if folder not in folder_sequences:
                 folder_sequences[folder] = 0
@@ -783,7 +873,9 @@ class Organizer:
                 action="move" if self.settings.move_files else "copy",
                 date_source=date_source,
                 location=location,
-                event_name=event_name
+                event_name=event_name,
+                burst_group=burst_group,
+                is_live_photo=is_live_photo,
             )
             preview.changes.append(result)
 
@@ -841,7 +933,9 @@ class Organizer:
                     action="dry_run",
                     date_source=change.date_source,
                     location=change.location,
-                    event_name=change.event_name
+                    event_name=change.event_name,
+                    burst_group=change.burst_group,
+                    is_live_photo=change.is_live_photo,
                 )
                 results.append(result)
                 self.progress.successful += 1
@@ -890,7 +984,9 @@ class Organizer:
                     metadata=json.dumps({
                         "date_source": change.date_source,
                         "location": change.location,
-                        "event": change.event_name
+                        "event": change.event_name,
+                        "burst_group": change.burst_group,
+                        "is_live_photo": change.is_live_photo,
                     })
                 ))
 
@@ -901,7 +997,9 @@ class Organizer:
                     action=action,
                     date_source=change.date_source,
                     location=change.location,
-                    event_name=change.event_name
+                    event_name=change.event_name,
+                    burst_group=change.burst_group,
+                    is_live_photo=change.is_live_photo,
                 )
                 results.append(result)
                 self.progress.successful += 1

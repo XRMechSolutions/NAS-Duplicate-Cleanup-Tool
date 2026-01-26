@@ -67,6 +67,14 @@ class ExclusionCandidate:
     total_size: int
 
 
+@dataclass
+class ProjectDetection:
+    """Detected project type and suggested exclusions."""
+    name: str
+    markers: list[str]
+    suggested_excludes: list[str]
+
+
 class RedundancyChecker:
     """Compute redundancy reports and backup plans."""
 
@@ -81,8 +89,6 @@ class RedundancyChecker:
     def build_report(self, limit: int = 1000) -> RedundancyReport:
         """Build redundancy report for hashed files."""
         groups = self.db.get_content_hash_groups(min_drives=1, limit=limit)
-        total_groups = len(groups)
-
         at_risk_groups: list[AtRiskGroup] = []
         redundant_groups: list[HashGroup] = []
         at_risk_files = 0
@@ -112,7 +118,7 @@ class RedundancyChecker:
                     )
                 )
 
-        total_hashed_files = sum(g[2] for g in groups)
+        total_hashed_files, total_groups, at_risk_files, at_risk_size = self._compute_totals()
 
         return RedundancyReport(
             total_hashed_files=total_hashed_files,
@@ -122,6 +128,44 @@ class RedundancyChecker:
             at_risk_files=at_risk_files,
             at_risk_size_bytes=at_risk_size,
         )
+
+    def _compute_totals(self) -> tuple[int, int, int, int]:
+        """Compute overall redundancy totals without sampling limits."""
+        with self.db.connection() as conn:
+            total_hashed_files = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL AND is_deleted = FALSE"
+                ).fetchone()[0]
+            )
+            total_groups = int(
+                conn.execute(
+                    "SELECT COUNT(DISTINCT content_hash) FROM files "
+                    "WHERE content_hash IS NOT NULL AND is_deleted = FALSE"
+                ).fetchone()[0]
+            )
+            at_risk_files = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM files
+                       WHERE content_hash IN (
+                           SELECT content_hash FROM files
+                           WHERE content_hash IS NOT NULL AND is_deleted = FALSE
+                           GROUP BY content_hash
+                           HAVING COUNT(DISTINCT drive_id) = 1
+                       ) AND is_deleted = FALSE"""
+                ).fetchone()[0]
+            )
+            at_risk_size = int(
+                conn.execute(
+                    """SELECT COALESCE(SUM(size), 0) FROM files
+                       WHERE content_hash IN (
+                           SELECT content_hash FROM files
+                           WHERE content_hash IS NOT NULL AND is_deleted = FALSE
+                           GROUP BY content_hash
+                           HAVING COUNT(DISTINCT drive_id) = 1
+                       ) AND is_deleted = FALSE"""
+                ).fetchone()[0]
+            )
+        return total_hashed_files, total_groups, at_risk_files, at_risk_size
 
     def build_backup_plan(
         self,
@@ -251,6 +295,126 @@ class RedundancyChecker:
         candidates.sort(key=lambda c: c.total_size, reverse=True)
         return candidates
 
+    def detect_project_types(self, source_path: str) -> list[ProjectDetection]:
+        """Detect project types under a source path."""
+        source_drive = self._resolve_drive_for_path(source_path)
+        if not source_drive:
+            return []
+
+        source_root = normalize_path(source_path)
+        detections: list[ProjectDetection] = []
+
+        project_markers: dict[str, list[str]] = {
+            "Unity": [
+                "\\Assets\\",
+                "\\ProjectSettings\\",
+                "\\Packages\\",
+            ],
+            "Unreal Engine": [
+                "\\Content\\",
+                "\\Config\\",
+                "\\Source\\",
+                "\\*.uproject",
+            ],
+            "Android/Gradle": [
+                "\\build.gradle",
+                "\\settings.gradle",
+                "\\gradlew",
+                "\\app\\src\\",
+            ],
+            "Node.js": [
+                "\\package.json",
+                "\\package-lock.json",
+                "\\yarn.lock",
+                "\\pnpm-lock.yaml",
+            ],
+            ".NET": [
+                "\\*.sln",
+                "\\*.csproj",
+                "\\*.fsproj",
+                "\\*.vbproj",
+            ],
+            "Python": [
+                "\\pyproject.toml",
+                "\\requirements.txt",
+                "\\setup.py",
+                "\\Pipfile",
+            ],
+            "CMake/C++": [
+                "\\CMakeLists.txt",
+            ],
+        }
+
+        suggested_excludes: dict[str, list[str]] = {
+            "Unity": [
+                "*/Library/*",
+                "*/Temp/*",
+                "*/Obj/*",
+                "*/Build/*",
+                "*/Builds/*",
+                "*/Logs/*",
+            ],
+            "Unreal Engine": [
+                "*/Binaries/*",
+                "*/Intermediate/*",
+                "*/DerivedDataCache/*",
+                "*/Saved/*",
+            ],
+            "Android/Gradle": [
+                "*/.gradle/*",
+                "*/build/*",
+                "*/.idea/*",
+            ],
+            "Node.js": [
+                "*/node_modules/*",
+                "*/dist/*",
+                "*/build/*",
+                "*/.next/*",
+                "*/.cache/*",
+            ],
+            ".NET": [
+                "*/bin/*",
+                "*/obj/*",
+                "*/.vs/*",
+            ],
+            "Python": [
+                "*/.venv/*",
+                "*/venv/*",
+                "*/__pycache__/*",
+                "*/.pytest_cache/*",
+            ],
+            "CMake/C++": [
+                "*/build/*",
+                "*/CMakeFiles/*",
+            ],
+        }
+
+        for name, markers in project_markers.items():
+            found_markers: list[str] = []
+            for marker in markers:
+                like_pattern = self._marker_to_like(source_root, marker)
+                count, _ = self.db.get_path_stats_like(like_pattern, drive_id=source_drive.id)
+                if count > 0:
+                    found_markers.append(marker)
+
+            if found_markers:
+                detections.append(ProjectDetection(
+                    name=name,
+                    markers=found_markers,
+                    suggested_excludes=suggested_excludes.get(name, []),
+                ))
+
+        return detections
+
+    def get_project_exclusion_suggestions(self, source_path: str) -> list[str]:
+        """Get suggested exclusion patterns based on detected projects."""
+        suggestions: list[str] = []
+        for detection in self.detect_project_types(source_path):
+            for pattern in detection.suggested_excludes:
+                if pattern not in suggestions:
+                    suggestions.append(pattern)
+        return suggestions
+
     def _safe_relpath(self, path: str, root: str, fallback_name: str) -> str:
         """Compute relative path, falling back to filename on error."""
         try:
@@ -277,3 +441,11 @@ class RedundancyChecker:
             if fnmatch.fnmatch(normalized, pattern.replace("\\", "/")):
                 return True
         return False
+
+    def _marker_to_like(self, source_root: str, marker: str) -> str:
+        """Convert a marker into a LIKE pattern for DB path matching."""
+        marker = marker.replace("/", "\\")
+        if marker.startswith("\\"):
+            marker = marker[1:]
+        marker = marker.replace("*", "%")
+        return f"{source_root}%\\{marker}"

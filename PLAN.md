@@ -44,8 +44,8 @@
 +------------------------------------------------------------------+
 |                        Dear PyGui UI                              |
 |  +------------+  +------------+  +------------+  +------------+   |
-|  |   Drives   |  |   Scan     |  | Duplicates |  |  Organize  |   |
-|  |   Panel    |  |   Progress |  |   Review   |  |   Photos   |   |
+|  |   Drives   |  |   Scan     |  | Duplicates |  |   Photos   |   |
+|  |   Panel    |  |   Progress |  |   Review   |  |  Organizer |   |
 |  +------------+  +------------+  +------------+  +------------+   |
 |  +------------+  +------------+  +------------+  +------------+   |
 |  |   Faces    |  |   Search   |  |  Settings  |  |   Actions  |   |
@@ -462,7 +462,7 @@ CREATE INDEX idx_metadata_date ON file_metadata(exif_date);
 ### Main Window Layout
 ```
 +------------------------------------------------------------------+
-|  [Drives] [Scan] [Duplicates] [Organize] [Faces] [Search]        |
+|  [Drives] [Scan] [Duplicates] [Photos] [Faces] [Search]          |
 +------------------------------------------------------------------+
 |                                                                   |
 |  +------------------+  +--------------------------------------+   |
@@ -503,13 +503,14 @@ CREATE INDEX idx_metadata_date ON file_metadata(exif_date);
 - Bulk actions: keep newest, keep on drive X, etc.
 - Filter: exact only, images only, videos only, by drive
 
-#### 4. Organize Panel
+#### 4. Photo Organizer Panel (Photos tab)
 - Preview of proposed organization
-- Source folder selection
-- Destination folder selection
-- Organization options (date format, etc.)
-- Before/after tree view
+- Source folder selection (unorganized photos)
+- Destination folder selection (organized output)
+- Organization options (date format, location, event clustering)
+- Before/after folder tree view
 - Execute button with dry-run option
+- Handles screenshots, bursts, and Live Photos
 
 #### 5. Faces Gallery
 - Grid of detected faces
@@ -664,7 +665,7 @@ nas_dedup/
 │   │   │   ├── drives_panel.py
 │   │   │   ├── scan_panel.py
 │   │   │   ├── duplicates_panel.py
-│   │   │   ├── organize_panel.py
+│   │   │   ├── organize_panel.py # Photo Organizer (Photos tab)
 │   │   │   ├── faces_panel.py
 │   │   │   ├── search_panel.py
 │   │   │   ├── settings_panel.py
@@ -722,6 +723,27 @@ nas_dedup/
 - Corrupted images (can't extract EXIF/hash)
 - AI model inference failures
 - Database corruption recovery
+
+---
+
+## Implementation Gaps (Current vs Plan)
+
+The following items are planned in this document but are not fully implemented yet
+or are partially wired in the UI:
+
+### UI Wired But Missing Backend
+- **Full Analysis button** in Drives panel runs scan + hash only; does not trigger AI analysis pipeline.
+- **Google AI summaries** listed as provider in config/UI but no key UI or backend implementation.
+
+### Planned Features Not Implemented
+- **CLI commands** for `organize`, `analyze`, `search`, and `faces train` are stubs.
+- **Quality scoring pipeline** exists but is not executed; “keep best quality” falls back to file size.
+- **Thumbnail generation/caching** schema exists but no generator or UI integration.
+- **Auto-tagging** tables exist but no tagging pipeline populates `tags` / `file_tags`.
+- **Video analysis/dedup** (frame extraction + similarity) not implemented.
+- **Settings storage** planned for SQLite; current implementation persists config to JSON.
+- **Drive manager filter/sorting UI** and **notifications** are not implemented.
+- **Action log cleanup UI** and **quarantine browser** are placeholders.
 
 ### Security
 - No execution of files

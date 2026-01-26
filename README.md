@@ -108,6 +108,14 @@ pip install -r requirements.txt
 # Install AI dependencies (optional, for face/scene recognition)
 pip install -r requirements-ai.txt
 
+# GPU setup (optional)
+# 1) Check CUDA version
+nvidia-smi
+# 2) Install CUDA-enabled PyTorch (example for CUDA 12.1)
+pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# 3) Install ONNX Runtime GPU (for InsightFace GPU)
+pip install onnxruntime-gpu
+
 # Run the application
 python -m duplicleaner
 ```

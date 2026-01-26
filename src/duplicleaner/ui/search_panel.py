@@ -5,18 +5,28 @@ Dear PyGui UI component for semantic and text-based search.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import dearpygui.dearpygui as dpg
+
+try:
+    from PIL import Image
+    import numpy as np
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 from duplicleaner.ai.scenes import SceneClassifier, SearchResult
 from duplicleaner.db.database import get_database
 from duplicleaner.db.models import FileRecord
 from duplicleaner.utils.logging import get_logger
+from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
@@ -46,6 +56,28 @@ class SearchPanel:
     TAG_ENABLE_SEMANTIC = "search_enable_semantic"
     TAG_ENABLE_TEXT = "search_enable_text"
     TAG_LIMIT = "search_limit"
+    TAG_SORT_BY = "search_sort_by"
+    TAG_RESULTS_CONTAINER = "search_results_container"
+    TAG_PREVIEW_DIALOG = "search_preview_dialog"
+    TAG_PREVIEW_IMAGE = "search_preview_image"
+    TAG_PREVIEW_INFO = "search_preview_info"
+    TAG_TEXTURE_REGISTRY = "search_texture_registry"
+
+    # Image file extensions for preview
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+
+    # Thumbnail size for results list
+    THUMBNAIL_SIZE = 60
+
+    # Preview dialog image size
+    PREVIEW_SIZE = 500
+
+    # Maximum texture cache size (LRU eviction when exceeded)
+    MAX_TEXTURE_CACHE = 100
+
+    # Tags for buttons that need state management
+    TAG_SEARCH_BUTTON = "search_search_button"
+    TAG_CLEAR_BUTTON = "search_clear_button"
 
     def __init__(self, parent: int | str, on_status_update: Optional[Callable[[str], None]] = None):
         """Initialize search panel."""
@@ -55,6 +87,21 @@ class SearchPanel:
 
         self._scene_classifier: Optional[SceneClassifier] = None
         self._search_thread: Optional[threading.Thread] = None
+
+        # Current results and state
+        self._current_results: list[SearchItem] = []
+        self._selected_result_ids: set[int] = set()
+        self._result_checkbox_tags: dict[int, str] = {}
+
+        # Texture cache for image previews (with LRU tracking)
+        self._texture_cache: dict[str, str] = {}
+        self._texture_lru: list[str] = []  # Track access order for LRU eviction
+        self._texture_counter = 0
+        self._preview_texture_tag: Optional[str] = None
+        self._preview_file_path: Optional[str] = None
+
+        # Operation state
+        self._search_in_progress = False
 
         self._build_ui()
 
@@ -68,7 +115,7 @@ class SearchPanel:
     def _build_ui(self) -> None:
         """Build the search panel UI."""
         with dpg.child_window(parent=self.parent, tag=self.TAG_PANEL, autosize_x=True, autosize_y=True):
-            dpg.add_text("Semantic Search", color=(150, 200, 255))
+            dpg.add_text("Semantic Search", color=get_accent_color())
             dpg.add_separator()
             dpg.add_spacer(height=5)
 
@@ -78,9 +125,11 @@ class SearchPanel:
                     tag=self.TAG_QUERY,
                     width=520,
                     hint="Search photos, scenes, or text...",
+                    on_enter=True,
+                    callback=self._on_search,
                 )
-                dpg.add_button(label="Search", callback=self._on_search)
-                dpg.add_button(label="Clear", callback=self._on_clear)
+                dpg.add_button(label="Search", tag=self.TAG_SEARCH_BUTTON, callback=self._on_search)
+                dpg.add_button(label="Clear", tag=self.TAG_CLEAR_BUTTON, callback=self._on_clear)
 
             dpg.add_spacer(height=5)
 
@@ -99,6 +148,15 @@ class SearchPanel:
                 dpg.add_spacer(width=20)
                 dpg.add_text("Limit:")
                 dpg.add_input_int(tag=self.TAG_LIMIT, default_value=200, min_value=10, max_value=5000, width=80)
+                dpg.add_spacer(width=20)
+                dpg.add_text("Sort:")
+                dpg.add_combo(
+                    tag=self.TAG_SORT_BY,
+                    items=["Relevance", "Date (Newest)", "Date (Oldest)", "Size (Largest)", "Size (Smallest)", "Name"],
+                    default_value="Relevance",
+                    width=130,
+                    callback=self._on_sort_change,
+                )
 
             dpg.add_spacer(height=10)
 
@@ -121,29 +179,25 @@ class SearchPanel:
 
             dpg.add_spacer(height=10)
 
-            dpg.add_text("Enter a query to search your library.", tag=self.TAG_STATUS_TEXT, color=(150, 150, 150))
+            # Status and selection controls
+            with dpg.group(horizontal=True):
+                dpg.add_text("Enter a query to search your library.", tag=self.TAG_STATUS_TEXT, color=get_text_color("disabled"))
+                dpg.add_spacer(width=20)
+                dpg.add_button(label="Select All", callback=self._select_all_results, small=True)
+                dpg.add_button(label="Select None", callback=self._deselect_all_results, small=True)
+
             dpg.add_spacer(height=5)
 
-            # Results table
-            with dpg.child_window(height=420, border=True):
-                with dpg.table(
-                    tag=self.TAG_RESULTS_TABLE,
-                    header_row=True,
-                    borders_innerH=True,
-                    borders_outerH=True,
-                    borders_innerV=True,
-                    borders_outerV=True,
-                    resizable=True,
-                    policy=dpg.mvTable_SizingStretchProp,
-                    row_background=True,
-                    scrollY=True,
-                    height=390,
-                ):
-                    dpg.add_table_column(label="File", init_width_or_weight=150)
-                    dpg.add_table_column(label="Path", init_width_or_weight=340)
-                    dpg.add_table_column(label="Source", init_width_or_weight=90)
-                    dpg.add_table_column(label="Score", init_width_or_weight=70)
-                    dpg.add_table_column(label="Categories", init_width_or_weight=220)
+            # Results container - scrollable list of result cards
+            with dpg.child_window(height=-1, border=True, tag=self.TAG_RESULTS_CONTAINER):
+                dpg.add_text("Results will appear here...", tag="search_results_placeholder", color=get_text_color("disabled"))
+
+        # Create texture registry
+        with dpg.texture_registry(tag=self.TAG_TEXTURE_REGISTRY):
+            pass
+
+        # Create preview dialog
+        self._create_preview_dialog()
 
     def _set_status(self, message: str, color: Optional[tuple[int, int, int]] = None) -> None:
         """Update status text."""
@@ -158,29 +212,40 @@ class SearchPanel:
         dpg.set_value(self.TAG_FILTER_PERSON, "")
         dpg.set_value(self.TAG_FILTER_DATE_FROM, "")
         dpg.set_value(self.TAG_FILTER_DATE_TO, "")
+        self._current_results = []
+        self._selected_result_ids.clear()
+        self._result_checkbox_tags.clear()
         self._clear_results()
-        self._set_status("Search cleared.", color=(150, 150, 150))
+        self._set_status("Search cleared.", color=get_text_color("disabled"))
 
     def _clear_results(self) -> None:
-        """Clear results table rows."""
-        children = dpg.get_item_children(self.TAG_RESULTS_TABLE, slot=1)
+        """Clear results container."""
+        children = dpg.get_item_children(self.TAG_RESULTS_CONTAINER, slot=1)
         if children:
             for child in children:
                 dpg.delete_item(child)
 
+    def _set_buttons_enabled(self, enabled: bool) -> None:
+        """Enable or disable search buttons during operations."""
+        for tag in [self.TAG_SEARCH_BUTTON, self.TAG_CLEAR_BUTTON]:
+            if dpg.does_item_exist(tag):
+                dpg.configure_item(tag, enabled=enabled)
+
     def _on_search(self) -> None:
         """Handle search button click."""
-        if self._search_thread and self._search_thread.is_alive():
+        if self._search_in_progress:
             logger.info("Search already in progress")
             return
 
         query = dpg.get_value(self.TAG_QUERY).strip()
         if not query:
-            self._set_status("Please enter a search query.", color=(255, 150, 150))
+            self._set_status("Please enter a search query.", color=get_status_color("error"))
             self._notify_status("Search query is empty.", level="warning")
             return
 
-        self._set_status("Searching...", color=(150, 200, 255))
+        self._search_in_progress = True
+        self._set_buttons_enabled(False)
+        self._set_status("Searching...", color=get_status_color("info"))
         self._notify_status(f"Searching for '{query}'...")
         self._clear_results()
 
@@ -201,7 +266,7 @@ class SearchPanel:
                     semantic_results = self.scene_classifier.search(query, limit=limit)
                     self._merge_semantic_results(items, semantic_results)
                 else:
-                    self._set_status("Semantic search unavailable (missing CLIP dependencies).", color=(255, 200, 120))
+                    self._set_status("Semantic search unavailable (missing CLIP dependencies).", color=get_status_color("warning"))
 
             if enable_text:
                 text_results = self.db.search_files(query, limit=limit)
@@ -209,15 +274,23 @@ class SearchPanel:
 
             results = list(items.values())
             results = self._apply_filters(results)
-            results.sort(key=self._sort_key)
+            results = self._apply_sort(results)
+
+            # Store results for later use
+            self._current_results = results
+            self._selected_result_ids.clear()
+            self._result_checkbox_tags.clear()
 
             self._render_results(results)
             self._notify_status(f"Search complete: {len(results)} result(s).")
 
         except Exception as e:
             logger.error(f"Search failed: {e}")
-            self._set_status(f"Search failed: {e}", color=(255, 150, 150))
+            self._set_status(f"Search failed: {e}", color=get_status_color("error"))
             self._notify_status("Search failed.", level="error")
+        finally:
+            self._search_in_progress = False
+            self._set_buttons_enabled(True)
 
     def _notify_status(self, message: str, level: str = "info") -> None:
         """Send status update if callback provided."""
@@ -355,39 +428,150 @@ class SearchPanel:
 
         return file_ids
 
-    def _sort_key(self, item: SearchItem) -> tuple[int, float]:
-        """Sort semantic results first by similarity, then source."""
-        if item.similarity is not None:
-            return (0, -item.similarity)
-        return (1, 0.0)
+    def _apply_sort(self, results: list[SearchItem]) -> list[SearchItem]:
+        """Apply sorting based on user selection."""
+        sort_by = dpg.get_value(self.TAG_SORT_BY)
+
+        if sort_by == "Relevance":
+            # Semantic results first by similarity, then text results
+            return sorted(results, key=lambda x: (0 if x.similarity else 1, -(x.similarity or 0)))
+        elif sort_by == "Date (Newest)":
+            return sorted(results, key=lambda x: x.file.modified if x.file and x.file.modified else datetime.min, reverse=True)
+        elif sort_by == "Date (Oldest)":
+            return sorted(results, key=lambda x: x.file.modified if x.file and x.file.modified else datetime.max)
+        elif sort_by == "Size (Largest)":
+            return sorted(results, key=lambda x: x.file.size if x.file else 0, reverse=True)
+        elif sort_by == "Size (Smallest)":
+            return sorted(results, key=lambda x: x.file.size if x.file else float('inf'))
+        elif sort_by == "Name":
+            return sorted(results, key=lambda x: Path(x.file_path).name.lower())
+        return results
+
+    def _on_sort_change(self, sender, app_data, user_data) -> None:
+        """Handle sort dropdown change - re-sort and re-render current results."""
+        if self._current_results:
+            self._current_results = self._apply_sort(self._current_results)
+            self._render_results(self._current_results)
 
     def _render_results(self, results: list[SearchItem]) -> None:
+        """Render search results as cards with thumbnails and actions."""
         dpg.split_frame()
         self._clear_results()
 
         if not results:
-            with dpg.table_row(parent=self.TAG_RESULTS_TABLE):
-                dpg.add_text("No matches found.")
-                dpg.add_text("")
-                dpg.add_text("")
-                dpg.add_text("")
-                dpg.add_text("")
-            self._set_status("No matches found.", color=(150, 150, 150))
+            dpg.add_text(
+                "No matches found.",
+                parent=self.TAG_RESULTS_CONTAINER,
+                color=get_text_color("disabled")
+            )
+            self._set_status("No matches found.", color=get_text_color("disabled"))
             return
 
         for item in results:
-            name = Path(item.file_path).name
-            score = f"{item.similarity:.3f}" if item.similarity is not None else ""
-            categories = self._format_categories(item.categories)
+            self._render_result_card(item)
 
-            with dpg.table_row(parent=self.TAG_RESULTS_TABLE):
-                dpg.add_text(name)
-                dpg.add_text(item.file_path)
-                dpg.add_text(item.source)
-                dpg.add_text(score)
-                dpg.add_text(categories)
+        self._set_status(f"Found {len(results)} result(s).", color=get_status_color("info"))
 
-        self._set_status(f"Found {len(results)} result(s).", color=(150, 200, 255))
+    def _render_result_card(self, item: SearchItem) -> None:
+        """Render a single result as a card with preview, info, and actions."""
+        file = item.file
+        if not file:
+            return
+
+        # Card container with border
+        with dpg.child_window(
+            parent=self.TAG_RESULTS_CONTAINER,
+            height=90,
+            border=True,
+            no_scrollbar=True,
+        ):
+            with dpg.group(horizontal=True):
+                # Checkbox for selection
+                checkbox_tag = f"search_result_checkbox_{item.file_id}"
+                self._result_checkbox_tags[item.file_id] = checkbox_tag
+                dpg.add_checkbox(
+                    tag=checkbox_tag,
+                    default_value=item.file_id in self._selected_result_ids,
+                    callback=self._on_result_checkbox_toggled,
+                    user_data=item.file_id,
+                )
+
+                # Thumbnail preview (for images)
+                if self._is_image_file(item.file_path):
+                    texture_tag = self._load_image_texture(item.file_path, size=self.THUMBNAIL_SIZE)
+                    if texture_tag:
+                        dpg.add_image(
+                            texture_tag,
+                            width=self.THUMBNAIL_SIZE,
+                            height=self.THUMBNAIL_SIZE,
+                        )
+                    else:
+                        # Placeholder for failed load
+                        with dpg.group():
+                            dpg.add_text("[Image]", color=get_text_color("disabled"))
+                            dpg.add_spacer(width=self.THUMBNAIL_SIZE - 40)
+                else:
+                    # Non-image placeholder
+                    with dpg.group():
+                        ext = Path(item.file_path).suffix.upper()
+                        dpg.add_text(ext if ext else "[File]", color=get_text_color("disabled"))
+                        dpg.add_spacer(width=self.THUMBNAIL_SIZE - 40)
+
+                dpg.add_spacer(width=10)
+
+                # File info column
+                with dpg.group():
+                    # Filename (clickable for preview)
+                    name = Path(item.file_path).name
+                    display_name = name[:45] + "..." if len(name) > 45 else name
+                    dpg.add_selectable(
+                        label=display_name,
+                        callback=lambda s, a, u: self._show_preview(u),
+                        user_data=item.file_id,
+                        span_columns=False,
+                    )
+
+                    # Size and date
+                    size_str = self._format_size(file.size)
+                    date_str = file.modified.strftime('%Y-%m-%d %H:%M') if file.modified else "Unknown date"
+                    dpg.add_text(f"{size_str}  |  {date_str}", color=get_text_color("disabled"))
+
+                    # Source and score
+                    score_str = f"  |  Score: {item.similarity:.3f}" if item.similarity is not None else ""
+                    dpg.add_text(f"Source: {item.source}{score_str}", color=get_text_color("secondary"))
+
+                dpg.add_spacer(width=20)
+
+                # Action buttons column
+                with dpg.group():
+                    with dpg.group(horizontal=True):
+                        dpg.add_button(
+                            label="Preview",
+                            callback=lambda s, a, u: self._show_preview(u),
+                            user_data=item.file_id,
+                            width=65,
+                            small=True,
+                        )
+                        dpg.add_button(
+                            label="Open",
+                            callback=lambda s, a, u: self._open_file(u),
+                            user_data=item.file_path,
+                            width=50,
+                            small=True,
+                        )
+                        dpg.add_button(
+                            label="Explorer",
+                            callback=lambda s, a, u: self._open_in_explorer(u),
+                            user_data=item.file_path,
+                            width=65,
+                            small=True,
+                        )
+
+                    # Categories if available
+                    if item.categories:
+                        cats = self._format_categories(item.categories)
+                        if cats:
+                            dpg.add_text(cats[:60] + "..." if len(cats) > 60 else cats, color=get_text_color("secondary"), wrap=250)
 
     def _format_categories(self, categories: Optional[dict[str, float]]) -> str:
         if not categories:
@@ -396,6 +580,316 @@ class SearchPanel:
         pairs = sorted(categories.items(), key=lambda x: x[1], reverse=True)
         top = pairs[:4]
         return ", ".join(f"{name} ({score:.2f})" for name, score in top)
+
+    def _format_size(self, size: int) -> str:
+        """Format file size in human-readable form."""
+        if size >= 1024 * 1024 * 1024:
+            return f"{size / (1024 * 1024 * 1024):.1f} GB"
+        elif size >= 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f} MB"
+        elif size >= 1024:
+            return f"{size / 1024:.0f} KB"
+        return f"{size} B"
+
+    def _is_image_file(self, file_path: str) -> bool:
+        """Check if a file is an image based on extension."""
+        ext = Path(file_path).suffix.lower()
+        return ext in self.IMAGE_EXTENSIONS
+
+    def _load_image_texture(self, file_path: str, size: int = None) -> Optional[str]:
+        """Load an image file as a Dear PyGui texture.
+
+        Args:
+            file_path: Path to the image file
+            size: Thumbnail size (uses THUMBNAIL_SIZE if not specified)
+
+        Returns:
+            Texture tag or None if failed
+        """
+        if not HAS_PIL:
+            return None
+
+        if not os.path.exists(file_path):
+            return None
+
+        size = size or self.THUMBNAIL_SIZE
+
+        # Check cache
+        cache_key = f"{file_path}_{size}"
+        if cache_key in self._texture_cache:
+            # Update LRU order
+            if cache_key in self._texture_lru:
+                self._texture_lru.remove(cache_key)
+            self._texture_lru.append(cache_key)
+            return self._texture_cache[cache_key]
+
+        try:
+            # Load and resize image
+            img = Image.open(file_path)
+            img.thumbnail((size, size), Image.Resampling.LANCZOS)
+
+            # Convert to RGBA
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+
+            # Get dimensions
+            width, height = img.size
+
+            # Convert to numpy array and normalize to 0-1 float
+            data = np.array(img).astype(np.float32) / 255.0
+            data = data.flatten().tolist()
+
+            # Create unique texture tag
+            self._texture_counter += 1
+            texture_tag = f"search_texture_{self._texture_counter}"
+
+            # Add static texture
+            dpg.add_static_texture(
+                width=width,
+                height=height,
+                default_value=data,
+                tag=texture_tag,
+                parent=self.TAG_TEXTURE_REGISTRY
+            )
+
+            # Evict oldest entries if cache is full
+            while len(self._texture_cache) >= self.MAX_TEXTURE_CACHE and self._texture_lru:
+                oldest_key = self._texture_lru.pop(0)
+                if oldest_key in self._texture_cache:
+                    old_tag = self._texture_cache.pop(oldest_key)
+                    try:
+                        if dpg.does_item_exist(old_tag):
+                            dpg.delete_item(old_tag)
+                    except Exception:
+                        pass
+
+            self._texture_cache[cache_key] = texture_tag
+            self._texture_lru.append(cache_key)
+            return texture_tag
+
+        except Exception as e:
+            logger.debug(f"Failed to load image texture for {file_path}: {e}")
+            return None
+
+    def _open_file(self, file_path: str) -> None:
+        """Open a file with its default application."""
+        if not os.path.exists(file_path):
+            logger.warning(f"File not found: {file_path}")
+            self._notify_status(f"File not found: {Path(file_path).name}", level="warning")
+            return
+
+        try:
+            os.startfile(file_path)
+        except Exception as e:
+            logger.error(f"Failed to open file: {e}")
+            self._notify_status(f"Failed to open file: {e}", level="error")
+
+    def _open_in_explorer(self, file_path: str) -> None:
+        """Open Windows Explorer with the file selected."""
+        if not os.path.exists(file_path):
+            logger.warning(f"File not found: {file_path}")
+            self._notify_status(f"File not found: {Path(file_path).name}", level="warning")
+            return
+
+        try:
+            # Use explorer /select to highlight the file
+            subprocess.run(['explorer', '/select,', file_path], check=False)
+        except Exception as e:
+            logger.error(f"Failed to open Explorer: {e}")
+            self._notify_status(f"Failed to open Explorer: {e}", level="error")
+
+    def _on_result_checkbox_toggled(self, sender, app_data, user_data) -> None:
+        """Handle selection checkbox toggle for a result."""
+        file_id = user_data
+        if app_data:
+            self._selected_result_ids.add(file_id)
+        else:
+            self._selected_result_ids.discard(file_id)
+
+    def _select_all_results(self) -> None:
+        """Select all visible results."""
+        self._selected_result_ids = {item.file_id for item in self._current_results}
+        for file_id, tag in self._result_checkbox_tags.items():
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, file_id in self._selected_result_ids)
+
+    def _deselect_all_results(self) -> None:
+        """Clear selection for all results."""
+        self._selected_result_ids.clear()
+        for tag in self._result_checkbox_tags.values():
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, False)
+
+    def _center_dialog(self, dialog_tag: str, width: int, height: int) -> None:
+        """Center a dialog on the viewport."""
+        try:
+            vp_width = dpg.get_viewport_width()
+            vp_height = dpg.get_viewport_height()
+            x = max(0, (vp_width - width) // 2)
+            y = max(0, (vp_height - height) // 2)
+            dpg.set_item_pos(dialog_tag, [x, y])
+        except Exception:
+            pass
+
+    def _create_preview_dialog(self) -> None:
+        """Create the file preview dialog."""
+        with dpg.window(
+            tag=self.TAG_PREVIEW_DIALOG,
+            label="File Preview",
+            modal=True,
+            show=False,
+            width=650,
+            height=600,
+            no_resize=False,
+        ):
+            dpg.add_text("File Preview", color=get_accent_color())
+            dpg.add_separator()
+            dpg.add_spacer(height=5)
+
+            # File info section
+            with dpg.group(tag=self.TAG_PREVIEW_INFO):
+                dpg.add_text("Loading...", tag="search_preview_filename")
+                dpg.add_text("", tag="search_preview_details", color=get_text_color("disabled"))
+                dpg.add_text("", tag="search_preview_path", color=get_text_color("disabled"), wrap=600)
+
+            dpg.add_spacer(height=10)
+
+            # Image preview area
+            with dpg.child_window(height=420, border=True, tag="search_preview_image_container"):
+                dpg.add_text("Preview will appear here...", tag="search_preview_placeholder", color=get_text_color("disabled"))
+
+            dpg.add_spacer(height=10)
+
+            # Action buttons
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Open File",
+                    callback=self._preview_open_file,
+                    width=100,
+                )
+                dpg.add_button(
+                    label="Show in Explorer",
+                    callback=self._preview_show_in_explorer,
+                    width=130,
+                )
+                dpg.add_spacer(width=200)
+                dpg.add_button(
+                    label="Close",
+                    callback=lambda: dpg.hide_item(self.TAG_PREVIEW_DIALOG),
+                    width=80,
+                )
+
+    def _show_preview(self, file_id: int) -> None:
+        """Show preview dialog for a file."""
+        # Find the item
+        item = next((i for i in self._current_results if i.file_id == file_id), None)
+        if not item or not item.file:
+            return
+
+        file = item.file
+        self._preview_file_path = item.file_path
+
+        # Update file info
+        dpg.set_value("search_preview_filename", file.filename)
+
+        size_str = self._format_size(file.size)
+        date_str = file.modified.strftime('%Y-%m-%d %H:%M') if file.modified else "Unknown date"
+        details = f"Size: {size_str}  |  Modified: {date_str}"
+        if item.similarity is not None:
+            details += f"  |  Score: {item.similarity:.3f}"
+        dpg.set_value("search_preview_details", details)
+
+        dpg.set_value("search_preview_path", f"Path: {item.file_path}")
+
+        # Clear previous preview
+        children = dpg.get_item_children("search_preview_image_container", slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+        # Clean up previous preview texture
+        if self._preview_texture_tag and dpg.does_item_exist(self._preview_texture_tag):
+            try:
+                dpg.delete_item(self._preview_texture_tag)
+            except Exception:
+                pass
+            self._preview_texture_tag = None
+
+        # Load preview image
+        if self._is_image_file(item.file_path):
+            texture_tag = self._load_preview_image(item.file_path)
+            if texture_tag:
+                self._preview_texture_tag = texture_tag
+                dpg.add_image(
+                    texture_tag,
+                    parent="search_preview_image_container",
+                )
+            else:
+                dpg.add_text(
+                    "Failed to load image preview.",
+                    parent="search_preview_image_container",
+                    color=get_status_color("error")
+                )
+        else:
+            # Non-image file
+            ext = Path(item.file_path).suffix.upper()
+            dpg.add_text(
+                f"No preview available for {ext} files.",
+                parent="search_preview_image_container",
+                color=get_text_color("disabled")
+            )
+            dpg.add_spacer(height=20, parent="search_preview_image_container")
+            dpg.add_text(
+                "Click 'Open File' to view with the default application.",
+                parent="search_preview_image_container",
+                color=get_text_color("disabled")
+            )
+
+        self._center_dialog(self.TAG_PREVIEW_DIALOG, 650, 600)
+        dpg.show_item(self.TAG_PREVIEW_DIALOG)
+
+    def _load_preview_image(self, file_path: str) -> Optional[str]:
+        """Load a larger preview image for the dialog."""
+        if not HAS_PIL or not os.path.exists(file_path):
+            return None
+
+        try:
+            img = Image.open(file_path)
+            img.thumbnail((self.PREVIEW_SIZE, self.PREVIEW_SIZE), Image.Resampling.LANCZOS)
+
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+
+            width, height = img.size
+            data = np.array(img).astype(np.float32) / 255.0
+            data = data.flatten().tolist()
+
+            self._texture_counter += 1
+            texture_tag = f"search_preview_{self._texture_counter}"
+
+            dpg.add_static_texture(
+                width=width,
+                height=height,
+                default_value=data,
+                tag=texture_tag,
+                parent=self.TAG_TEXTURE_REGISTRY
+            )
+
+            return texture_tag
+
+        except Exception as e:
+            logger.debug(f"Failed to load preview image: {e}")
+            return None
+
+    def _preview_open_file(self) -> None:
+        """Open file from preview dialog."""
+        if self._preview_file_path:
+            self._open_file(self._preview_file_path)
+
+    def _preview_show_in_explorer(self) -> None:
+        """Show file in explorer from preview dialog."""
+        if self._preview_file_path:
+            self._open_in_explorer(self._preview_file_path)
 
     def _parse_date(self, value: str) -> Optional[datetime]:
         text = (value or "").strip()
@@ -419,5 +913,44 @@ class SearchPanel:
 
     def refresh(self) -> None:
         """Refresh the panel."""
+        self._current_results = []
+        self._selected_result_ids.clear()
+        self._result_checkbox_tags.clear()
         self._clear_results()
-        self._set_status("Ready to search.", color=(150, 150, 150))
+        self._set_status("Ready to search.", color=get_text_color("disabled"))
+
+    def cleanup(self) -> None:
+        """Clean up resources (textures, threads, etc.)."""
+        # Wait for search thread to finish (with timeout)
+        if self._search_thread and self._search_thread.is_alive():
+            logger.debug("Waiting for search thread to finish...")
+            self._search_thread.join(timeout=2.0)
+            if self._search_thread.is_alive():
+                logger.warning("Search thread did not finish in time")
+        self._search_thread = None
+        self._search_in_progress = False
+
+        # Clean up cached textures
+        for texture_tag in self._texture_cache.values():
+            try:
+                if dpg.does_item_exist(texture_tag):
+                    dpg.delete_item(texture_tag)
+            except Exception:
+                pass
+        self._texture_cache.clear()
+        self._texture_lru.clear()
+
+        # Clean up preview texture
+        if self._preview_texture_tag and dpg.does_item_exist(self._preview_texture_tag):
+            try:
+                dpg.delete_item(self._preview_texture_tag)
+            except Exception:
+                pass
+            self._preview_texture_tag = None
+
+        # Delete texture registry
+        if dpg.does_item_exist(self.TAG_TEXTURE_REGISTRY):
+            try:
+                dpg.delete_item(self.TAG_TEXTURE_REGISTRY)
+            except Exception:
+                pass

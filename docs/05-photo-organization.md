@@ -10,14 +10,14 @@ Common scenarios it solves:
 - Multiple cameras mixing their numbering schemes
 - Photos from family members' devices all merged together
 
-## The Organize Tab
+## The Photos Tab (Photo Organizer)
 
 ### Main Interface
 
-The Organize tab shows your unorganized media and previews how it will be sorted:
+The Photos tab (Photo Organizer) shows your unorganized media and previews how it will be sorted:
 
 ```
-ORGANIZE PHOTOS
+PHOTO ORGANIZER
 ===============
 
 Source: [\\NAS\Photos\Unsorted          ] [Browse]
@@ -39,7 +39,7 @@ ORGANIZATION PREVIEW
     2023-12-25_Christmas/         (456 photos)
     ...
 
-[Settings]  [Preview Changes]  [Organize]
+[Settings]  [Preview]  [Organize Now]
 ```
 
 ## Organization Options
@@ -84,11 +84,12 @@ Add location names to folders based on where photos were taken.
     2024-02-10_Paris_France/
 ```
 
-**Location Level Options:**
-- City only: "NewYork"
-- City + Country: "NewYork_USA"
-- City + State + Country: "NewYork_NY_USA"
-- Neighborhood (when available): "Manhattan_NewYork"
+**Location Detail Options:**
+- **City Only**: "NewYork"
+- **City + Country**: "NewYork_USA"
+- **City + State + Country**: "NewYork_NY_USA"
+
+Configure with the **Location Detail** dropdown in the Photo Organizer settings.
 
 **Note:** Location lookup requires internet connection. Results are cached locally so each location is only looked up once.
 
@@ -111,9 +112,8 @@ You take 30 photos between 10pm and 11pm → separate event
 **Event Naming:**
 - With location: "2024-01-15_NewYork"
 - Without location: "2024-01-15_Event1", "2024-01-15_Event2"
-- With AI scene detection: "2024-01-15_Beach", "2024-01-15_Restaurant"
 
-**Configure the time gap** in **Settings > Organization > Event Gap** (1-24 hours).
+**Configure the time gap** in **Settings > Organization > Event Gap** (1-48 hours).
 
 ### File Renaming
 
@@ -161,59 +161,32 @@ The app automatically detects screenshots and can separate them:
 
 **Options:**
 - **Mix with photos** - Screenshots stay with regular photos
-- **Separate folder** - Move to a "Screenshots" folder
-- **Separate by app** - Group by source app if detectable
+- **Separate folder** - Move to a "Screenshots/" subfolder
 
 ### Burst Photos
 
 When your phone takes burst mode photos (many photos in rapid succession):
 
 **Detection:**
-- Photos taken within 1-2 seconds of each other
-- Same camera, same settings
-- Sometimes indicated in EXIF data
+- Photos taken within 2 seconds of each other
+- At least 3 photos in sequence to qualify as a burst
 
 **Options:**
-- **Keep all** - Organize normally, keep every frame
-- **Subfolder** - Put bursts in subfolders: "Burst_001/"
-- **Flag for review** - Mark bursts so you can pick the best later
+- **Keep all** - Sort normally, keep every frame in the same folder
+- **Subfolder** - Put bursts in subfolders: "Burst_001/", "Burst_002/", etc.
+- **Flag for review** - Mark bursts in the preview so you can review them later
 
 ### Live Photos (iPhone)
 
 iPhone Live Photos are a still image + short video clip:
 
 **Detection:**
-- Matching filename with .jpg and .mov
-- Apple-specific EXIF data
-- Files created within milliseconds of each other
+- Matching filename with .jpg/.heic and .mov/.mp4 extensions
+- Files in the same folder with the same base name
 
 **Options:**
 - **Keep together** - Photo and video stay in same folder
-- **Video subfolder** - Move .mov clips to a "LivePhoto_Videos" subfolder
-- **Video only if different** - Only separate if video has different content
-
-### RAW + JPEG Pairs
-
-Many cameras save both RAW and JPEG versions:
-
-**Detection:**
-- Same filename, different extensions (.CR2/.jpg, .NEF/.jpg, .ARW/.jpg)
-- Same capture timestamp
-- Same camera
-
-**Options:**
-- **Keep together** - Both files in the same folder
-- **RAW subfolder** - Move RAW files to a "RAW" subfolder
-- **JPEG only** - Organize JPEGs, leave RAW files in place
-
-### Videos
-
-Videos are organized alongside photos by default:
-
-**Options:**
-- **Mix with photos** - Videos in same date folders as photos
-- **Separate Videos folder** - All videos go to a parallel structure
-- **By length** - Short clips with photos, long videos separate
+- **Video subfolder** - Move video clips to a "LivePhoto_Videos/" subfolder
 
 ## Preview and Dry Run
 
@@ -230,15 +203,28 @@ Files to organize: 45,234
   Will stay in place: 1,343 (already organized)
 
 Folders to create: 234
+Burst Groups: 12          (shown in orange when bursts detected)
+Live Photos: 156          (shown in blue when Live Photos detected)
 
-SAMPLE CHANGES (showing first 100):
-  IMG_4521.jpg → 2024/01-January/2024-01-15_NewYork/2024-01-15_NewYork_001.jpg
-  IMG_4522.jpg → 2024/01-January/2024-01-15_NewYork/2024-01-15_NewYork_002.jpg
-  DSC_0001.jpg → 2024/01-January/2024-01-22/2024-01-22_001.jpg
+SAMPLE CHANGES (showing first 500):
+  Source          | Destination                                          | Date | Location | Burst | Live
+  IMG_4521.jpg    | 2024/01-January/2024-01-15_NewYork/2024-01-15_001.jpg| exif | NewYork  |       |
+  IMG_4522.jpg    | 2024/01-January/2024-01-15_NewYork/2024-01-15_002.jpg| exif | NewYork  | #1    |
+  IMG_4523.jpg    | 2024/01-January/2024-01-15_NewYork/2024-01-15_003.jpg| exif | NewYork  | #1    |
+  IMG_0001.jpg    | 2024/02-February/2024-02-10/2024-02-10_001.jpg       | exif |          |       | Yes
+  IMG_0001.mov    | 2024/02-February/2024-02-10/LivePhoto_Videos/...     | file |          |       | Yes
   ...
 
-[View Full List]  [Export as CSV]  [Back]  [Proceed]
+[Export as CSV]  [Organize Now]
 ```
+
+The preview table shows:
+- **Source**: Original filename
+- **Destination**: Where the file will be organized to
+- **Date**: Source of date information (exif, file, or undated)
+- **Location**: Location name if GPS data available
+- **Burst**: Burst group number (e.g., #1, #2) if part of a burst sequence
+- **Live**: "Yes" if file is part of a Live Photo pair
 
 ### Dry Run Mode
 
@@ -266,7 +252,7 @@ When a photo has no EXIF date and no reliable file date:
 When location-based organization is enabled but GPS data is missing:
 
 - Folder name omits location: "2024-01-15/" instead of "2024-01-15_NewYork/"
-- Or use AI scene detection for location hints (beach, mountain, etc.)
+- Photos without GPS are organized by date only
 
 ### Conflicting Filenames
 
@@ -277,14 +263,6 @@ When the destination filename already exists:
 - **Add timestamp** - photo_143022.jpg
 - **Skip** - Don't move, report conflict
 - **Overwrite if identical** - Replace if same hash, skip if different
-
-### Very Old Photos (Scanned)
-
-Scanned photos may have scan date, not original date:
-
-- EXIF shows when scanned, not when photo was taken
-- App flags these for manual date assignment
-- Can bulk-set dates for groups of scanned photos
 
 ## Reversibility
 
@@ -343,14 +321,17 @@ Reverse geocoding:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Date Format | YYYY/MM | Folder structure pattern |
+| Date Format | YYYY/MM-Month | Folder structure pattern |
 | Include Location | Off | Add location to folder names |
+| Location Detail | City Only | Level of detail for location names |
 | Event Clustering | Off | Group by time proximity |
-| Event Gap | 4 hours | Time gap to separate events |
+| Event Gap | 4 hours | Time gap to separate events (1-48 hours) |
 | Rename Files | On | Rename to date-based names |
 | Rename Pattern | {date}_{seq} | Filename pattern |
-| Screenshot Handling | Separate | How to handle screenshots |
+| Conflict Resolution | Add Sequence Number | How to handle filename conflicts |
+| Screenshot Handling | Separate Folder | How to handle screenshots |
 | Burst Handling | Keep All | How to handle burst photos |
 | Live Photo Handling | Keep Together | How to handle Live Photos |
+| Undated Photos | Undated Folder | How to handle photos without dates |
 | Move vs Copy | Move | Move files or copy them |
 | Dry Run | Off | Preview only, don't move |

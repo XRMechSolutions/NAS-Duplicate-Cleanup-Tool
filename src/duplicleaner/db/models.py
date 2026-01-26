@@ -212,6 +212,7 @@ class Person:
     birth_year: Optional[int] = None
     notes: Optional[str] = None
     is_favorite: bool = False
+    is_hidden: bool = False  # Hidden/ignored persons (unknown faces user wants to hide)
     reference_photo_id: Optional[int] = None
     created_at: Optional[datetime] = None
     photo_count: int = 0

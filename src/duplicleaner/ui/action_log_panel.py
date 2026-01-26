@@ -15,6 +15,7 @@ from duplicleaner.core.actions import ActionEngine, ActionResult, ActionStatus
 from duplicleaner.db.database import get_database
 from duplicleaner.db.models import ActionLogEntry, ActionType
 from duplicleaner.utils.logging import get_logger
+from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
@@ -107,7 +108,7 @@ class ActionLogPanel:
         """Build the panel UI."""
         with dpg.child_window(parent=self.parent, tag=self.TAG_PANEL, autosize_x=True, autosize_y=True):
             # Header
-            dpg.add_text("Action Log", color=(150, 200, 255))
+            dpg.add_text("Action Log", color=get_accent_color())
             dpg.add_separator()
             dpg.add_spacer(height=5)
 
@@ -214,7 +215,7 @@ class ActionLogPanel:
 
             # Quarantine section
             dpg.add_separator()
-            dpg.add_text("Quarantine Folder", color=(200, 200, 150))
+            dpg.add_text("Quarantine Folder", color=get_accent_color())
             dpg.add_spacer(height=5)
 
             with dpg.group(horizontal=True, tag=self.TAG_QUARANTINE_STATS):
@@ -244,7 +245,7 @@ class ActionLogPanel:
         ):
             dpg.add_text("Are you sure you want to undo these actions?", tag="undo_dialog_text")
             dpg.add_spacer(height=10)
-            dpg.add_text("This will:", color=(200, 200, 100))
+            dpg.add_text("This will:", color=get_status_color("warning"))
             dpg.add_text("", tag="undo_dialog_details", wrap=480)
             dpg.add_spacer(height=20)
             with dpg.group(horizontal=True):
@@ -287,11 +288,11 @@ class ActionLogPanel:
             no_resize=True,
             pos=[225, 175],
         ):
-            dpg.add_text("This will PERMANENTLY DELETE all quarantined files.", color=(255, 100, 100))
+            dpg.add_text("This will PERMANENTLY DELETE all quarantined files.", color=get_status_color("error"))
             dpg.add_spacer(height=10)
             dpg.add_text("", tag="empty_quarantine_info")
             dpg.add_spacer(height=10)
-            dpg.add_text("This action CANNOT be undone.", color=(255, 150, 100))
+            dpg.add_text("This action CANNOT be undone.", color=get_status_color("warning"))
             dpg.add_spacer(height=10)
             dpg.add_text("Type 'DELETE' to confirm:")
             dpg.add_input_text(tag="confirm_delete_input", width=200)
@@ -460,9 +461,9 @@ class ActionLogPanel:
 
                 # Status
                 if entry.reversed:
-                    dpg.add_text("Undone", color=(150, 150, 150))
+                    dpg.add_text("Undone", color=get_text_color("disabled"))
                 else:
-                    dpg.add_text("Active", color=(100, 200, 100))
+                    dpg.add_text("Active", color=get_status_color("success"))
 
                 # Undo button
                 if entry.reversible and not entry.reversed:

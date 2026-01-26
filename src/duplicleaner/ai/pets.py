@@ -600,6 +600,77 @@ class PetAnalyzer:
 
         return matches_found, assigned
 
+    def find_more_detections_for_pet(
+        self,
+        pet_id: int,
+        threshold: float = MATCH_THRESHOLD_HIGH,
+        auto_assign: bool = True,
+    ) -> tuple[int, int]:
+        """Find and assign unassigned detections that match a specific pet.
+
+        Unlike match_and_assign_detections which matches against all pets,
+        this method only looks for detections that match the specified pet.
+
+        Args:
+            pet_id: ID of the pet to find more detections for
+            threshold: Minimum similarity threshold
+            auto_assign: Whether to automatically assign matching detections
+
+        Returns:
+            Tuple of (matches_found, detections_assigned)
+        """
+        # Get pet info
+        pet = self.db.get_pet(pet_id)
+        if not pet:
+            logger.warning(f"Pet {pet_id} not found")
+            return 0, 0
+
+        if pet_id not in self._pet_histograms:
+            self.load_pet_histograms()
+
+        if pet_id not in self._pet_histograms:
+            logger.warning(f"No histogram found for pet {pet_id}")
+            return 0, 0
+
+        pet_hist = self._pet_histograms[pet_id]
+
+        # Get unassigned detections
+        detections = self.db.get_unassigned_pet_detections()
+
+        self.progress.phase = "matching"
+        self._notify_progress()
+
+        matches_found = 0
+        assigned = 0
+
+        for detection in detections:
+            if self._cancel_event.is_set():
+                break
+
+            if not detection.color_histogram:
+                continue
+
+            # Species must match
+            if pet.species and pet.species != detection.species:
+                continue
+
+            det_hist = self._deserialize_histogram(detection.color_histogram)
+            score = self.compare_histograms(det_hist, pet_hist)
+
+            if score >= threshold:
+                matches_found += 1
+
+                if auto_assign:
+                    self.db.assign_pet_detection_to_pet(detection.id, pet_id)
+                    assigned += 1
+                    self.db.update_pet_photo_count(pet_id)
+
+        self.progress.pets_matched = assigned
+        self._notify_progress()
+
+        logger.info(f"Found {matches_found} matches for pet {pet_id} ({pet.name}), assigned {assigned}")
+        return matches_found, assigned
+
     # ==========================================================================
     # Pet Clustering
     # ==========================================================================

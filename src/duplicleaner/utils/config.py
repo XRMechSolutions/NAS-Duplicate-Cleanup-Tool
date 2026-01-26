@@ -94,9 +94,10 @@ class AISettings:
 
     enabled: bool = True
     models_directory: str = ""  # Empty = use default
+    dependency_variant: str = "cpu"  # gpu, cpu
 
     # Hardware settings
-    use_gpu: bool = True
+    use_gpu: bool = False
     batch_size: int = 32
     max_concurrent_tasks: int = 4
 
@@ -125,6 +126,27 @@ class AISettings:
     summary_model_google: str = "gemini-pro-vision"
     summary_max_tokens: int = 500
     summary_temperature: float = 0.7
+    metadata_location_lookup: bool = False
+    metadata_location_level: str = "city"
+    analysis_include_images: bool = True
+    analysis_include_documents: bool = True
+    analysis_include_data_files: bool = False
+    analysis_include_metadata: bool = True
+    analysis_include_scenes: bool = True
+    analysis_include_objects: bool = True
+    analysis_include_ocr: bool = True
+    analysis_include_summaries: bool = False
+    analysis_doc_extensions: list[str] = field(default_factory=lambda: [
+        ".txt", ".md", ".pdf", ".rtf", ".docx", ".odt", ".pptx", ".xlsx"
+    ])
+    analysis_data_extensions: list[str] = field(default_factory=lambda: [
+        ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml", ".ini", ".log"
+    ])
+    analysis_scan_before_full: bool = True
+    analysis_reanalyze_existing: bool = False
+    analysis_batch_limit: int = 200
+    analysis_background_during_scan: bool = True
+    hash_background_during_scan: bool = True
 
     # Quality analysis settings
     quality_analysis_enabled: bool = True

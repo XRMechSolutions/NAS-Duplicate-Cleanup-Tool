@@ -1,9 +1,10 @@
-"""Organize Panel for DupliCleaner.
+"""Photo Organizer Panel for DupliCleaner.
 
-Dear PyGui UI component for photo organization features.
+Dear PyGui UI component for organizing photos into date/location-based folder structures.
 """
 
 import threading
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -18,11 +19,13 @@ from duplicleaner.core.organizer import (
     DateFormat,
     ScreenshotHandling,
     BurstHandling,
+    LivePhotoHandling,
     ConflictResolution,
     UndatedHandling,
 )
 from duplicleaner.utils.logging import get_logger
-from duplicleaner.utils.config import get_config
+from duplicleaner.ui.tooltips import add_tooltip, ORGANIZE_TOOLTIPS
+from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
@@ -37,7 +40,7 @@ def format_size(size_bytes: int) -> str:
 
 
 class OrganizePanel:
-    """UI panel for photo organization."""
+    """UI panel for organizing photos into structured folder hierarchies."""
 
     # Tag constants
     TAG_PANEL = "organize_panel"
@@ -51,6 +54,10 @@ class OrganizePanel:
     TAG_STATS_GROUP = "org_stats_group"
     TAG_SETTINGS_GROUP = "org_settings_group"
     TAG_FOLDER_TREE = "org_folder_tree"
+    TAG_SOURCE_DIALOG = "org_source_dialog"
+    TAG_DEST_DIALOG = "org_dest_dialog"
+    TAG_EXPORT_DIALOG = "org_export_dialog"
+    TAG_PREVIEW_BTN = "org_preview_btn"
 
     def __init__(
         self,
@@ -71,7 +78,9 @@ class OrganizePanel:
         # Organizer instance
         self._organizer: Optional[Organizer] = None
         self._organize_thread: Optional[threading.Thread] = None
+        self._preview_thread: Optional[threading.Thread] = None
         self._current_preview: Optional[OrganizePreview] = None
+        self._operation_in_progress = False
 
         # Settings
         self._settings = OrganizeSettings()
@@ -83,7 +92,7 @@ class OrganizePanel:
         """Build the panel UI."""
         with dpg.child_window(parent=self.parent, tag=self.TAG_PANEL, autosize_x=True, autosize_y=True):
             # Header
-            dpg.add_text("Photo Organization", color=(150, 200, 255))
+            dpg.add_text("Photo Organizer", color=get_accent_color())
             dpg.add_separator()
             dpg.add_spacer(height=10)
 
@@ -91,29 +100,31 @@ class OrganizePanel:
             with dpg.group():
                 with dpg.group(horizontal=True):
                     dpg.add_text("Source Folder:", indent=0)
-                    dpg.add_input_text(
+                    inp = dpg.add_input_text(
                         tag=self.TAG_SOURCE_INPUT,
                         width=400,
                         hint="Select folder with unorganized photos..."
                     )
+                    add_tooltip(inp, ORGANIZE_TOOLTIPS["source_folder"])
                     dpg.add_button(label="Browse...", callback=self._on_browse_source)
 
                 dpg.add_spacer(height=5)
 
                 with dpg.group(horizontal=True):
                     dpg.add_text("Destination: ", indent=0)
-                    dpg.add_input_text(
+                    inp = dpg.add_input_text(
                         tag=self.TAG_DEST_INPUT,
                         width=400,
                         hint="Select destination for organized photos..."
                     )
+                    add_tooltip(inp, ORGANIZE_TOOLTIPS["dest_folder"])
                     dpg.add_button(label="Browse...", callback=self._on_browse_dest)
 
             dpg.add_spacer(height=10)
 
             # Statistics (updated after preview)
             with dpg.group(tag=self.TAG_STATS_GROUP):
-                dpg.add_text("Run Preview to see organization statistics.", color=(150, 150, 150))
+                dpg.add_text("Run Preview to see organization statistics.", color=get_text_color("disabled"))
 
             dpg.add_spacer(height=10)
 
@@ -121,35 +132,47 @@ class OrganizePanel:
             with dpg.collapsing_header(label="Organization Settings", default_open=True):
                 with dpg.group(horizontal=True):
                     # Left column - Folder structure
-                    with dpg.child_window(width=350, height=250, border=False):
-                        dpg.add_text("Folder Structure", color=(150, 200, 255))
+                    with dpg.child_window(width=350, height=320, border=False):
+                        dpg.add_text("Folder Structure", color=get_accent_color())
                         dpg.add_separator()
 
-                        dpg.add_combo(
+                        ctrl = dpg.add_combo(
                             label="Date Format",
                             items=["YYYY/MM", "YYYY/MM-Month", "YYYY/MM/DD", "YYYY/YYYY-MM-DD"],
                             default_value="YYYY/MM-Month",
                             callback=self._on_date_format_change,
                             tag="org_date_format"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["date_format"])
 
-                        dpg.add_checkbox(
+                        ctrl = dpg.add_checkbox(
                             label="Include Location in Folders",
                             default_value=False,
                             callback=self._on_location_toggle,
                             tag="org_include_location"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["include_location"])
 
-                        dpg.add_checkbox(
+                        ctrl = dpg.add_combo(
+                            label="Location Detail",
+                            items=["City Only", "City + Country", "City + State + Country"],
+                            default_value="City Only",
+                            callback=self._on_location_level_change,
+                            tag="org_location_level"
+                        )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["location_level"])
+
+                        ctrl = dpg.add_checkbox(
                             label="Event Clustering",
                             default_value=False,
                             callback=self._on_event_toggle,
                             tag="org_event_clustering"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["event_clustering"])
 
                         with dpg.group(horizontal=True):
                             dpg.add_text("Event Gap (hours):")
-                            dpg.add_input_int(
+                            ctrl = dpg.add_input_int(
                                 default_value=4,
                                 min_value=1,
                                 max_value=48,
@@ -157,20 +180,22 @@ class OrganizePanel:
                                 callback=self._on_event_gap_change,
                                 tag="org_event_gap"
                             )
+                            add_tooltip(ctrl, ORGANIZE_TOOLTIPS["event_gap"])
 
                     # Middle column - File naming
-                    with dpg.child_window(width=350, height=250, border=False):
-                        dpg.add_text("File Naming", color=(150, 200, 255))
+                    with dpg.child_window(width=350, height=320, border=False):
+                        dpg.add_text("File Naming", color=get_accent_color())
                         dpg.add_separator()
 
-                        dpg.add_checkbox(
+                        ctrl = dpg.add_checkbox(
                             label="Rename Files",
                             default_value=True,
                             callback=self._on_rename_toggle,
                             tag="org_rename_files"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["rename_files"])
 
-                        dpg.add_combo(
+                        ctrl = dpg.add_combo(
                             label="Rename Pattern",
                             items=[
                                 "{date}_{seq}",
@@ -182,78 +207,107 @@ class OrganizePanel:
                             callback=self._on_pattern_change,
                             tag="org_rename_pattern"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["rename_pattern"])
 
-                        dpg.add_combo(
+                        ctrl = dpg.add_combo(
                             label="Conflict Resolution",
                             items=["Add Sequence Number", "Add Timestamp", "Skip", "Overwrite if Identical"],
                             default_value="Add Sequence Number",
                             callback=self._on_conflict_change,
                             tag="org_conflict"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["conflict_resolution"])
 
                     # Right column - Special handling
-                    with dpg.child_window(width=350, height=250, border=False):
-                        dpg.add_text("Special Handling", color=(150, 200, 255))
+                    with dpg.child_window(width=350, height=320, border=False):
+                        dpg.add_text("Special Handling", color=get_accent_color())
                         dpg.add_separator()
 
-                        dpg.add_combo(
+                        ctrl = dpg.add_combo(
                             label="Screenshots",
-                            items=["Mix with Photos", "Separate Folder", "Separate by App"],
+                            items=["Mix with Photos", "Separate Folder"],
                             default_value="Separate Folder",
                             callback=self._on_screenshot_change,
                             tag="org_screenshots"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["screenshots"])
 
-                        dpg.add_combo(
+                        ctrl = dpg.add_combo(
+                            label="Burst Photos",
+                            items=["Keep All", "Subfolder", "Flag for Review"],
+                            default_value="Keep All",
+                            callback=self._on_burst_change,
+                            tag="org_bursts"
+                        )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["bursts"])
+
+                        ctrl = dpg.add_combo(
+                            label="Live Photos",
+                            items=["Keep Together", "Video Subfolder"],
+                            default_value="Keep Together",
+                            callback=self._on_livephoto_change,
+                            tag="org_livephotos"
+                        )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["live_photos"])
+
+                        ctrl = dpg.add_combo(
                             label="Undated Photos",
                             items=["Undated Folder", "Use File Date", "Skip"],
                             default_value="Undated Folder",
                             callback=self._on_undated_change,
                             tag="org_undated"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["undated"])
 
                         dpg.add_spacer(height=10)
 
-                        dpg.add_checkbox(
+                        ctrl = dpg.add_checkbox(
                             label="Move Files (uncheck to copy)",
                             default_value=True,
                             callback=self._on_move_toggle,
                             tag="org_move_files"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["move_files"])
 
-                        dpg.add_checkbox(
+                        ctrl = dpg.add_checkbox(
                             label="Dry Run (preview only)",
                             default_value=False,
                             callback=self._on_dryrun_toggle,
                             tag="org_dry_run"
                         )
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["dry_run"])
 
             dpg.add_spacer(height=10)
 
             # Action buttons
             with dpg.group(horizontal=True):
-                dpg.add_button(
+                btn = dpg.add_button(
                     label="Preview Organization",
                     callback=self._on_preview_click,
-                    width=150
+                    width=150,
+                    tag=self.TAG_PREVIEW_BTN
                 )
-                dpg.add_button(
+                add_tooltip(btn, ORGANIZE_TOOLTIPS["preview"])
+                btn = dpg.add_button(
                     label="Organize Now",
                     callback=self._on_organize_click,
                     width=150,
                     tag="org_organize_btn"
                 )
+                add_tooltip(btn, ORGANIZE_TOOLTIPS["organize"])
                 dpg.add_spacer(width=20)
-                dpg.add_button(label="Cancel", callback=self._on_cancel_click, tag="org_cancel_btn", enabled=False)
+                btn = dpg.add_button(label="Cancel", callback=self._on_cancel_click, tag="org_cancel_btn", enabled=False)
+                add_tooltip(btn, ORGANIZE_TOOLTIPS["cancel"])
                 dpg.add_spacer(width=20)
-                dpg.add_button(label="Export Preview as CSV", callback=self._on_export_click, tag="org_export_btn", enabled=False)
+                btn = dpg.add_button(label="Export Preview as CSV", callback=self._on_export_click, tag="org_export_btn", enabled=False)
+                add_tooltip(btn, ORGANIZE_TOOLTIPS["export_csv"])
 
             dpg.add_spacer(height=10)
 
             # Progress section (initially hidden)
             with dpg.group(tag=self.TAG_PROGRESS_GROUP, show=False):
                 dpg.add_separator()
-                dpg.add_text("Organization Progress", color=(150, 200, 255))
+                dpg.add_text("Organization Progress", color=get_accent_color())
                 dpg.add_spacer(height=5)
 
                 dpg.add_text("Status: Idle", tag=self.TAG_PROGRESS_TEXT)
@@ -264,21 +318,21 @@ class OrganizePanel:
 
             # Preview section
             dpg.add_separator()
-            dpg.add_text("Preview", color=(150, 200, 255))
+            dpg.add_text("Preview", color=get_accent_color())
             dpg.add_spacer(height=5)
 
             # Two-column layout: folder tree and file list
             with dpg.group(horizontal=True):
                 # Folder tree
                 with dpg.child_window(width=300, height=400, border=True):
-                    dpg.add_text("Folders to Create", color=(150, 200, 255))
+                    dpg.add_text("Folders to Create", color=get_accent_color())
                     dpg.add_separator()
                     with dpg.tree_node(label="Organized Photos", tag=self.TAG_FOLDER_TREE, default_open=True):
-                        dpg.add_text("Run preview to see folder structure", color=(150, 150, 150))
+                        dpg.add_text("Run preview to see folder structure", color=get_text_color("disabled"))
 
                 # File list table
                 with dpg.child_window(width=-1, height=400, border=True):
-                    dpg.add_text("Files to Organize", color=(150, 200, 255))
+                    dpg.add_text("Files to Organize", color=get_accent_color())
                     dpg.add_separator()
                     with dpg.table(
                         tag=self.TAG_PREVIEW_TABLE,
@@ -293,29 +347,91 @@ class OrganizePanel:
                         scrollY=True,
                         height=350,
                     ):
-                        dpg.add_table_column(label="Source", init_width_or_weight=250)
-                        dpg.add_table_column(label="Destination", init_width_or_weight=350)
-                        dpg.add_table_column(label="Date Source", init_width_or_weight=80)
-                        dpg.add_table_column(label="Location", init_width_or_weight=100)
+                        dpg.add_table_column(label="Source", init_width_or_weight=200)
+                        dpg.add_table_column(label="Destination", init_width_or_weight=300)
+                        dpg.add_table_column(label="Date", init_width_or_weight=50)
+                        dpg.add_table_column(label="Location", init_width_or_weight=80)
+                        dpg.add_table_column(label="Burst", init_width_or_weight=50)
+                        dpg.add_table_column(label="Live", init_width_or_weight=40)
 
         # File dialogs
         self._create_file_dialogs()
 
     def _create_file_dialogs(self) -> None:
         """Create file/folder dialogs."""
-        # We'll use a simple input for now since file dialogs need more setup
-        # In production, use dpg.add_file_dialog
-        pass
+        # Source folder dialog
+        with dpg.file_dialog(
+            directory_selector=True,
+            show=False,
+            callback=self._on_source_selected,
+            cancel_callback=lambda: None,
+            tag=self.TAG_SOURCE_DIALOG,
+            width=700,
+            height=400,
+        ):
+            pass
+
+        # Destination folder dialog
+        with dpg.file_dialog(
+            directory_selector=True,
+            show=False,
+            callback=self._on_dest_selected,
+            cancel_callback=lambda: None,
+            tag=self.TAG_DEST_DIALOG,
+            width=700,
+            height=400,
+        ):
+            pass
+
+        # Export file dialog
+        with dpg.file_dialog(
+            directory_selector=False,
+            show=False,
+            callback=self._on_export_path_selected,
+            cancel_callback=lambda: None,
+            tag=self.TAG_EXPORT_DIALOG,
+            width=700,
+            height=400,
+            default_filename="organize_preview.csv",
+        ):
+            dpg.add_file_extension(".csv", color=(0, 255, 0, 255))
 
     def _on_browse_source(self) -> None:
         """Handle source browse button click."""
-        # For now, prompt user to enter path manually
-        # Full implementation would use dpg.add_file_dialog
-        logger.info("Browse source clicked - enter path manually")
+        dpg.show_item(self.TAG_SOURCE_DIALOG)
 
     def _on_browse_dest(self) -> None:
         """Handle destination browse button click."""
-        logger.info("Browse destination clicked - enter path manually")
+        dpg.show_item(self.TAG_DEST_DIALOG)
+
+    def _on_source_selected(self, sender, app_data) -> None:
+        """Handle source folder selection from dialog."""
+        if not app_data or "file_path_name" not in app_data:
+            return
+
+        path = app_data["file_path_name"]
+        if not Path(path).exists():
+            self._show_error(f"Source folder does not exist: {path}")
+            return
+        if not Path(path).is_dir():
+            self._show_error(f"Source path is not a directory: {path}")
+            return
+
+        dpg.set_value(self.TAG_SOURCE_INPUT, path)
+
+    def _on_dest_selected(self, sender, app_data) -> None:
+        """Handle destination folder selection from dialog."""
+        if not app_data or "file_path_name" not in app_data:
+            return
+
+        path = app_data["file_path_name"]
+        # Destination doesn't need to exist, but parent should
+        parent = Path(path).parent
+        if not parent.exists():
+            self._show_error(f"Parent directory does not exist: {parent}")
+            return
+
+        dpg.set_value(self.TAG_DEST_INPUT, path)
 
     def _update_settings_from_ui(self) -> None:
         """Update settings object from UI controls."""
@@ -337,6 +453,16 @@ class OrganizePanel:
         self._settings.move_files = dpg.get_value("org_move_files")
         self._settings.dry_run = dpg.get_value("org_dry_run")
 
+        # Location level
+        location_level_map = {
+            "City Only": "city",
+            "City + Country": "city_country",
+            "City + State + Country": "full",
+        }
+        self._settings.location_level = location_level_map.get(
+            dpg.get_value("org_location_level"), "city"
+        )
+
         # Pattern
         self._settings.rename_pattern = dpg.get_value("org_rename_pattern")
 
@@ -344,10 +470,28 @@ class OrganizePanel:
         screenshot_map = {
             "Mix with Photos": ScreenshotHandling.MIX,
             "Separate Folder": ScreenshotHandling.SEPARATE,
-            "Separate by App": ScreenshotHandling.SEPARATE_BY_APP,
         }
         self._settings.screenshot_handling = screenshot_map.get(
             dpg.get_value("org_screenshots"), ScreenshotHandling.SEPARATE
+        )
+
+        # Burst handling
+        burst_map = {
+            "Keep All": BurstHandling.KEEP_ALL,
+            "Subfolder": BurstHandling.SUBFOLDER,
+            "Flag for Review": BurstHandling.FLAG,
+        }
+        self._settings.burst_handling = burst_map.get(
+            dpg.get_value("org_bursts"), BurstHandling.KEEP_ALL
+        )
+
+        # Live Photo handling
+        livephoto_map = {
+            "Keep Together": LivePhotoHandling.KEEP_TOGETHER,
+            "Video Subfolder": LivePhotoHandling.VIDEO_SUBFOLDER,
+        }
+        self._settings.live_photo_handling = livephoto_map.get(
+            dpg.get_value("org_livephotos"), LivePhotoHandling.KEEP_TOGETHER
         )
 
         # Undated
@@ -379,6 +523,10 @@ class OrganizePanel:
         """Handle location toggle."""
         self._update_settings_from_ui()
 
+    def _on_location_level_change(self, sender, app_data) -> None:
+        """Handle location level change."""
+        self._update_settings_from_ui()
+
     def _on_event_toggle(self, sender, app_data) -> None:
         """Handle event clustering toggle."""
         self._update_settings_from_ui()
@@ -399,6 +547,14 @@ class OrganizePanel:
         """Handle screenshot handling change."""
         self._update_settings_from_ui()
 
+    def _on_burst_change(self, sender, app_data) -> None:
+        """Handle burst photo handling change."""
+        self._update_settings_from_ui()
+
+    def _on_livephoto_change(self, sender, app_data) -> None:
+        """Handle live photo handling change."""
+        self._update_settings_from_ui()
+
     def _on_undated_change(self, sender, app_data) -> None:
         """Handle undated handling change."""
         self._update_settings_from_ui()
@@ -415,8 +571,22 @@ class OrganizePanel:
         """Handle dry run toggle."""
         self._update_settings_from_ui()
 
+    def _set_buttons_enabled(self, enabled: bool) -> None:
+        """Enable or disable action buttons during operations."""
+        dpg.configure_item(self.TAG_PREVIEW_BTN, enabled=enabled)
+        dpg.configure_item("org_organize_btn", enabled=enabled)
+        # Export button depends on having a preview
+        if enabled and self._current_preview:
+            dpg.configure_item("org_export_btn", enabled=True)
+        elif not enabled:
+            dpg.configure_item("org_export_btn", enabled=False)
+
     def _on_preview_click(self) -> None:
         """Handle preview button click."""
+        if self._operation_in_progress:
+            self._show_error("An operation is already in progress.")
+            return
+
         source = dpg.get_value(self.TAG_SOURCE_INPUT).strip()
         dest = dpg.get_value(self.TAG_DEST_INPUT).strip()
 
@@ -433,6 +603,8 @@ class OrganizePanel:
             return
 
         self._update_settings_from_ui()
+        self._set_buttons_enabled(False)
+        self._operation_in_progress = True
 
         # Run preview in thread
         def preview_thread():
@@ -455,9 +627,13 @@ class OrganizePanel:
                 self._show_error(f"Preview failed: {e}")
                 if self.on_status_update:
                     self.on_status_update("Preview failed.")
+            finally:
+                dpg.split_frame()
+                self._operation_in_progress = False
+                self._set_buttons_enabled(True)
 
-        thread = threading.Thread(target=preview_thread)
-        thread.start()
+        self._preview_thread = threading.Thread(target=preview_thread)
+        self._preview_thread.start()
 
     def _update_preview_ui(self, preview: OrganizePreview) -> None:
         """Update UI with preview results.
@@ -477,6 +653,14 @@ class OrganizePanel:
             dpg.add_text(f"Skip: {preview.files_to_skip}")
             dpg.add_spacer(width=20)
             dpg.add_text(f"Folders: {preview.folders_to_create}")
+        # Second row for burst and live photo stats
+        with dpg.group(parent=self.TAG_STATS_GROUP, horizontal=True):
+            if preview.bursts_detected > 0:
+                dpg.add_text(f"Burst Groups: {preview.bursts_detected}", color=get_status_color("warning"))
+                dpg.add_spacer(width=20)
+            if preview.live_photos_detected > 0:
+                dpg.add_text(f"Live Photos: {preview.live_photos_detected}", color=get_status_color("info"))
+                dpg.add_spacer(width=20)
 
         # Update folder tree
         dpg.delete_item(self.TAG_FOLDER_TREE, children_only=True)
@@ -522,16 +706,35 @@ class OrganizePanel:
                 dpg.add_text(change.dest_path)
                 dpg.add_text(change.date_source or "")
                 dpg.add_text(change.location or "")
+                # Burst group column
+                if change.burst_group is not None:
+                    dpg.add_text(f"#{change.burst_group}", color=get_status_color("warning"))
+                else:
+                    dpg.add_text("")
+                # Live photo column
+                if change.is_live_photo:
+                    dpg.add_text("Yes", color=get_status_color("info"))
+                else:
+                    dpg.add_text("")
 
         if len(preview.changes) > 500:
             with dpg.table_row(parent=self.TAG_PREVIEW_TABLE):
                 dpg.add_text(f"... and {len(preview.changes) - 500} more files")
+                dpg.add_text("")
+                dpg.add_text("")
+                dpg.add_text("")
+                dpg.add_text("")
+                dpg.add_text("")
 
         # Enable export and organize buttons
         dpg.configure_item("org_export_btn", enabled=True)
 
     def _on_organize_click(self) -> None:
         """Handle organize button click."""
+        if self._operation_in_progress:
+            self._show_error("An operation is already in progress.")
+            return
+
         if self._current_preview is None:
             self._show_error("Please run Preview first.")
             return
@@ -543,10 +746,16 @@ class OrganizePanel:
             self._show_error("Source and destination are required.")
             return
 
+        # Re-validate source still exists before organizing
+        if not Path(source).exists():
+            self._show_error(f"Source folder no longer exists: {source}")
+            return
+
         # Show progress
         dpg.configure_item(self.TAG_PROGRESS_GROUP, show=True)
         dpg.configure_item("org_cancel_btn", enabled=True)
-        dpg.configure_item("org_organize_btn", enabled=False)
+        self._set_buttons_enabled(False)
+        self._operation_in_progress = True
 
         self._update_settings_from_ui()
 
@@ -571,10 +780,14 @@ class OrganizePanel:
                 logger.error(f"Organization failed: {e}")
                 dpg.split_frame()
                 self._show_error(f"Organization failed: {e}")
-                dpg.configure_item("org_organize_btn", enabled=True)
+                self._set_buttons_enabled(True)
                 dpg.configure_item("org_cancel_btn", enabled=False)
+                dpg.configure_item(self.TAG_PROGRESS_GROUP, show=False)
                 if self.on_status_update:
                     self.on_status_update("Organization failed.")
+            finally:
+                dpg.split_frame()
+                self._operation_in_progress = False
 
         self._organize_thread = threading.Thread(target=organize_thread)
         self._organize_thread.start()
@@ -616,11 +829,13 @@ class OrganizePanel:
             f"Complete! {successful} organized, {failed} failed, {skipped} skipped"
         )
         dpg.set_value(self.TAG_PROGRESS_BAR, 1.0)
-        dpg.configure_item("org_organize_btn", enabled=True)
         dpg.configure_item("org_cancel_btn", enabled=False)
 
-        # Clear preview
+        # Clear preview and re-enable buttons
         self._current_preview = None
+        self._set_buttons_enabled(True)
+        # Export disabled since preview is cleared
+        dpg.configure_item("org_export_btn", enabled=False)
 
         if self.on_organize_complete:
             self.on_organize_complete(results)
@@ -635,26 +850,66 @@ class OrganizePanel:
         """Handle export preview button click."""
         if self._current_preview is None:
             return
+        # Show file save dialog
+        dpg.show_item(self.TAG_EXPORT_DIALOG)
 
-        # Export to CSV
+    def _on_export_path_selected(self, sender, app_data) -> None:
+        """Handle export path selection from dialog."""
+        if not app_data or "file_path_name" not in app_data:
+            return
+
+        export_path = Path(app_data["file_path_name"])
+
+        # Ensure .csv extension
+        if export_path.suffix.lower() != ".csv":
+            export_path = export_path.with_suffix(".csv")
+
         try:
-            export_path = Path.home() / "Desktop" / "organize_preview.csv"
-
             with open(export_path, "w", encoding="utf-8") as f:
-                f.write("Source,Destination,Date Source,Location,Event\n")
+                f.write("Source,Destination,Date Source,Location,Event,Burst Group,Live Photo\n")
                 for change in self._current_preview.changes:
+                    burst_str = str(change.burst_group) if change.burst_group is not None else ""
+                    live_str = "Yes" if change.is_live_photo else ""
                     f.write(
                         f'"{change.source_path}","{change.dest_path}",'
                         f'"{change.date_source or ""}","{change.location or ""}",'
-                        f'"{change.event_name or ""}"\n'
+                        f'"{change.event_name or ""}","{burst_str}","{live_str}"\n'
                     )
 
             logger.info(f"Preview exported to {export_path}")
-            # Could show success message in UI
+            self._show_message("Export Successful", f"Preview exported to:\n{export_path}")
 
+        except PermissionError:
+            logger.error(f"Permission denied exporting preview to {export_path}")
+            self._show_error("Permission denied. Close the file if it's open in another program.")
         except Exception as e:
             logger.error(f"Export failed: {e}")
             self._show_error(f"Export failed: {e}")
+
+    def _show_message(self, title: str, message: str) -> None:
+        """Show an informational message.
+
+        Args:
+            title: Dialog title
+            message: Message to display
+        """
+        popup_tag = f"org_msg_popup_{uuid.uuid4().hex[:8]}"
+        with dpg.window(
+            label=title,
+            modal=True,
+            width=450,
+            height=150,
+            pos=[400, 300],
+            no_resize=True,
+            tag=popup_tag
+        ):
+            dpg.add_text(message, wrap=430)
+            dpg.add_spacer(height=20)
+            dpg.add_button(
+                label="OK",
+                callback=lambda: dpg.delete_item(popup_tag),
+                width=100
+            )
 
     def _show_error(self, message: str) -> None:
         """Show an error message.
@@ -662,7 +917,7 @@ class OrganizePanel:
         Args:
             message: Error message
         """
-        # Simple popup for now
+        popup_tag = f"org_error_popup_{uuid.uuid4().hex[:8]}"
         with dpg.window(
             label="Error",
             modal=True,
@@ -670,13 +925,13 @@ class OrganizePanel:
             height=150,
             pos=[400, 300],
             no_resize=True,
-            tag="org_error_popup"
+            tag=popup_tag
         ):
             dpg.add_text(message, wrap=380)
             dpg.add_spacer(height=20)
             dpg.add_button(
                 label="OK",
-                callback=lambda: dpg.delete_item("org_error_popup"),
+                callback=lambda: dpg.delete_item(popup_tag),
                 width=100
             )
 
@@ -689,7 +944,21 @@ class OrganizePanel:
 
     def destroy(self) -> None:
         """Clean up resources."""
+        # Cancel any running organizer
         if self._organizer:
             self._organizer.cancel()
+
+        # Wait for preview thread
+        if self._preview_thread and self._preview_thread.is_alive():
+            self._preview_thread.join(timeout=2.0)
+            self._preview_thread = None
+
+        # Wait for organize thread
         if self._organize_thread and self._organize_thread.is_alive():
             self._organize_thread.join(timeout=2.0)
+            self._organize_thread = None
+
+        # Clear state
+        self._current_preview = None
+        self._organizer = None
+        self._operation_in_progress = False

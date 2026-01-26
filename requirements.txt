@@ -7,6 +7,7 @@ dearpygui>=1.11.0
 # Image Processing
 pillow>=10.0.0
 imagehash>=4.3.0
+numpy>=1.24.0
 
 # Fast Hashing
 xxhash>=3.4.0
@@ -23,6 +24,11 @@ send2trash>=1.8.0
 
 # Version Tracking
 gitpython>=3.1.0
+
+# Document text extraction (optional)
+pdfminer.six>=20231228
+python-docx>=1.1.0
+
 
 # Video Processing (optional, for video deduplication)
 # ffmpeg-python>=0.2.0

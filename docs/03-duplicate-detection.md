@@ -129,82 +129,45 @@ These may need manual review or the AI-powered similarity features.
 
 ## Near Duplicates (Videos)
 
-### How They're Found
-
-Video near-duplicate detection works by:
-1. Extracting key frames from each video (every 10 seconds)
-2. Computing perceptual hashes of those frames
-3. Comparing frame hashes between videos
-
-Two videos are considered near-duplicates if most of their key frames match.
-
-### What It Catches
-
-- **Same video, different resolution** - 4K vs 1080p vs 720p versions
-- **Same video, different encoding** - MP4 vs AVI vs MOV
-- **Same video, different quality** - Re-encoded with different bitrates
-- **Trimmed versions** - Video with beginning/end cut off
-
-### What It Won't Catch
-
-- **Heavily edited videos** - Significant cuts, reordering
-- **Videos from different angles** - Same event but different camera
-- **Time-lapse vs real-time** - Same content but different speed
-
-### Video Processing Note
-
-Video analysis is slower than image analysis because:
-- Videos must be decoded to extract frames
-- Large video files take time to read
-- Frame extraction uses FFmpeg
-
-The app processes videos in the background and shows results as they complete.
+Video near-duplicate detection is not currently implemented. The UI includes a
+setting for processing videos, but duplicate detection today focuses on
+content hashes (exact matches) and perceptual hashing for images.
 
 ## The Duplicates Tab
 
 ### Main View
 
-The Duplicates tab shows all duplicate groups organized by type:
+The Duplicates tab shows groups on the left and details on the right:
 
-```
-[Exact Duplicates (2,341)]  [Near-Duplicate Images (847)]  [Near-Duplicate Videos (23)]
+- **Filters:** Type, Status (Pending/Resolved/Ignored), Scope, and Drive
+- **Select All / Select None:** Bulk-select visible groups
+- **Group list:** One row per group with a selection checkbox
 
-Filter: [All Types ▼]  [All Drives ▼]  [Min Size: ___]  [Sort: Size ▼]
+### Deciding Keepers
 
-Total potential savings: 52.7 GB
-```
+Use the **Strategy** section to mark keepers without deleting files:
 
-### Bulk Actions
+- **Keep Newest**
+- **Keep Oldest**
+- **Keep Largest**
+- **Keep Shortest Path**
+- **Keep on Drive...** (requires a preferred drive selection)
+- **Manual** (choose a keeper per group)
 
-Select multiple groups and apply actions to all:
+Use:
+- **Preview** to estimate impact for the selected groups (or current view)
+- **Set Keepers (Selected)** to apply the strategy to checked groups
+- **Set Keepers (All Pending)** to apply to all pending groups in the current view
 
-- **Auto-select: Keep Newest** - In each group, check the newest file, uncheck others
-- **Auto-select: Keep Oldest** - Keep the original, remove copies
-- **Auto-select: Keep Largest** - Keep highest resolution/quality
-- **Auto-select: Keep on Drive X** - Keep copy on preferred drive
-- **Auto-select: Keep Shortest Path** - Keep files with simpler paths
+### Processing Files
 
-After auto-select, review the selections and click **Apply** to remove unchecked files.
+Once keepers are selected, use the action buttons:
 
-### Individual Group Actions
+- **Quarantine** (recommended, recoverable)
+- **Send to Trash**
+- **Delete Permanently**
 
-For each duplicate group:
-- **Preview** - See all files side by side
-- **Open Location** - Open folder containing a file
-- **Select/Deselect** - Toggle which to keep
-- **Ignore Group** - Don't show this group anymore (files are intentional duplicates)
-- **Mark as Not Duplicate** - For near-duplicates: tell the app these aren't really duplicates
-
-### Reviewing Near-Duplicates
-
-Near-duplicates need more careful review since they might not be true duplicates. The preview pane shows:
-
-- Side-by-side comparison of all images
-- Zoom in to check details
-- File metadata (resolution, size, format, date)
-- Similarity percentage between each pair
-
-If images are actually different (e.g., sequential photos that look similar), click **Not Duplicates** to exclude them.
+These actions remove non-keeper files from the selected groups.
 
 ## Libraries Used
 

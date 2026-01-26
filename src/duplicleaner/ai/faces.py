@@ -5,11 +5,12 @@ and recognition. Includes temporal bridging for age progression tracking.
 """
 
 import os
+from pathlib import Path
 import struct
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
 from threading import Event
 from typing import Callable, Optional
 
@@ -27,6 +28,15 @@ INSIGHTFACE_AVAILABLE = False
 SKLEARN_AVAILABLE = False
 
 try:
+    # Suppress FutureWarning from scikit-image's deprecated estimate method
+    # used internally by insightface. The warning fires at runtime during
+    # face alignment. This will be fixed when insightface updates to use
+    # SimilarityTransform.from_estimate() instead of tform.estimate().
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*`estimate` is deprecated.*",
+        category=FutureWarning,
+    )
     import insightface
     from insightface.app import FaceAnalysis
     INSIGHTFACE_AVAILABLE = True
@@ -153,6 +163,10 @@ class FaceAnalyzer:
         self.model_name = model_name
         self.use_gpu = use_gpu
         self.det_size = det_size
+        config = get_config()
+        self.det_conf_threshold = config.ai.face_detection_threshold
+        self.match_threshold = config.ai.face_recognition_threshold
+        self.cluster_similarity_threshold = config.ai.face_clustering_threshold
 
         self._model: Optional["FaceAnalysis"] = None
         self._model_loaded = False
@@ -201,7 +215,8 @@ class FaceAnalyzer:
             self._notify_progress()
 
             # Determine providers
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if self.use_gpu else ["CPUExecutionProvider"]
+            use_gpu = self.use_gpu and self._cuda_available()
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
 
             # Get model directory
             config = get_config()
@@ -217,7 +232,7 @@ class FaceAnalyzer:
                 root=model_dir,
                 providers=providers,
             )
-            self._model.prepare(ctx_id=0 if self.use_gpu else -1, det_size=self.det_size)
+            self._model.prepare(ctx_id=0 if use_gpu else -1, det_size=self.det_size)
 
             self._model_loaded = True
             logger.info(f"Loaded face model: {self.model_name}")
@@ -234,6 +249,27 @@ class FaceAnalyzer:
         self._model = None
         self._model_loaded = False
         logger.info("Face model unloaded")
+
+    def _cuda_available(self) -> bool:
+        """Check whether CUDA can be used by InsightFace/onnxruntime."""
+        try:
+            import onnxruntime as ort
+            providers = ort.get_available_providers()
+            if "CUDAExecutionProvider" not in providers:
+                return False
+            if os.name == "nt":
+                import ctypes
+                capi_dir = Path(ort.__file__).resolve().parent / "capi"
+                provider_dll = capi_dir / "onnxruntime_providers_cuda.dll"
+                if provider_dll.exists():
+                    try:
+                        ctypes.WinDLL(str(provider_dll))
+                    except OSError:
+                        return False
+        except ImportError:
+            return False
+
+        return True
 
     # ==========================================================================
     # Face Detection
@@ -277,6 +313,8 @@ class FaceAnalyzer:
 
                 # Get confidence
                 confidence = float(face.det_score) if hasattr(face, "det_score") else 0.0
+                if confidence < self.det_conf_threshold:
+                    continue
 
                 # Get age/gender if available
                 age = int(face.age) if hasattr(face, "age") and face.age is not None else None
@@ -311,10 +349,13 @@ class FaceAnalyzer:
         """
         if file_record.id is None:
             return []
+        if self.db.is_face_blacklisted(file_record.id):
+            return []
 
         # Detect faces
         detected = self.detect_faces(file_record.path)
         if not detected:
+            self.db.mark_faces_analyzed(file_record.id, faces_found=0)
             return []
 
         faces = []
@@ -337,6 +378,7 @@ class FaceAnalyzer:
             face.id = face_id
             faces.append(face)
 
+        self.db.mark_faces_analyzed(file_record.id, faces_found=len(faces))
         return faces
 
     def analyze_batch(
@@ -374,7 +416,7 @@ class FaceAnalyzer:
             # Skip if already analyzed
             if skip_existing and file_record.id:
                 existing = self.db.get_faces_for_file(file_record.id)
-                if existing:
+                if existing or self.db.is_faces_analyzed(file_record.id):
                     continue
 
             # Analyze
@@ -414,7 +456,7 @@ class FaceAnalyzer:
     def cluster_faces(
         self,
         faces: Optional[list[Face]] = None,
-        eps: float = DBSCAN_EPS,
+        eps: Optional[float] = None,
         min_samples: int = DBSCAN_MIN_SAMPLES,
     ) -> list[FaceCluster]:
         """Cluster unassigned faces into groups.
@@ -433,7 +475,7 @@ class FaceAnalyzer:
 
         # Get unassigned faces if not provided
         if faces is None:
-            faces = self.db.get_unassigned_faces()
+            faces = self.db.get_unassigned_faces(min_confidence=self.det_conf_threshold)
 
         if len(faces) < min_samples:
             logger.info(f"Not enough faces to cluster: {len(faces)}")
@@ -455,21 +497,40 @@ class FaceAnalyzer:
             return []
 
         # Convert to numpy array
-        X = np.array(embeddings)
+        X = np.array(embeddings, dtype=np.float32)
 
-        # Normalize for cosine distance
-        X_norm = X / np.linalg.norm(X, axis=1, keepdims=True)
+        # Normalize for cosine distance, skip zero vectors
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        valid_mask = norms.squeeze() > 0
+        if not np.all(valid_mask):
+            X = X[valid_mask]
+            valid_faces = [f for i, f in enumerate(valid_faces) if valid_mask[i]]
+            embeddings = [embeddings[i] for i in range(len(embeddings)) if valid_mask[i]]
+
+        if len(X) < min_samples:
+            return []
+
+        X_norm = X / np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-8)
 
         # Compute distance matrix (1 - similarity)
         similarity_matrix = np.dot(X_norm, X_norm.T)
-        distance_matrix = 1 - similarity_matrix
+        similarity_matrix = np.clip(similarity_matrix, -1.0, 1.0)
+        distance_matrix = 1.0 - similarity_matrix
+        distance_matrix = np.clip(distance_matrix, 0.0, None)
+        np.fill_diagonal(distance_matrix, 0.0)
 
         # Run DBSCAN
-        clustering = DBSCAN(
-            eps=eps,
-            min_samples=min_samples,
-            metric="precomputed",
-        ).fit(distance_matrix)
+        if eps is None:
+            eps = max(0.05, min(0.95, 1.0 - self.cluster_similarity_threshold))
+        try:
+            clustering = DBSCAN(
+                eps=eps,
+                min_samples=min_samples,
+                metric="precomputed",
+            ).fit(distance_matrix)
+        except ValueError as exc:
+            logger.error(f"Face clustering failed: {exc}")
+            return []
 
         # Build clusters
         labels = clustering.labels_
@@ -529,7 +590,7 @@ class FaceAnalyzer:
     def match_face(
         self,
         face: Face,
-        threshold: float = MATCH_THRESHOLD_MEDIUM,
+        threshold: Optional[float] = None,
     ) -> Optional[FaceMatch]:
         """Try to match a face to a known person.
 
@@ -551,6 +612,7 @@ class FaceAnalyzer:
         face_stage = AgeStage.from_age(face_age)
 
         best_match: Optional[FaceMatch] = None
+        threshold = threshold if threshold is not None else self.match_threshold
         best_similarity = threshold
 
         for person_id, person_embeddings in self._person_embeddings.items():
@@ -576,7 +638,7 @@ class FaceAnalyzer:
     def match_and_assign_faces(
         self,
         faces: Optional[list[Face]] = None,
-        threshold: float = MATCH_THRESHOLD_HIGH,
+        threshold: Optional[float] = None,
         auto_assign: bool = True,
     ) -> tuple[int, int]:
         """Match unassigned faces to known persons.
@@ -590,7 +652,7 @@ class FaceAnalyzer:
             Tuple of (matches_found, faces_assigned)
         """
         if faces is None:
-            faces = self.db.get_unassigned_faces()
+            faces = self.db.get_unassigned_faces(min_confidence=self.det_conf_threshold)
 
         self.progress.phase = "matching"
         self._notify_progress()
@@ -598,6 +660,7 @@ class FaceAnalyzer:
         matches_found = 0
         faces_assigned = 0
 
+        threshold = threshold if threshold is not None else self.match_threshold
         for face in faces:
             if self._cancel_event.is_set():
                 break
@@ -618,6 +681,227 @@ class FaceAnalyzer:
         self._notify_progress()
 
         return matches_found, faces_assigned
+
+    def find_more_faces_for_person(
+        self,
+        person_id: int,
+        threshold: Optional[float] = None,
+        auto_assign: bool = True,
+    ) -> tuple[int, int]:
+        """Find and assign unassigned faces that match a specific person.
+
+        Unlike match_and_assign_faces which matches against all people,
+        this method only looks for faces that match the specified person.
+
+        Args:
+            person_id: ID of the person to find more faces for
+            threshold: Minimum similarity threshold (default: 0.8)
+            auto_assign: Whether to automatically assign matching faces
+
+        Returns:
+            Tuple of (matches_found, faces_assigned)
+        """
+        # Get person and their embeddings
+        person = self.db.get_person(person_id)
+        if not person:
+            logger.warning(f"Person {person_id} not found")
+            return 0, 0
+
+        if person_id not in self._person_embeddings:
+            self.load_person_embeddings()
+
+        if person_id not in self._person_embeddings:
+            logger.warning(f"No embeddings found for person {person_id}")
+            return 0, 0
+
+        person_embeddings = self._person_embeddings[person_id]
+
+        # Get unassigned faces
+        faces = self.db.get_unassigned_faces(min_confidence=self.det_conf_threshold)
+
+        self.progress.phase = "matching"
+        self._notify_progress()
+
+        threshold = threshold if threshold is not None else 0.8
+        matches_found = 0
+        faces_assigned = 0
+
+        for face in faces:
+            if self._cancel_event.is_set():
+                break
+
+            if not face.embedding:
+                continue
+
+            emb = self._deserialize_embedding(face.embedding)
+            face_age = face.estimated_age or 25
+            face_stage = AgeStage.from_age(face_age)
+
+            # Check similarity against this specific person only
+            best_similarity = 0.0
+            for stage, person_emb in person_embeddings:
+                similarity = self.compute_similarity(emb, person_emb)
+
+                # Boost similarity for same age stage
+                if stage == face_stage:
+                    similarity += 0.05
+
+                if similarity > best_similarity:
+                    best_similarity = similarity
+
+            if best_similarity >= threshold:
+                matches_found += 1
+
+                if auto_assign:
+                    self.db.assign_face_to_person(face.id, person_id)
+                    faces_assigned += 1
+                    self.db.update_person_photo_count(person_id)
+
+        self.progress.faces_matched = faces_assigned
+        self._notify_progress()
+
+        logger.info(f"Found {matches_found} matches for person {person_id} ({person.name}), assigned {faces_assigned}")
+        return matches_found, faces_assigned
+
+    # ==========================================================================
+    # Cross-Age Cluster Linking
+    # ==========================================================================
+
+    # Thresholds for cross-age matching
+    AUTO_ASSIGN_THRESHOLD = 0.85  # Auto-assign clusters above this similarity
+    SUGGEST_THRESHOLD = 0.65      # Suggest clusters between this and auto threshold
+
+    def find_intermediate_clusters(
+        self,
+        person_id: int,
+        clusters: list,
+    ) -> tuple[list, list[tuple]]:
+        """Find clusters that may be the same person at intermediate ages.
+
+        Uses embeddings from a person at known ages to find clusters that fall
+        between them temporally, suggesting they may be the same person.
+
+        Args:
+            person_id: ID of the person to find intermediate clusters for
+            clusters: List of FaceCluster objects to search
+
+        Returns:
+            Tuple of:
+            - auto_assigned_clusters: Clusters above AUTO_ASSIGN_THRESHOLD (0.85)
+            - suggested_clusters_with_scores: List of (cluster, score) for review (0.65-0.85)
+        """
+        person = self.db.get_person(person_id)
+        if not person:
+            return [], []
+
+        # Load person embeddings if needed
+        if person_id not in self._person_embeddings:
+            self.load_person_embeddings()
+
+        if person_id not in self._person_embeddings:
+            return [], []
+
+        person_embeddings = self._person_embeddings[person_id]
+        if not person_embeddings:
+            return [], []
+
+        auto_assigned = []
+        suggestions = []
+
+        for cluster in clusters:
+            # Skip clusters already assigned to someone
+            if not cluster.face_ids:
+                continue
+
+            # Get sample faces from cluster
+            sample_faces = self.db.get_faces_by_ids(cluster.face_ids[:10])
+            if not sample_faces:
+                continue
+
+            # Compute best similarity to person's embeddings
+            best_similarity = 0.0
+
+            for face in sample_faces:
+                if not face.embedding:
+                    continue
+
+                emb = self._deserialize_embedding(face.embedding)
+                face_age = face.estimated_age
+
+                for stage, person_emb in person_embeddings:
+                    similarity = self.compute_similarity(emb, person_emb)
+
+                    # Boost if cluster's estimated age falls between known ages
+                    if face_age and person.birth_year:
+                        expected_age = face_age
+                        stage_age = stage.mid_age() if hasattr(stage, 'mid_age') else 25
+                        # Small boost for intermediate ages
+                        if abs(expected_age - stage_age) < 5:
+                            similarity += 0.02
+
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+
+            # Categorize based on similarity
+            if best_similarity >= self.AUTO_ASSIGN_THRESHOLD:
+                auto_assigned.append(cluster)
+            elif best_similarity >= self.SUGGEST_THRESHOLD:
+                suggestions.append((cluster, best_similarity))
+
+        # Sort suggestions by score (highest first)
+        suggestions.sort(key=lambda x: x[1], reverse=True)
+
+        return auto_assigned, suggestions
+
+    def link_person_across_ages(self, person_id: int) -> tuple[int, int]:
+        """Auto-assign high-confidence clusters and return suggestion count.
+
+        Called after naming/assigning a person to find related clusters.
+
+        Args:
+            person_id: ID of the person to link across ages
+
+        Returns:
+            Tuple of (auto_assigned_count, suggestion_count)
+        """
+        # Get current clusters
+        run = self.db.get_latest_face_cluster_run()
+        if not run:
+            return 0, 0
+
+        run_id, _ = run
+        cluster_data = self.db.get_face_clusters_for_run(run_id)
+
+        # Convert to FaceCluster objects
+        clusters = []
+        for cluster_id, face_ids in cluster_data:
+            # Only include unassigned clusters
+            faces = self.db.get_faces_by_ids(face_ids[:5])
+            if faces and all(f.person_id is None for f in faces):
+                sample = self.db.get_faces_by_ids(face_ids[:5])
+                clusters.append(FaceCluster(
+                    cluster_id=cluster_id,
+                    face_ids=face_ids,
+                    sample_faces=sample,
+                ))
+
+        auto_assigned, suggestions = self.find_intermediate_clusters(person_id, clusters)
+
+        # Auto-assign high-confidence matches
+        auto_count = 0
+        for cluster in auto_assigned:
+            for face_id in cluster.face_ids:
+                self.db.assign_face_to_person(face_id, person_id)
+                auto_count += 1
+            self.db.update_person_photo_count(person_id)
+
+        logger.info(
+            f"Cross-age linking for person {person_id}: "
+            f"auto-assigned {auto_count} faces from {len(auto_assigned)} clusters, "
+            f"{len(suggestions)} clusters suggested for review"
+        )
+
+        return len(auto_assigned), len(suggestions)
 
     # ==========================================================================
     # Person Management
@@ -662,6 +946,15 @@ class FaceAnalyzer:
 
         logger.info(f"Created person '{name}' with {len(cluster.face_ids)} faces")
         return person_id
+
+    def assign_cluster_to_person(self, cluster: FaceCluster, person_id: int) -> None:
+        """Assign all faces in a cluster to an existing person."""
+        for face_id in cluster.face_ids:
+            self.db.assign_face_to_person(face_id, person_id)
+
+        # Refresh embedding cache
+        self.load_person_embeddings()
+        logger.info(f"Assigned cluster with {len(cluster.face_ids)} faces to person {person_id}")
 
     def merge_clusters(
         self,
@@ -863,7 +1156,7 @@ class FaceAnalyzer:
         self,
         face: Face,
         limit: int = 20,
-        threshold: float = MATCH_THRESHOLD_LOW,
+        threshold: Optional[float] = None,
     ) -> list[tuple[Face, float]]:
         """Find faces similar to a given face.
 
@@ -885,6 +1178,7 @@ class FaceAnalyzer:
 
         # Compute similarities
         results = []
+        threshold = threshold if threshold is not None else self.match_threshold
         for other_face in all_faces:
             if other_face.id == face.id:
                 continue

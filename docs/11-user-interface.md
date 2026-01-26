@@ -10,7 +10,7 @@ The app uses a modern desktop interface built with Dear PyGui, providing GPU-acc
 +------------------------------------------------------------------+
 |  NAS Duplicate Cleanup Tool                          [_] [□] [X] |
 +------------------------------------------------------------------+
-|  [Drives] [Duplicates] [Organize] [Faces] [Search] [Settings]    |
+|  [Drives] [Duplicates] [Photos] [Faces] [Search] [Settings]      |
 +------------------------------------------------------------------+
 |                                                                   |
 |  +------------------+  +--------------------------------------+   |
@@ -36,7 +36,7 @@ Six main tabs for different features:
 |-----|---------|
 | **Drives** | Manage storage locations, start scans |
 | **Duplicates** | View and resolve duplicate files |
-| **Organize** | Photo organization tools |
+| **Photos** | Photo organizer - sort unorganized photos into folders |
 | **Faces** | Face recognition and people management |
 | **Search** | Find files by content, text, or metadata |
 | **Settings** | Configure app behavior |
@@ -146,10 +146,54 @@ Loading... [⠋]
 
 **Background Task Badge:**
 ```
-[Duplicates] [Organize] [Faces 🔄] [Search]
-                         ↑
-              (status bar updates during long operations like scan, hash, organize, backup)
+[Duplicates] [Photos] [Faces 🔄] [Search]
+                        ↑
+              (status bar updates during long operations like scan, hash, photo organization, backup)
 ```
+
+## Tooltips
+
+Tooltips provide contextual help when hovering over UI elements. They explain what buttons, checkboxes, and input fields do without cluttering the interface.
+
+### Using Tooltips
+
+Hover over any UI element to see its tooltip. Tooltips appear after a brief delay and contain:
+- Brief description of the feature
+- What happens when you click/change it
+- Tips for when to use the feature
+
+### Implementation (for developers)
+
+Tooltips use the `duplicleaner.ui.tooltips` module:
+
+```python
+from duplicleaner.ui.tooltips import add_tooltip, DRIVE_TOOLTIPS
+
+# After creating a widget:
+btn = dpg.add_button(label="Quick Scan", callback=...)
+add_tooltip(btn, DRIVE_TOOLTIPS["quick_scan"])
+
+# Or with custom text:
+add_tooltip(some_widget, "Custom tooltip explaining this feature.")
+```
+
+**Adding tooltips to a new panel:**
+
+1. Import the tooltip module
+2. Define tooltip text in `tooltips.py` (e.g., `MY_PANEL_TOOLTIPS` dict)
+3. Call `add_tooltip(widget, text)` after creating each widget
+
+**Tooltip text guidelines:**
+- First line: What the feature does
+- Additional lines: When/why to use it
+- Keep under 4 lines total
+- Use `\n` for line breaks in the dict values
+
+**Available tooltip dictionaries:**
+- `DRIVE_TOOLTIPS` - Drives panel
+- `DUPLICATE_TOOLTIPS` - Duplicates panel
+- `FACE_TOOLTIPS` - Faces panel (placeholder)
+- `ORGANIZE_TOOLTIPS` - Photo Organizer panel (Photos tab)
 
 ## Tab-Specific Interfaces
 
@@ -194,9 +238,10 @@ Model downloads run in the background and are stored in the app's models directo
 |   [Connected]    | Size: 892 GB used, 108 GB free        |
 |                  | Last scan: 2 hours ago                |
 | > Old External   |                                        |
-|   [Disconnected] | [Scan] [Quick Scan] [Full Analysis]   |
+|   [Disconnected] | [Quick Scan] [Deep Scan] [Full Analysis] [Scan All...] |
 |                  |                                        |
-| [+ Add Drive]    | REDUNDANCY & BACKUPS                   |
+| [+ Add Drive]    | [Remove Selected] [Hash Now] [Resume Scan] |
+|                  | REDUNDANCY & BACKUPS                   |
 |                  | - Generate redundancy report           |
 | SUMMARY          | - At-risk files listed below           |
 | Files: 234,567   | - Source + targets + exclude patterns  |
@@ -207,6 +252,8 @@ Model downloads run in the background and are stored in the app's models directo
 ```
 
 When a scan is paused or interrupted, a **Resume Scan** button appears in the Drives tab for that drive.
+
+The Redundancy & Backups section includes project-type detection; it lists detected projects and suggests exclude patterns you can optionally apply.
 
 ### Log Tab
 
@@ -249,11 +296,13 @@ The log supports filtering by level and exporting to a text file.
 +------------------+----------------------------------------+
 ```
 
-### Organize Tab
+### Photos Tab (Photo Organizer)
+
+The Photos tab helps you organize unstructured photo collections (phone dumps, unsorted folders) into well-organized date/location-based folder structures using EXIF metadata.
 
 ```
 +------------------+----------------------------------------+
-| ORGANIZE         | PREVIEW                                |
+| PHOTO ORGANIZER  | PREVIEW                                |
 |                  |                                        |
 | Source:          | 2024/                                  |
 | [\\NAS\Unsorted] |   01-January/                          |
@@ -271,60 +320,182 @@ The log supports filtering by level and exporting to a text file.
 | [x] Smart Rename |                                        |
 | [ ] Separate     | Ready to organize: 45,234 files        |
 |     Screenshots  |                                        |
-|                  | [Preview] [Dry Run] [Organize]         |
+|                  | [Preview] [Dry Run] [Organize Now]     |
 +------------------+----------------------------------------+
 ```
+
+**Key Features:**
+- Date-based folder organization (YYYY/MM, YYYY/MM-Month, YYYY/MM/DD)
+- Location grouping using GPS data from photos
+- Event clustering by time proximity
+- Smart file renaming with patterns
+- Screenshot, burst photo, and Live Photo handling
+- Dry-run mode for safe preview before execution
 
 ### Faces Tab
 
+The Faces tab provides two views: Unknown Clusters (faces waiting to be identified) and Named People (your identified contacts with photo browsing).
+
+**Named People View:**
 ```
-+------------------+----------------------------------------+
-| PEOPLE           | EMMA - 456 PHOTOS                      |
-|                  |                                        |
-| > Emma (456)     | AGE TIMELINE                           |
-| > Dad (234)      | 2015  2017  2019  2021  2023  2024    |
-| > Mom (198)      | |-----|-----|-----|-----|-----|       |
-| > Jake (145)     |                                        |
-| > Grandma (167)  | +---+ +---+ +---+ +---+ +---+ +---+   |
-|                  | |   | |   | |   | |   | |   | |   |   |
-| Unknown Clusters | +---+ +---+ +---+ +---+ +---+ +---+   |
-| > Cluster 1 (89) |  0yr   2yr   4yr   6yr   8yr   9yr   |
-| > Cluster 2 (67) |                                        |
-| > Cluster 3 (45) | [View All] [Find More] [Edit Person]  |
-|                  |                                        |
-| [Analyze Photos] | RECENT ADDITIONS                       |
-| [Merge People]   | +---+ +---+ +---+                      |
-|                  | | ? | | ? | | ? |  3 faces to review  |
-+------------------+----------------------------------------+
++------------------------------------------------------------------------+
+| Faces & Pets                                                            |
++------------------------------------------------------------------------+
+| [Run Face Analysis] [Run Pet Analysis] [Cluster Faces] [Refresh]       |
+|                                                                         |
+| View: ( ) Unknown Clusters  (x) Named People                           |
+|                                                                         |
+| Search: [Filter by name...] [Clear]    [ ] Show Hidden (0)             |
++------------------------------------------------------------------------+
+| NAME        | PHOTOS | AGE RANGE | ACTIONS                              |
+|-------------|--------|-----------|--------------------------------------|
+| Emma        | 456    | ~9 years  | [Photos][Timeline][Find More][Edit][Delete] |
+| Dad         | 234    | -         | [Photos][Timeline][Find More][Edit][Delete] |
+| Mom         | 198    | -         | [Photos][Timeline][Find More][Edit][Delete] |
++------------------------------------------------------------------------+
 ```
+
+**Photo Gallery Dialog** (opened via "Photos" button):
+```
++------------------------------------------------------------------------+
+| Photo Gallery                                                       [X] |
++------------------------------------------------------------------------+
+| Photos of Emma                                                          |
+| 456 photos | Age ~9 | Born ~2015                                       |
++------------------------------------------------------------------------+
+| Sort by: [Date (Newest) v]    [Select All] [Open Selected]             |
++------------------------------------------------------------------------+
+| +-------+ +-------+ +-------+ +-------+ +-------+ +-------+            |
+| | thumb | | thumb | | thumb | | thumb | | thumb | | thumb |            |
+| +-------+ +-------+ +-------+ +-------+ +-------+ +-------+            |
+| IMG_001   IMG_002   IMG_003   IMG_004   IMG_005   IMG_006              |
+| 2024-03   2024-03   2024-02   2024-02   2024-01   2024-01              |
+|                                                                         |
+| (scrollable grid of photos...)                                          |
++------------------------------------------------------------------------+
+| [Find More Photos] [View Timeline]                          [Close]     |
++------------------------------------------------------------------------+
+```
+
+**Timeline Dialog** (shows photos organized by year with thumbnails):
+```
++------------------------------------------------------------------------+
+| Timeline: Emma                                                      [X] |
++------------------------------------------------------------------------+
+| 2024 (Age ~9) - 45 photos                                              |
+| ----------------------------------------------------------------       |
+| +---+ +---+ +---+ +---+ +---+ +---+ +---+ +---+                        |
+| |   | |   | |   | |   | |   | |   | |   | |   |                        |
+| +---+ +---+ +---+ +---+ +---+ +---+ +---+ +---+                        |
+|   +21 more photos                                                       |
+|                                                                         |
+| 2023 (Age ~8) - 67 photos                                              |
+| ----------------------------------------------------------------       |
+| +---+ +---+ +---+ +---+ +---+ +---+ +---+ +---+                        |
+| |   | |   | |   | |   | |   | |   | |   | |   |                        |
+| +---+ +---+ +---+ +---+ +---+ +---+ +---+ +---+                        |
++------------------------------------------------------------------------+
+| [Close] [Find More Photos]                                              |
++------------------------------------------------------------------------+
+```
+
+**Photo Preview Dialog** (click any photo in gallery or timeline):
+```
++------------------------------------------------------------------------+
+| Photo Preview                                                       [X] |
++------------------------------------------------------------------------+
+| IMG_4521.jpg | 4.2 MB | 2024-03-15 14:32                              |
++------------------------------------------------------------------------+
+|                                                                         |
+|              +----------------------------------+                        |
+|              |                                  |                        |
+|              |         (Large Preview)          |                        |
+|              |                                  |                        |
+|              +----------------------------------+                        |
+|                                                                         |
+| Path: C:\Photos\2024\03\IMG_4521.jpg                                   |
++------------------------------------------------------------------------+
+| [Open File] [Show in Explorer] [Remove from Person]          [Close]    |
++------------------------------------------------------------------------+
+```
+
+**Actions:**
+- **Photos**: Browse all photos of a person in a scrollable gallery
+- **Timeline**: View photos grouped by year with age tracking
+- **Find More**: Search for additional photos using face recognition
+- **Edit**: Change name or birth year
+- **Delete**: Remove person (their faces return to Unknown Clusters)
 
 ### Search Tab
 
+The Search tab provides powerful file discovery using AI-powered semantic search and text-based search.
+
 ```
-+------------------+----------------------------------------+
-| SEARCH           | RESULTS                                |
-|                  |                                        |
-| Query:           | "sunset beach vacation"                |
-| [sunset beach   ]| 234 results                            |
-| [vacation       ]|                                        |
-| [Search]         | +---+ +---+ +---+ +---+ +---+          |
-|                  | |   | |   | |   | |   | |   |          |
-| FILTERS          | +---+ +---+ +---+ +---+ +---+          |
-|                  | 94%   91%   89%   87%   85%            |
-| Date Range:      |                                        |
-| [Any        ▼]   | +---+ +---+ +---+ +---+ +---+          |
-|                  | |   | |   | |   | |   | |   |          |
-| Person:          | +---+ +---+ +---+ +---+ +---+          |
-| [Any Person ▼]   | 82%   80%   78%   76%   74%            |
-|                  |                                        |
-| File Type:       | Showing 50 of 234 matches              |
-| [Images Only ▼]  |                                        |
-|                  | [Load More Results]                    |
-| SAVED SEARCHES   |                                        |
-| - Beach vacations|                                        |
-| - Kids activities|                                        |
-+------------------+----------------------------------------+
++------------------------------------------------------------------------+
+| SEMANTIC SEARCH                                                         |
++------------------------------------------------------------------------+
+| [Search photos, scenes, or text...                    ] [Search] [Clear]|
+|                                                                         |
+| [x] Semantic (CLIP)  [x] Text (summaries/OCR/tags)  Limit: [200]       |
+|                                                      Sort: [Relevance v]|
+|                                                                         |
+| Type: [All v]  Date: [From______] [To________]  Person: [Name______]   |
+|                                                                         |
+| Found 234 result(s).                    [Select All] [Select None]      |
++------------------------------------------------------------------------+
+| RESULTS (scrollable cards with thumbnails)                              |
+|                                                                         |
+| +--------------------------------------------------------------------+ |
+| | [x] +-------+ vacation_001.jpg                [Preview][Open][Expl]| |
+| |     | thumb | 4.2 MB  |  2024-03-15 14:32                          | |
+| |     +-------+ Source: semantic  |  Score: 0.943                    | |
+| |               beach (0.89), sunset (0.82), travel (0.71)           | |
+| +--------------------------------------------------------------------+ |
+|                                                                         |
+| +--------------------------------------------------------------------+ |
+| | [ ] +-------+ IMG_5234.jpg                    [Preview][Open][Expl]| |
+| |     | thumb | 3.8 MB  |  2024-03-14 10:15                          | |
+| |     +-------+ Source: semantic+tags  |  Score: 0.891               | |
+| |               ocean (0.85), sunny (0.79)                           | |
+| +--------------------------------------------------------------------+ |
++------------------------------------------------------------------------+
 ```
+
+**Search Modes:**
+- **Semantic (CLIP)**: AI-powered search using natural language. Finds images matching queries like "dog playing in snow" or "birthday party with cake".
+- **Text Search**: Searches AI-generated summaries, OCR text from documents/screenshots, and user-assigned tags.
+
+**Filters:**
+- **Type**: All, Images, Videos, Documents, Other
+- **Date Range**: From/To dates (YYYY-MM-DD format, flexible parsing)
+- **Person**: Filter by people detected in photos (partial name match)
+
+**Sorting Options:**
+- **Relevance**: Semantic matches first by similarity score, then text matches
+- **Date (Newest/Oldest)**: By file modification date
+- **Size (Largest/Smallest)**: By file size
+- **Name**: Alphabetical by filename
+
+**Result Cards:**
+Each result displays:
+- Selection checkbox for batch operations
+- Thumbnail preview (for images) or file type indicator
+- Filename (clickable to open preview dialog)
+- File size and modification date
+- Search source (semantic, tags, summary, ocr)
+- Similarity score (for semantic matches)
+- Top AI-detected categories
+
+**Actions:**
+- **Preview**: Opens a detailed preview dialog with larger image and full metadata
+- **Open**: Opens the file with its default application
+- **Explorer**: Opens Windows Explorer with the file selected
+
+**Preview Dialog:**
+- Large image preview (500px max)
+- Full file path and metadata
+- Open and Explorer buttons
+- Works for non-image files too (shows file info without preview)
 
 ## Keyboard Shortcuts
 

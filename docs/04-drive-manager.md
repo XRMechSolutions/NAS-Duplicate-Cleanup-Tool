@@ -32,6 +32,8 @@ E:\
 \\LS210D11E\share\Documents                              766 GB free
 ```
 
+Use **Scan All** to apply the same scan mode across every registered drive, one at a time.
+
 ### Drive Status Indicators
 
 Each drive shows its current status:
@@ -46,19 +48,17 @@ Each drive shows its current status:
 
 ### Adding a Drive
 
-1. Click **Add Location**
-2. Choose the type:
-   - **Browse Local** - Opens folder picker for local/USB drives
-   - **Enter Network Path** - Type UNC path (e.g., `\\NAS\share`)
-3. Enter a friendly name (e.g., "NAS Photos", "Backup External")
+1. Click **Add Drive**
+2. Enter a folder path or UNC path (e.g., `C:\Photos` or `\\NAS\share`)
+3. Enter a friendly name (optional)
 4. Click **Add**
 
 The drive appears in your list with "Needs Scan" status.
 
 ### Removing a Drive
 
-1. Right-click the drive
-2. Select **Remove from List**
+1. Select a drive in the list
+2. Click **Remove Selected**
 3. Confirm removal
 
 Removing a drive from the list:
@@ -68,11 +68,7 @@ Removing a drive from the list:
 
 ### Editing Drive Settings
 
-Right-click a drive and select **Properties** to:
-- Change the friendly name
-- Update the path (if drive letter changed)
-- Set as "Primary" drive (preferred location for keeping files)
-- Exclude from certain operations
+Drive properties (rename, change path, primary drive, exclusions) are planned but not implemented yet.
 
 ## Redundancy Analysis
 
@@ -131,6 +127,8 @@ Documents/Tax_Returns_2024.pdf                  Backup Drive    156 KB
 ...
 
 Filter/sorting controls are not implemented yet.
+
+The summary totals reflect all hashed files; the list is a capped sample.
 ```
 
 Use **Build Backup Plan** to preview targets, then **Execute Plan** to copy.
@@ -185,6 +183,8 @@ The app can suggest what to backup and where:
 5. Click **Build Backup Plan**
 
 Use **Analyze Exclusions** to see how much space each exclude pattern would save.
+The app also detects common project types (Unity, Unreal, Android/Gradle, Node.js, .NET, Python, CMake) within the source
+folder and suggests additional exclude patterns you can review and apply manually.
 
 ### The Backup Plan
 
@@ -256,13 +256,14 @@ Planned for a future release:
 ### Drive Identification
 
 Drives are identified by:
-- **Local drives**: Volume serial number (survives drive letter changes)
+- **Local drive roots**: Volume serial number (survives drive letter changes)
+- **Local subfolders**: Volume serial number + folder path
 - **Network shares**: UNC path normalized to consistent format
 - **Friendly name**: User-assigned label for display
 
 ### Path Mapping
 
-If you access the same drive via different paths (e.g., `Z:\` and `\\NAS\share`), the app detects this and treats them as the same location, avoiding false duplicates.
+Mapped drive letters and UNC paths are currently treated as separate locations. Prefer UNC paths for network shares to avoid duplicates.
 
 ### Database Storage
 

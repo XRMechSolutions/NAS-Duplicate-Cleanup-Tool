@@ -48,7 +48,7 @@ duplicleaner/
 
 ### 1.4 Basic UI Shell
 - [x] Dear PyGui app initialization (`app.py`)
-- [x] Main window with tab bar: Drives, Duplicates, Organize, Faces, Search, Settings
+- [x] Main window with tab bar: Drives, Duplicates, Photos, Faces, Search, Settings
 - [x] Status bar (file count, storage, GPU status)
 - [x] Left panel placeholder
 - [x] Main content area placeholder
@@ -127,7 +127,7 @@ duplicleaner/
 - [x] Progress tracking with cancel support
 - [x] Conflict resolution options
 
-### 4.2 Organize UI (`ui/organize_panel.py`)
+### 4.2 Photo Organizer UI (`ui/organize_panel.py` - Photos tab)
 - [x] Source/destination folder selection
 - [x] Organization settings (date format, location, events)
 - [x] File naming settings (patterns, conflicts)
@@ -198,6 +198,17 @@ duplicleaner/
 ---
 
 ## Phase 6: AI - Face & Pet Recognition
+
+---
+
+## Test Plan Updates
+
+- [x] DriveManager: distinct folder IDs on same volume
+- [ ] Drives UI: single-selection behavior (manual)
+- [ ] Drives UI: hash-only shows progress (manual)
+- [ ] Drives UI: status auto-refresh on connect/disconnect (manual)
+- [ ] Drives UI: scan all runs sequentially and completes (manual)
+- [ ] Drives UI: remove confirmation dialog (manual)
 
 ### 6.1 Face Analyzer (`ai/faces.py`)
 - [x] InsightFace model download/loading (buffalo_l)

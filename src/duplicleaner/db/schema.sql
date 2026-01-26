@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS persons (
     birth_year INTEGER,         -- Approximate birth year for age progression
     notes TEXT,                 -- User notes about the person
     is_favorite BOOLEAN DEFAULT FALSE,
+    is_hidden BOOLEAN DEFAULT FALSE,  -- Hidden/ignored persons (unknown faces user wants to hide)
     reference_photo_id INTEGER, -- Best photo for identification
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     photo_count INTEGER DEFAULT 0
@@ -118,6 +119,51 @@ CREATE TABLE IF NOT EXISTS faces (
     estimated_age INTEGER,
     estimated_gender TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- User blacklisted files for face detection
+CREATE TABLE IF NOT EXISTS face_blacklist (
+    file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Face clustering runs and membership (persist clusters across sessions)
+CREATE TABLE IF NOT EXISTS face_cluster_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    method TEXT DEFAULT 'auto',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS face_clusters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES face_cluster_runs(id) ON DELETE CASCADE,
+    method TEXT DEFAULT 'auto',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS face_cluster_members (
+    cluster_id INTEGER NOT NULL REFERENCES face_clusters(id) ON DELETE CASCADE,
+    face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+    PRIMARY KEY (cluster_id, face_id)
+);
+
+CREATE TABLE IF NOT EXISTS face_cluster_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    from_cluster_id INTEGER,
+    to_cluster_id INTEGER,
+    face_ids TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Per-file AI analysis status (used to avoid reprocessing)
+CREATE TABLE IF NOT EXISTS file_ai_status (
+    file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    faces_analyzed BOOLEAN DEFAULT FALSE,
+    faces_found INTEGER DEFAULT 0,
+    faces_error TEXT,
+    faces_updated_at TIMESTAMP
 );
 
 -- Scene and content analysis

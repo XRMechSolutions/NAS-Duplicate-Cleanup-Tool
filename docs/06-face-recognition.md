@@ -38,6 +38,31 @@ With labeled faces, the app finds more photos:
 
 ## The Faces Tab
 
+### Background Processing During Scans
+
+When a scan is running, the app can start face analysis on images as soon as they are discovered. It keeps analyzing while the scan continues and finishes any remaining images after the scan completes. This means you don't have to wait for the entire scan to finish before face clusters start to appear.
+
+While background analysis is running, the Faces tab will auto-refresh and re-cluster periodically so new faces show up without manual clicks.
+
+### Face Analysis Settings
+
+In the Faces tab, you can tune detection and clustering:
+- **Detection confidence** to reduce false positives
+- **Recognition similarity** for matching to known people
+- **Clustering similarity** to control how tight clusters are
+
+Changing the detection confidence refilters existing detections for clustering and display, so you can tighten results without reprocessing all photos.
+
+### Assign Clusters to a Known Person
+
+If a cluster is clearly the same person as someone you already named, use **Assign** on the cluster and choose the person. This helps the system connect different ages of the same person.
+
+### Split Mixed Clusters
+
+If two people are mixed in one cluster, use **Split**. Select the faces that belong together, then **Name Selected** or **Assign Selected** to an existing person.
+
+Clusters are now persisted across sessions, and manual splits are recorded so you can keep working without reclustering after restart.
+
 ### Cluster View (Default)
 
 When you first open the Faces tab, you see face clusters:
@@ -78,7 +103,7 @@ Name: [Emma                    ]
 [ ] This person is a child (enable age tracking)
     Birth year (approximate): [2015    ]
 
-[Not the Same Person]  [Cancel]  [Save]
+[Cancel]  [Save]
 ```
 
 **Options:**
@@ -86,7 +111,7 @@ Name: [Emma                    ]
 - **Child tracking** - Enable special age progression for children
 - **Birth year** - Approximate birth year helps with age estimation
 
-**If faces don't match:** Click "Not the Same Person" to split the cluster.
+**If faces don't match:** Use the **Split** button on the cluster to separate mixed faces before naming.
 
 ### People View
 
@@ -106,22 +131,13 @@ Age range: 65-74           Age range: 5-14
 [View All People]
 ```
 
-Click a person to see all their photos:
+For each person, you can:
+- **Timeline** - View their photo counts by year (with age if birth year is set)
+- **Find More** - Search unassigned faces for more photos of this specific person
+- **Edit** - Change name or birth year
+- **Delete** - Remove the person (faces return to unassigned)
 
-```
-EMMA - 456 PHOTOS
-
-Timeline View: [0-1 yr] [2-3 yr] [4-5 yr] [6-7 yr] [8-9 yr] [All Ages]
-
-[Grid of photos organized by age]
-
-2015 (Baby): 45 photos
-2016 (1 year): 67 photos
-2017 (2 years): 89 photos
-...
-
-[Find More Photos]  [Edit Person]  [Merge with Another Person]
-```
+The **Find More** button searches specifically for photos matching that person's face embeddings, not all people.
 
 ## Age Progression Tracking
 
@@ -173,31 +189,28 @@ For each person who is/was a child in your photos:
 
 The app re-analyzes their photos with age-aware matching.
 
-### Manual Linking
-
-Sometimes the automatic bridging misses a connection. You can manually link:
-
-1. Go to person's timeline view
-2. Find a gap or separate cluster
-3. Drag photos into the timeline, or
-4. Use **Link Faces** to manually connect clusters
-
 ### Viewing the Age Timeline
 
-For people with age tracking enabled:
+Click **Timeline** on a person to see their photos organized by year:
 
 ```
-EMMA - AGE TIMELINE
+TIMELINE: EMMA
 
-      2015    2016    2017    2018    2019    2020    2021    2022    2023    2024
-      Baby    1 yr    2 yr    3 yr    4 yr    5 yr    6 yr    7 yr    8 yr    9 yr
-      ----    ----    ----    ----    ----    ----    ----    ----    ----    ----
-Photos: 45      67      89      78      56      92      84      76      68      45
+2015 (Age ~0): 45 photos
+2016 (Age ~1): 67 photos
+2017 (Age ~2): 89 photos
+2018 (Age ~3): 78 photos
+...
 
-[Scrollable timeline of photos showing growth over time]
-
-[Export Timeline]  [Find Missing Years]
+[Find More Photos]  [Close]
 ```
+
+The timeline shows:
+- Year of photo (based on EXIF date or file date)
+- Approximate age if birth year is set
+- Number of photos from that year
+
+Use **Find More Photos** from the timeline dialog to search for additional photos of this person.
 
 ## Face Detection Settings
 
@@ -274,6 +287,98 @@ When you have many unknown clusters:
 2. Find the wrong photo
 3. Click **Remove from Person**
 4. The face returns to unknown clusters
+
+## Ignoring Unknown Faces
+
+### When to Use Ignore
+
+Use the **Ignore** button when a cluster contains faces you don't want to track:
+- Strangers in the background of crowd photos
+- People who appear once and won't be in other photos
+- Faces that are false positives (not actually faces)
+
+### How Ignore Works
+
+When you click **Ignore** on a cluster:
+1. A hidden person is created with the name "Unknown #N"
+2. All faces in the cluster are assigned to this hidden person
+3. The cluster disappears from the Unknown Clusters view
+4. The hidden person won't appear in the regular People list
+
+### Viewing Hidden People
+
+To see hidden/ignored people:
+1. Switch to the **People** view
+2. Check the **Show Hidden (N)** checkbox in the header
+3. Hidden people appear dimmed/grayed out
+
+### Managing Hidden People
+
+For each hidden person, you can:
+- **Restore** - Unhide them so they appear in the regular People list
+- **Delete** - Permanently remove them (faces return to Unknown Clusters)
+
+This is useful if you accidentally ignored the wrong cluster.
+
+## Managing Named People
+
+### Editing a Person
+
+To change a person's details:
+1. In the People view, click **Edit** next to their name
+2. Update their name or birth year
+3. Click **Save**
+
+Birth year helps with age-based matching for children.
+
+### Deleting a Person
+
+To remove a person:
+1. Click **Delete** next to their name
+2. Confirm in the dialog (shows how many faces will be affected)
+3. The person is removed and their faces return to Unknown Clusters
+
+This is useful if you named someone incorrectly or want to re-process their faces.
+
+### Searching People
+
+Use the search bar in the People view to filter by name:
+- Type any part of the name to filter
+- Case-insensitive matching
+- Click **Clear** to show all people again
+
+## Cross-Age Cluster Linking
+
+### Automatic Cross-Age Matching
+
+After you name or assign a cluster to a person, the app automatically looks for other clusters that might be the same person at different ages.
+
+**Auto-assignment:** Clusters with 85%+ similarity are automatically assigned.
+
+**Suggestions:** Clusters with 65-85% similarity are flagged for your review.
+
+### How It Works
+
+1. When you name a cluster (e.g., "Emma at age 5"), the app saves those face embeddings
+2. It searches other unknown clusters for faces that match
+3. High-confidence matches are auto-assigned
+4. Medium-confidence matches are shown as suggestions for you to review
+
+### Finding Related Clusters Manually
+
+In the People view, use **Find Related Clusters** (or similar) to manually trigger a search for more clusters that might be this person at other ages.
+
+## Reset Confirmation
+
+### Safety First
+
+Before clearing face data, a confirmation dialog appears showing:
+- What will be deleted (all faces, unassigned only, or low-confidence)
+- The scope (all drives or a specific drive)
+- The count of faces affected
+- Color-coded severity (red for destructive, yellow for moderate, green for safe)
+
+This prevents accidental data loss.
 
 ### Suggested Matches
 

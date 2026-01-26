@@ -5,6 +5,7 @@ and provides methods for common database operations.
 """
 
 import sqlite3
+import json
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -101,6 +102,9 @@ class Database:
                     logger.info(f"Database initialized at {self.db_path}")
                 else:
                     logger.warning(f"Schema file not found at {schema_path}")
+
+                # Run migrations for existing databases
+                self._run_migrations(conn)
         except sqlite3.OperationalError as exc:
             if "readonly" not in str(exc).lower():
                 raise
@@ -112,6 +116,21 @@ class Database:
                     with open(schema_path, "r", encoding="utf-8") as f:
                         conn.executescript(f.read())
                     logger.info(f"Database initialized at {self.db_path}")
+                # Run migrations for fallback path too
+                self._run_migrations(conn)
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """Run database migrations for schema changes.
+
+        Adds new columns to existing tables if they don't exist.
+        """
+        # Migration: Add is_hidden column to persons table
+        try:
+            conn.execute("SELECT is_hidden FROM persons LIMIT 1")
+        except sqlite3.OperationalError:
+            # Column doesn't exist, add it
+            conn.execute("ALTER TABLE persons ADD COLUMN is_hidden BOOLEAN DEFAULT FALSE")
+            logger.info("Migration: Added is_hidden column to persons table")
 
     @contextmanager
     def connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -320,6 +339,18 @@ class Database:
                 return FileRecord(**dict(row))
             return None
 
+    def get_file_by_path_any(self, path: str) -> Optional[FileRecord]:
+        """Get a file by path across all drives."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM files WHERE path = ? AND is_deleted = FALSE",
+                (path,)
+            ).fetchone()
+
+            if row:
+                return FileRecord(**dict(row))
+            return None
+
     def get_files_by_size(self, size: int) -> list[FileRecord]:
         """Get all files with a specific size."""
         with self.connection() as conn:
@@ -448,6 +479,18 @@ class Database:
 
             return [FileRecord(**dict(row)) for row in rows]
 
+    def get_content_hash_counts(self) -> tuple[int, int]:
+        """Return total files and count with content hashes."""
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) as total,
+                          SUM(CASE WHEN content_hash IS NOT NULL THEN 1 ELSE 0 END) as hashed
+                   FROM files WHERE is_deleted = FALSE"""
+            ).fetchone()
+            total = row["total"] or 0
+            hashed = row["hashed"] or 0
+            return total, hashed
+
     def get_files_by_type(
         self,
         extensions: list[str],
@@ -513,6 +556,48 @@ class Database:
                     params
                 )
 
+    def update_file_scan_date(self, file_id: int, scan_date: Optional[datetime] = None) -> None:
+        """Update scan date (and undelete) for a file."""
+        if scan_date is None:
+            scan_date = datetime.now()
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE files SET scan_date = ?, is_deleted = FALSE WHERE id = ?",
+                (scan_date, file_id)
+            )
+
+    def mark_files_deleted_before_scan(
+        self,
+        drive_id: str,
+        scan_start: datetime,
+    ) -> int:
+        """Mark files as deleted if not seen in the current scan."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """UPDATE files
+                   SET is_deleted = TRUE
+                   WHERE drive_id = ?
+                     AND is_deleted = FALSE
+                     AND (scan_date IS NULL OR scan_date < ?)""",
+                (drive_id, scan_start),
+            )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def reset_deleted_flags(self, drive_id: str, touch_scan_date: bool = True) -> int:
+        """Clear deleted flags for a drive and optionally refresh scan_date."""
+        with self.connection() as conn:
+            if touch_scan_date:
+                cursor = conn.execute(
+                    "UPDATE files SET is_deleted = FALSE, scan_date = ? WHERE drive_id = ?",
+                    (datetime.now(), drive_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE files SET is_deleted = FALSE WHERE drive_id = ?",
+                    (drive_id,),
+                )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
     def mark_file_deleted(self, file_id: int) -> None:
         """Mark a file as deleted."""
         with self.connection() as conn:
@@ -520,6 +605,136 @@ class Database:
                 "UPDATE files SET is_deleted = TRUE WHERE id = ?",
                 (file_id,)
             )
+
+    def mark_files_deleted_not_in_ids(
+        self,
+        drive_id: str,
+        seen_file_ids: list[int],
+        batch_size: int = 1000,
+    ) -> int:
+        """Mark files as deleted when missing from the latest scan.
+
+        Args:
+            drive_id: Drive whose files are being reconciled
+            seen_file_ids: File IDs observed during the scan
+            batch_size: Insert batch size for temp table
+
+        Returns:
+            Count of files marked deleted
+        """
+        with self.connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS temp_seen_files")
+            conn.execute("CREATE TEMP TABLE temp_seen_files (id INTEGER PRIMARY KEY)")
+
+            if seen_file_ids:
+                for i in range(0, len(seen_file_ids), batch_size):
+                    chunk = seen_file_ids[i:i + batch_size]
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO temp_seen_files (id) VALUES (?)",
+                        [(file_id,) for file_id in chunk]
+                    )
+
+            cursor = conn.execute(
+                """
+                UPDATE files
+                SET is_deleted = TRUE
+                WHERE drive_id = ?
+                  AND is_deleted = FALSE
+                  AND id NOT IN (SELECT id FROM temp_seen_files)
+                """,
+                (drive_id,),
+            )
+            deleted_count = cursor.rowcount if cursor.rowcount is not None else 0
+
+            conn.execute("DROP TABLE IF EXISTS temp_seen_files")
+            return deleted_count
+
+    def mark_faces_analyzed(
+        self,
+        file_id: int,
+        faces_found: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        """Record that face analysis has been run for a file."""
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO file_ai_status (file_id, faces_analyzed, faces_found, faces_error, faces_updated_at)
+                   VALUES (?, TRUE, ?, ?, ?)
+                   ON CONFLICT(file_id) DO UPDATE SET
+                       faces_analyzed = TRUE,
+                       faces_found = ?,
+                       faces_error = ?,
+                       faces_updated_at = ?""",
+                (
+                    file_id,
+                    faces_found,
+                    error,
+                    datetime.now(),
+                    faces_found,
+                    error,
+                    datetime.now(),
+                )
+            )
+
+    def is_faces_analyzed(self, file_id: int) -> bool:
+        """Return True if face analysis has been recorded for a file."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT faces_analyzed FROM file_ai_status WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+            if not row:
+                return False
+            return bool(row["faces_analyzed"])
+
+    def get_image_files_missing_face_analysis(
+        self,
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get image files that have not been processed for face analysis."""
+        extensions = [".jpg", ".jpeg", ".png", ".heic", ".webp"]
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN file_ai_status s ON s.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND (s.faces_analyzed IS NULL OR s.faces_analyzed = FALSE)
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def backfill_face_status_from_existing_faces(
+        self,
+        drive_id: Optional[str] = None,
+    ) -> int:
+        """Mark files with existing faces as already analyzed."""
+        query = """
+            INSERT INTO file_ai_status (file_id, faces_analyzed, faces_found, faces_updated_at)
+            SELECT f.id, TRUE, COUNT(fc.id), ?
+            FROM files f
+            JOIN faces fc ON fc.file_id = f.id
+            LEFT JOIN file_ai_status s ON s.file_id = f.id
+            WHERE s.file_id IS NULL
+        """
+        params: list[Any] = [datetime.now()]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " GROUP BY f.id"
+
+        with self.connection() as conn:
+            cursor = conn.execute(query, params)
+            return cursor.rowcount if cursor.rowcount is not None else 0
 
     def get_file_count(self, drive_id: Optional[str] = None) -> int:
         """Get total file count."""
@@ -573,6 +788,249 @@ class Database:
             if row:
                 return FileMetadata(**dict(row))
             return None
+
+    def get_files_by_extensions_after_id(
+        self,
+        extensions: list[str],
+        last_id: int = 0,
+        drive_id: Optional[str] = None,
+        limit: int = 200,
+    ) -> list[FileRecord]:
+        """Get files with given extensions after an ID for paging."""
+        if not extensions:
+            return []
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND f.id > ?
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        params.append(last_id)
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " ORDER BY f.id LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_files_missing_metadata_by_extensions(
+        self,
+        extensions: list[str],
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get files without extracted metadata for provided extensions."""
+        if not extensions:
+            return []
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN file_metadata m ON m.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND m.file_id IS NULL
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_files_missing_ocr_by_extensions(
+        self,
+        extensions: list[str],
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get files missing OCR/text extraction for provided extensions."""
+        if not extensions:
+            return []
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN ocr_results o ON o.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND o.file_id IS NULL
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_files_missing_summaries_by_extensions(
+        self,
+        extensions: list[str],
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get files missing AI summaries for provided extensions."""
+        if not extensions:
+            return []
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN ai_summaries a ON a.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND a.file_id IS NULL
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_image_files_missing_metadata(
+        self,
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get image files without extracted metadata."""
+        extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN file_metadata m ON m.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND m.file_id IS NULL
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_image_files_missing_scene_analysis(
+        self,
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get image files missing scene analysis."""
+        extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN scene_analysis s ON s.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND s.file_id IS NULL
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_image_files_missing_scene_objects(
+        self,
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get image files with scene analysis but missing object labels."""
+        extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN scene_analysis s ON s.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND (s.file_id IS NULL OR s.objects IS NULL OR s.objects = '' OR s.objects = '[]')
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_image_files_missing_ocr(
+        self,
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get image files missing OCR text."""
+        extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN ocr_results o ON o.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND o.file_id IS NULL
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
+    def get_image_files_missing_summaries(
+        self,
+        limit: int = 200,
+        drive_id: Optional[str] = None,
+    ) -> list[FileRecord]:
+        """Get image files missing AI summaries."""
+        extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN ai_summaries a ON a.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND a.file_id IS NULL
+        """
+        params: list[Any] = [ext.lower() for ext in extensions]
+        if drive_id:
+            query += " AND f.drive_id = ?"
+            params.append(drive_id)
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
 
     # ==========================================================================
     # Duplicate Groups
@@ -700,6 +1158,25 @@ class Database:
                 groups.append(DuplicateGroup(**data))
 
             return groups
+
+    def get_duplicate_group_counts(self) -> dict[GroupStatus, int]:
+        """Get counts of duplicate groups by status."""
+        counts = {
+            GroupStatus.PENDING: 0,
+            GroupStatus.RESOLVED: 0,
+            GroupStatus.IGNORED: 0,
+        }
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) as cnt FROM duplicate_groups GROUP BY status"
+            ).fetchall()
+            for row in rows:
+                try:
+                    status = GroupStatus(row["status"])
+                except ValueError:
+                    continue
+                counts[status] = row["cnt"]
+        return counts
 
     def resolve_duplicate_group(self, group_id: int, keeper_id: int) -> None:
         """Mark a group as resolved with the keeper file."""
@@ -884,11 +1361,11 @@ class Database:
         with self.connection() as conn:
             cursor = conn.execute(
                 """INSERT INTO persons (name, birth_year, notes, is_favorite,
-                   reference_photo_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?) RETURNING id""",
+                   is_hidden, reference_photo_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id""",
                 (
                     person.name, person.birth_year, person.notes,
-                    person.is_favorite, person.reference_photo_id,
+                    person.is_favorite, person.is_hidden, person.reference_photo_id,
                     person.created_at or datetime.now()
                 )
             )
@@ -905,21 +1382,27 @@ class Database:
                 return Person(**dict(row))
             return None
 
-    def get_all_persons(self, named_only: bool = False) -> list[Person]:
+    def get_all_persons(
+        self,
+        named_only: bool = False,
+        include_hidden: bool = False,
+    ) -> list[Person]:
         """Get all persons.
 
         Args:
             named_only: If True, only return persons with names
+            include_hidden: If True, include hidden/ignored persons
         """
         with self.connection() as conn:
+            conditions = []
             if named_only:
-                rows = conn.execute(
-                    "SELECT * FROM persons WHERE name IS NOT NULL ORDER BY name"
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM persons ORDER BY name"
-                ).fetchall()
+                conditions.append("name IS NOT NULL")
+            if not include_hidden:
+                conditions.append("(is_hidden = FALSE OR is_hidden IS NULL)")
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            query = f"SELECT * FROM persons {where_clause} ORDER BY name"
+            rows = conn.execute(query).fetchall()
             return [Person(**dict(row)) for row in rows]
 
     def update_person(self, person: Person) -> None:
@@ -930,10 +1413,10 @@ class Database:
         with self.connection() as conn:
             conn.execute(
                 """UPDATE persons SET name = ?, birth_year = ?, notes = ?,
-                   is_favorite = ?, reference_photo_id = ? WHERE id = ?""",
+                   is_favorite = ?, is_hidden = ?, reference_photo_id = ? WHERE id = ?""",
                 (
                     person.name, person.birth_year, person.notes,
-                    person.is_favorite, person.reference_photo_id, person.id
+                    person.is_favorite, person.is_hidden, person.reference_photo_id, person.id
                 )
             )
 
@@ -952,6 +1435,103 @@ class Database:
                 "SELECT * FROM persons WHERE is_favorite = TRUE ORDER BY name"
             ).fetchall()
             return [Person(**dict(row)) for row in rows]
+
+    def get_hidden_persons(self) -> list[Person]:
+        """Get all hidden/ignored persons."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM persons WHERE is_hidden = TRUE ORDER BY name"
+            ).fetchall()
+            return [Person(**dict(row)) for row in rows]
+
+    def get_hidden_person_count(self) -> int:
+        """Get count of hidden persons."""
+        with self.connection() as conn:
+            result = conn.execute(
+                "SELECT COUNT(*) FROM persons WHERE is_hidden = TRUE"
+            ).fetchone()
+            return result[0] if result else 0
+
+    def set_person_hidden(self, person_id: int, hidden: bool) -> None:
+        """Set a person's hidden status.
+
+        Args:
+            person_id: Person ID
+            hidden: True to hide, False to restore
+        """
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE persons SET is_hidden = ? WHERE id = ?",
+                (hidden, person_id)
+            )
+
+    def create_hidden_person_from_cluster(
+        self,
+        cluster_face_ids: list[int],
+    ) -> int:
+        """Create a hidden person from a cluster of faces.
+
+        Creates a person named 'Unknown #N' with is_hidden=True
+        and assigns all provided faces to it.
+
+        Args:
+            cluster_face_ids: List of face IDs to assign to the hidden person
+
+        Returns:
+            The new person's ID
+        """
+        with self.connection() as conn:
+            # Get the next unknown number
+            result = conn.execute(
+                "SELECT COUNT(*) FROM persons WHERE name LIKE 'Unknown #%'"
+            ).fetchone()
+            next_num = (result[0] if result else 0) + 1
+
+            # Create hidden person
+            cursor = conn.execute(
+                """INSERT INTO persons (name, is_hidden, created_at, photo_count)
+                   VALUES (?, TRUE, ?, ?) RETURNING id""",
+                (f"Unknown #{next_num}", datetime.now(), len(cluster_face_ids))
+            )
+            person_id = cursor.fetchone()[0]
+
+            # Assign faces
+            for face_id in cluster_face_ids:
+                conn.execute(
+                    "UPDATE faces SET person_id = ? WHERE id = ?",
+                    (person_id, face_id)
+                )
+
+            return person_id
+
+    def delete_person(self, person_id: int) -> int:
+        """Delete a person and unassign their faces.
+
+        Faces are unassigned (person_id set to NULL), not deleted.
+
+        Args:
+            person_id: Person ID to delete
+
+        Returns:
+            Number of faces unassigned
+        """
+        with self.connection() as conn:
+            # Count faces first (more reliable than rowcount)
+            face_count = conn.execute(
+                "SELECT COUNT(*) FROM faces WHERE person_id = ?",
+                (person_id,)
+            ).fetchone()[0]
+
+            # Unassign faces
+            conn.execute(
+                "UPDATE faces SET person_id = NULL WHERE person_id = ?",
+                (person_id,)
+            )
+
+            # Delete the person
+            conn.execute("DELETE FROM persons WHERE id = ?", (person_id,))
+
+            return face_count
 
     def add_face(self, face: Face) -> int:
         """Add a detected face.
@@ -982,12 +1562,77 @@ class Database:
             ).fetchall()
             return [Face(**dict(row)) for row in rows]
 
-    def get_faces_for_person(self, person_id: int) -> list[Face]:
-        """Get all faces for a person."""
+    def delete_faces_for_file(self, file_id: int) -> int:
+        """Delete all faces for a file."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM faces WHERE file_id = ?",
+                (file_id,),
+            )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def get_faces_for_person(self, person_id: int, limit: int = 10000) -> list[Face]:
+        """Get all faces for a person.
+
+        Args:
+            person_id: Person ID to get faces for
+            limit: Maximum number of faces to return
+
+        Returns:
+            List of Face objects
+        """
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM faces WHERE person_id = ?", (person_id,)
+                "SELECT * FROM faces WHERE person_id = ? LIMIT ?",
+                (person_id, limit)
             ).fetchall()
+            return [Face(**dict(row)) for row in rows]
+
+    def unassign_face_from_person(self, face_id: int) -> bool:
+        """Unassign a face from its person.
+
+        Args:
+            face_id: Face ID to unassign
+
+        Returns:
+            True if face was unassigned, False if face not found
+        """
+        with self.connection() as conn:
+            # Get the current person_id before unassigning
+            row = conn.execute(
+                "SELECT person_id FROM faces WHERE id = ?",
+                (face_id,)
+            ).fetchone()
+            if not row or not row[0]:
+                return False
+
+            old_person_id = row[0]
+
+            # Unassign the face
+            cursor = conn.execute(
+                "UPDATE faces SET person_id = NULL WHERE id = ?",
+                (face_id,)
+            )
+
+            if cursor.rowcount > 0:
+                # Update old person's photo count
+                conn.execute(
+                    """UPDATE persons SET photo_count = (
+                        SELECT COUNT(DISTINCT file_id) FROM faces WHERE person_id = ?
+                    ) WHERE id = ?""",
+                    (old_person_id, old_person_id)
+                )
+                return True
+            return False
+
+    def get_faces_by_ids(self, face_ids: list[int]) -> list[Face]:
+        """Get faces by a list of IDs."""
+        if not face_ids:
+            return []
+        placeholders = ", ".join("?" for _ in face_ids)
+        query = f"SELECT * FROM faces WHERE id IN ({placeholders})"
+        with self.connection() as conn:
+            rows = conn.execute(query, face_ids).fetchall()
             return [Face(**dict(row)) for row in rows]
 
     def assign_face_to_person(self, face_id: int, person_id: int) -> None:
@@ -1005,13 +1650,21 @@ class Database:
                 (person_id, person_id)
             )
 
-    def get_unassigned_faces(self, limit: int = 10000) -> list[Face]:
+    def get_unassigned_faces(
+        self,
+        limit: int = 10000,
+        min_confidence: Optional[float] = None,
+    ) -> list[Face]:
         """Get faces not assigned to any person."""
+        query = "SELECT * FROM faces WHERE person_id IS NULL"
+        params: list[Any] = []
+        if min_confidence is not None:
+            query += " AND confidence >= ?"
+            params.append(min_confidence)
+        query += " LIMIT ?"
+        params.append(limit)
         with self.connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM faces WHERE person_id IS NULL LIMIT ?",
-                (limit,)
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
             return [Face(**dict(row)) for row in rows]
 
     def get_all_faces(self, limit: int = 100000) -> list[Face]:
@@ -1021,6 +1674,188 @@ class Database:
                 "SELECT * FROM faces LIMIT ?", (limit,)
             ).fetchall()
             return [Face(**dict(row)) for row in rows]
+
+    def add_face_blacklist(self, file_id: int, reason: Optional[str] = None) -> None:
+        """Blacklist a file from future face detection."""
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO face_blacklist (file_id, reason, created_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(file_id) DO UPDATE SET
+                       reason = ?,
+                       created_at = ?""",
+                (file_id, reason, datetime.now(), reason, datetime.now()),
+            )
+
+    def is_face_blacklisted(self, file_id: int) -> bool:
+        """Check if a file is blacklisted for face detection."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM face_blacklist WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+            return row is not None
+
+    def create_face_cluster_run(self, method: str = "auto") -> int:
+        """Create a new face cluster run."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO face_cluster_runs (method, created_at) VALUES (?, ?) RETURNING id",
+                (method, datetime.now()),
+            )
+            return cursor.fetchone()[0]
+
+    def get_latest_face_cluster_run(self) -> Optional[tuple[int, str]]:
+        """Get the most recent face cluster run."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT id, method FROM face_cluster_runs ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            return (row["id"], row["method"])
+
+    def clear_face_clusters_for_run(self, run_id: int) -> None:
+        """Delete clusters and members for a run."""
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM face_clusters WHERE run_id = ?",
+                (run_id,),
+            )
+
+    def create_face_cluster(self, run_id: int, method: str = "auto") -> int:
+        """Create a cluster for a run."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO face_clusters (run_id, method, created_at) VALUES (?, ?, ?) RETURNING id",
+                (run_id, method, datetime.now()),
+            )
+            return cursor.fetchone()[0]
+
+    def add_face_cluster_members(self, cluster_id: int, face_ids: list[int]) -> None:
+        """Add faces to a cluster."""
+        if not face_ids:
+            return
+        with self.connection() as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) VALUES (?, ?)",
+                [(cluster_id, face_id) for face_id in face_ids],
+            )
+
+    def save_face_clusters(self, run_id: int, clusters: list[list[int]], method: str = "auto") -> None:
+        """Save clusters for a run, replacing any existing clusters for that run."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM face_clusters WHERE run_id = ?", (run_id,))
+            for face_ids in clusters:
+                cursor = conn.execute(
+                    "INSERT INTO face_clusters (run_id, method, created_at) VALUES (?, ?, ?) RETURNING id",
+                    (run_id, method, datetime.now()),
+                )
+                cluster_id = cursor.fetchone()[0]
+                conn.executemany(
+                    "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) VALUES (?, ?)",
+                    [(cluster_id, fid) for fid in face_ids],
+                )
+
+    def get_face_clusters_for_run(self, run_id: int) -> list[tuple[int, list[int]]]:
+        """Get clusters and members for a run."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT c.id as cluster_id, m.face_id
+                   FROM face_clusters c
+                   JOIN face_cluster_members m ON m.cluster_id = c.id
+                   WHERE c.run_id = ?
+                   ORDER BY c.id""",
+                (run_id,),
+            ).fetchall()
+        clusters: dict[int, list[int]] = {}
+        for row in rows:
+            clusters.setdefault(row["cluster_id"], []).append(row["face_id"])
+        return [(cid, face_ids) for cid, face_ids in clusters.items()]
+
+    def move_faces_to_new_cluster(
+        self,
+        run_id: int,
+        face_ids: list[int],
+        from_cluster_id: int,
+        method: str = "manual",
+    ) -> Optional[int]:
+        """Move faces to a new cluster and record history."""
+        if not face_ids:
+            return None
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO face_clusters (run_id, method, created_at) VALUES (?, ?, ?) RETURNING id",
+                (run_id, method, datetime.now()),
+            )
+            new_cluster_id = cursor.fetchone()[0]
+            conn.executemany(
+                "INSERT OR IGNORE INTO face_cluster_members (cluster_id, face_id) VALUES (?, ?)",
+                [(new_cluster_id, fid) for fid in face_ids],
+            )
+            conn.executemany(
+                "DELETE FROM face_cluster_members WHERE cluster_id = ? AND face_id = ?",
+                [(from_cluster_id, fid) for fid in face_ids],
+            )
+            conn.execute(
+                """INSERT INTO face_cluster_history (action, from_cluster_id, to_cluster_id, face_ids, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                ("split", from_cluster_id, new_cluster_id, json.dumps(face_ids), datetime.now()),
+            )
+            return new_cluster_id
+
+    def delete_faces_for_drive(self, drive_id: str) -> int:
+        """Delete all faces for a drive."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """DELETE FROM faces
+                   WHERE file_id IN (SELECT id FROM files WHERE drive_id = ?)""",
+                (drive_id,),
+            )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def delete_all_faces(self) -> int:
+        """Delete all face detections."""
+        with self.connection() as conn:
+            cursor = conn.execute("DELETE FROM faces")
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def delete_unassigned_faces(self, drive_id: Optional[str] = None) -> int:
+        """Delete faces without a person assignment."""
+        with self.connection() as conn:
+            if drive_id:
+                cursor = conn.execute(
+                    """DELETE FROM faces
+                       WHERE person_id IS NULL
+                         AND file_id IN (SELECT id FROM files WHERE drive_id = ?)""",
+                    (drive_id,),
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM faces WHERE person_id IS NULL"
+                )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
+    def delete_low_confidence_faces(
+        self,
+        min_confidence: float,
+        drive_id: Optional[str] = None,
+    ) -> int:
+        """Delete faces below a confidence threshold."""
+        with self.connection() as conn:
+            if drive_id:
+                cursor = conn.execute(
+                    """DELETE FROM faces
+                       WHERE confidence < ?
+                         AND file_id IN (SELECT id FROM files WHERE drive_id = ?)""",
+                    (min_confidence, drive_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM faces WHERE confidence < ?",
+                    (min_confidence,),
+                )
+            return cursor.rowcount if cursor.rowcount is not None else 0
 
     def get_face(self, face_id: int) -> Optional[Face]:
         """Get a face by ID."""
@@ -1032,6 +1867,14 @@ class Database:
                 return Face(**dict(row))
             return None
 
+    def update_face_bbox(self, face_id: int, x: int, y: int, w: int, h: int) -> None:
+        """Update bounding box for a face."""
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE faces SET bbox_x = ?, bbox_y = ?, bbox_w = ?, bbox_h = ? WHERE id = ?",
+                (x, y, w, h, face_id),
+            )
+
     def update_person_photo_count(self, person_id: int) -> None:
         """Update photo count for a person."""
         with self.connection() as conn:
@@ -1042,30 +1885,55 @@ class Database:
                 (person_id, person_id)
             )
 
-    def delete_person(self, person_id: int) -> None:
-        """Delete a person and unassign their faces."""
-        with self.connection() as conn:
-            # Unassign faces
-            conn.execute(
-                "UPDATE faces SET person_id = NULL WHERE person_id = ?",
-                (person_id,)
-            )
-            # Delete person
-            conn.execute(
-                "DELETE FROM persons WHERE id = ?",
-                (person_id,)
-            )
-
-    def get_face_count(self, person_id: Optional[int] = None) -> int:
+    def get_face_count(
+        self,
+        person_id: Optional[int] = None,
+        min_confidence: Optional[float] = None,
+    ) -> int:
         """Get count of faces, optionally for a specific person."""
         with self.connection() as conn:
             if person_id is not None:
+                query = "SELECT COUNT(*) FROM faces WHERE person_id = ?"
+                params: list[Any] = [person_id]
+                if min_confidence is not None:
+                    query += " AND confidence >= ?"
+                    params.append(min_confidence)
+                return conn.execute(query, params).fetchone()[0]
+            if min_confidence is not None:
                 return conn.execute(
-                    "SELECT COUNT(*) FROM faces WHERE person_id = ?",
-                    (person_id,)
+                    "SELECT COUNT(*) FROM faces WHERE confidence >= ?",
+                    (min_confidence,)
                 ).fetchone()[0]
-            else:
-                return conn.execute("SELECT COUNT(*) FROM faces").fetchone()[0]
+            return conn.execute("SELECT COUNT(*) FROM faces").fetchone()[0]
+
+    def get_face_count_for_drive(self, drive_id: str) -> int:
+        """Get count of faces for a specific drive."""
+        with self.connection() as conn:
+            return conn.execute(
+                """SELECT COUNT(*) FROM faces f
+                   JOIN files fi ON f.file_id = fi.id
+                   WHERE fi.drive_id = ?""",
+                (drive_id,)
+            ).fetchone()[0]
+
+    def get_low_confidence_face_count(
+        self,
+        threshold: float,
+        drive_id: Optional[str] = None,
+    ) -> int:
+        """Get count of faces below the confidence threshold."""
+        with self.connection() as conn:
+            if drive_id:
+                return conn.execute(
+                    """SELECT COUNT(*) FROM faces f
+                       JOIN files fi ON f.file_id = fi.id
+                       WHERE f.confidence < ? AND fi.drive_id = ?""",
+                    (threshold, drive_id)
+                ).fetchone()[0]
+            return conn.execute(
+                "SELECT COUNT(*) FROM faces WHERE confidence < ?",
+                (threshold,)
+            ).fetchone()[0]
 
     # ==========================================================================
     # Scene Analysis
@@ -1123,8 +1991,10 @@ class Database:
         import json
         with self.connection() as conn:
             conn.execute(
-                "UPDATE scene_analysis SET objects = ? WHERE file_id = ?",
-                (json.dumps(objects), file_id)
+                """INSERT INTO scene_analysis (file_id, objects, analyzed_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(file_id) DO UPDATE SET objects = ?""",
+                (file_id, json.dumps(objects), datetime.now(), json.dumps(objects))
             )
 
     def update_scene_quality(

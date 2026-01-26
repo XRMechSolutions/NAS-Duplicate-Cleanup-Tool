@@ -11,11 +11,9 @@ When you scan a location, the app walks through every folder, records informatio
 ### Adding Your First Drive
 
 1. Open the app and go to the **Drives** tab
-2. Click the **Add Location** button
-3. Choose how to add:
-   - **Browse Local** - Opens a folder picker for local drives
-   - **Enter Network Path** - Type a UNC path like `\\LS210D11E\share\Photos`
-4. Give it a friendly name (e.g., "NAS Photos", "Backup Drive")
+2. Click the **Add Drive** button
+3. Enter a folder path or UNC path like `\\LS210D11E\share\Photos`
+4. Give it a friendly name (optional)
 5. Click **Add**
 
 The location appears in your drives list with a "Not Scanned" status.
@@ -23,14 +21,14 @@ The location appears in your drives list with a "Not Scanned" status.
 ### Starting a Scan
 
 1. Select a drive from the list
-2. Click **Scan** (or right-click and choose "Scan")
+2. Click **Quick Scan**, **Deep Scan**, or **Full Analysis**
 3. Choose your scan type:
    - **Quick Scan** - Only checks new and modified files (fast, use after first scan)
    - **Deep Scan** - Re-examines all files even if unchanged (thorough but slower)
    - **Full Analysis** - Deep scan plus AI analysis of all images
-4. Click **Start**
+4. The scan starts immediately
 
-You can also scan multiple locations at once by selecting them with Ctrl+Click, then clicking **Scan Selected**.
+You can also use **Scan All** to run the same scan mode across every registered drive, one at a time.
 
 ### What You'll See During Scanning
 
@@ -78,18 +76,15 @@ The app works with any network share accessible from Windows, including:
 
 Just enter the UNC path (the `\\server\share` format) when adding the location.
 
-**Tip:** If you've mapped the NAS to a drive letter (like Z:), you can use either the drive letter or the UNC path. The app will recognize them as the same location.
+**Tip:** Prefer UNC paths for network shares. Mapped drive letters are treated as separate locations.
 
 ### When the Network Disconnects
 
 If your NAS becomes unreachable during a scan (unplugged, network issue, NAS went to sleep):
 
 1. The scan pauses automatically
-2. A dialog appears: "Network location unavailable"
-3. You can choose:
-   - **Wait and Retry** - App checks every 30 seconds for reconnection
-   - **Skip This Location** - Continue scanning other drives, come back to this later
-   - **Cancel Scan** - Stop entirely
+2. The Drives tab status updates to reflect the disconnect
+3. You can cancel or resume once the drive is reachable again
 
 When the NAS comes back online, the scan resumes from where it left off.
 
@@ -213,6 +208,10 @@ Like Deep Scan, but also runs AI analysis on all images:
 - Object detection
 
 Use this after major changes or when you want to refresh all AI-generated metadata.
+
+### Face Analysis While Scanning
+
+If face recognition is enabled and the model is installed, the app can start face analysis on images as soon as they're discovered during a scan. It keeps processing new images while the scan runs and finishes any remaining items after the scan completes.
 
 ## Behind the Scenes
 

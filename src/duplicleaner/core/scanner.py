@@ -169,6 +169,7 @@ class Scanner:
         self._resume_path: Optional[str] = None
         self._resume_active = False
         self._resume_reached = False
+        self._scan_started_at: Optional[datetime] = None
         self._last_state_save = 0.0
         self._state_save_interval = 5.0
 
@@ -216,6 +217,7 @@ class Scanner:
         self._state = ScanState.SCANNING
         if not self._progress.start_time:
             self._progress.start_time = datetime.now()
+        self._scan_started_at = self._progress.start_time
         self._progress.state = ScanState.SCANNING
         self._cancel_event.clear()
         self._pause_event.set()
@@ -267,8 +269,8 @@ class Scanner:
             if self._file_batch:
                 self._flush_batch()
 
-            # Mark removed files (only for deep/full scans)
-            if mode in (ScanMode.DEEP, ScanMode.FULL) and not self._cancel_event.is_set():
+            # Mark removed files
+            if not self._cancel_event.is_set():
                 self._mark_removed_files(drive.id)
 
             # Update drive stats
@@ -291,6 +293,7 @@ class Scanner:
             self._resume_path = None
             self._resume_active = False
             self._resume_reached = False
+            self._scan_started_at = None
 
         # Calculate elapsed time
         if self._progress.start_time:
@@ -383,7 +386,7 @@ class Scanner:
         """Recursively scan a directory.
 
         Args:
-            scan_path: Path to scan (may include \\?\ prefix)
+            scan_path: Path to scan (may include extended-length prefix)
             display_path: Clean path for display and storage
             drive: Drive being scanned
             mode: Scan mode
@@ -510,6 +513,7 @@ class Scanner:
 
                     # Check if modified
                     if existing.modified == modified and existing.size == size:
+                        self.db.update_file_scan_date(existing.id, datetime.now())
                         self._progress.files_unchanged += 1
                         self._progress.files_found += 1
                         self._update_progress()
@@ -722,11 +726,13 @@ class Scanner:
         Args:
             drive_id: Drive ID to check
         """
-        # This would need a database method to get all file IDs for a drive
-        # and mark those not in _seen_file_ids as deleted
-        # For now, we'll log what would happen
-        logger.info(f"Would mark removed files for drive {drive_id}")
-        # TODO: Implement when database method is available
+        if not drive_id:
+            return
+        if not self._scan_started_at:
+            return
+        deleted_count = self.db.mark_files_deleted_before_scan(drive_id, self._scan_started_at)
+        if deleted_count:
+            logger.info(f"Marked {deleted_count} files as deleted for drive {drive_id}")
 
     def _update_drive_stats(self, drive: Drive) -> None:
         """Update drive statistics after scan.
