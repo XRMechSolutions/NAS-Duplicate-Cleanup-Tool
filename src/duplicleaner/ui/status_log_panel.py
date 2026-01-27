@@ -131,8 +131,8 @@ class StatusLogPanel:
     def _on_entry_selected(self, sender, app_data, user_data) -> None:
         entry = user_data
         is_selected = dpg.get_value(sender)
-        shift_down = dpg.is_key_down(dpg.mvKey_Shift)
-        ctrl_down = dpg.is_key_down(dpg.mvKey_Control)
+        shift_down = self._is_shift_down()
+        ctrl_down = self._is_ctrl_down()
 
         if shift_down and self._last_selected in self._visible_entries:
             start = self._visible_entries.index(self._last_selected)
@@ -206,19 +206,41 @@ class StatusLogPanel:
 
     def _on_copy_shortcut(self) -> None:
         """Handle Ctrl+C for selected entries."""
-        if not dpg.is_key_down(dpg.mvKey_Control):
+        if not self._is_ctrl_down():
             return
         self._copy_selected()
 
     def _on_select_all_shortcut(self) -> None:
         """Handle Ctrl+A for selecting all visible entries."""
-        if not dpg.is_key_down(dpg.mvKey_Control):
+        if not self._is_ctrl_down():
             return
         if not self._visible_entries:
             return
         self._selected_entries = set(self._visible_entries)
         self._refresh_view()
         dpg.set_value(self.TAG_STATUS, f"Selected {len(self._visible_entries)} entries.")
+
+    def _is_ctrl_down(self) -> bool:
+        """Return True if either control key is pressed."""
+        key = getattr(dpg, "mvKey_Control", None)
+        if key is not None:
+            return dpg.is_key_down(key)
+        left = getattr(dpg, "mvKey_LControl", None)
+        right = getattr(dpg, "mvKey_RControl", None)
+        if left is None and right is None:
+            return False
+        return (left is not None and dpg.is_key_down(left)) or (right is not None and dpg.is_key_down(right))
+
+    def _is_shift_down(self) -> bool:
+        """Return True if either shift key is pressed."""
+        key = getattr(dpg, "mvKey_Shift", None)
+        if key is not None:
+            return dpg.is_key_down(key)
+        left = getattr(dpg, "mvKey_LShift", None)
+        right = getattr(dpg, "mvKey_RShift", None)
+        if left is None and right is None:
+            return False
+        return (left is not None and dpg.is_key_down(left)) or (right is not None and dpg.is_key_down(right))
 
     def _get_or_create_level_theme(self, color: tuple[int, int, int]) -> str:
         """Get or create a theme for a specific text color."""

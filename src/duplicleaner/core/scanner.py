@@ -20,6 +20,7 @@ from duplicleaner.db.database import Database, get_database
 from duplicleaner.db.models import FileRecord, Drive
 from duplicleaner.utils.config import get_config
 from duplicleaner.utils.logging import get_logger
+from duplicleaner.utils.profiling import profile_block
 
 logger = get_logger(__name__)
 
@@ -211,107 +212,110 @@ class Scanner:
 
         logger.info(f"Starting {mode.value} scan of {drive.label} ({drive.path})")
 
-        # Reset state
-        self._reset_progress()
-        self._apply_resume_state(resume_state)
-        self._state = ScanState.SCANNING
-        if not self._progress.start_time:
-            self._progress.start_time = datetime.now()
-        self._scan_started_at = self._progress.start_time
-        self._progress.state = ScanState.SCANNING
-        self._cancel_event.clear()
-        self._pause_event.set()
+        with profile_block(f"scan.{mode.value}"):
+            # Reset state
+            self._reset_progress()
+            self._apply_resume_state(resume_state)
+            self._state = ScanState.SCANNING
+            if not self._progress.start_time:
+                self._progress.start_time = datetime.now()
+            self._scan_started_at = self._progress.start_time
+            self._progress.state = ScanState.SCANNING
+            self._cancel_event.clear()
+            self._pause_event.set()
 
-        # Track existing files for this drive
-        self._seen_file_ids.clear()
-        self._scan_drive_id = drive.id
-        self._scan_mode = mode
-        self._scan_root = self._normalize_path(drive.path)
-        self._resume_path = None
-        self._resume_active = False
-        self._resume_reached = False
-
-        if resume_state:
-            resume_path = resume_state.get("last_path")
-            if resume_path:
-                resume_path = self._normalize_path(resume_path)
-                if self._scan_root and resume_path.startswith(self._scan_root):
-                    self._resume_path = resume_path
-                    self._resume_active = True
-                    self._resume_reached = False
-            logger.info(f"Resuming scan for {drive.label}")
-        else:
-            self.db.clear_scan_state(drive.id)
-            self._last_state_save = 0.0
-        self._persist_scan_state(force=True)
-
-        try:
-            # Walk the directory tree
-            for file_record in self._walk_directory(drive, mode):
-                # Check for pause
-                self._pause_event.wait()
-
-                # Check for cancellation
-                if self._cancel_event.is_set():
-                    self._state = ScanState.CANCELLED
-                    self._progress.state = ScanState.CANCELLED
-                    logger.info("Scan cancelled")
-                    break
-
-                # Add to batch
-                self._file_batch.append(file_record)
-
-                # Flush batch if full
-                if len(self._file_batch) >= self.batch_size:
-                    self._flush_batch()
-
-            # Flush remaining files
-            if self._file_batch:
-                self._flush_batch()
-
-            # Mark removed files
-            if not self._cancel_event.is_set():
-                self._mark_removed_files(drive.id)
-
-            # Update drive stats
-            if not self._cancel_event.is_set():
-                self._update_drive_stats(drive)
-                self._state = ScanState.COMPLETED
-                self._progress.state = ScanState.COMPLETED
-                self.db.clear_scan_state(drive.id)
-                logger.info(f"Scan completed: {self._progress.files_found} files found")
-
-        except Exception as e:
-            logger.error(f"Scan error: {e}")
-            self._state = ScanState.ERROR
-            self._progress.state = ScanState.ERROR
-            raise
-        finally:
-            self._scan_drive_id = None
-            self._scan_mode = None
-            self._scan_root = None
+            # Track existing files for this drive
+            self._seen_file_ids.clear()
+            self._scan_drive_id = drive.id
+            self._scan_mode = mode
+            self._scan_root = self._normalize_path(drive.path)
             self._resume_path = None
             self._resume_active = False
             self._resume_reached = False
-            self._scan_started_at = None
 
-        # Calculate elapsed time
-        if self._progress.start_time:
-            self._progress.elapsed_seconds = (
-                datetime.now() - self._progress.start_time
-            ).total_seconds()
+            if resume_state:
+                resume_path = resume_state.get("last_path")
+                if resume_path:
+                    resume_path = self._normalize_path(resume_path)
+                    if self._scan_root and resume_path.startswith(self._scan_root):
+                        self._resume_path = resume_path
+                        self._resume_active = True
+                        self._resume_reached = False
+                logger.info(f"Resuming scan for {drive.label}")
+            else:
+                self.db.clear_scan_state(drive.id)
+                self._last_state_save = 0.0
+            self._persist_scan_state(force=True)
 
-        # Return result
-        return ScanResult(
-            drive_id=drive.id,
-            total_files=self._progress.files_found,
-            new_files=self._progress.files_new,
-            modified_files=self._progress.files_modified,
-            removed_files=self._progress.files_removed,
-            errors=self._progress.errors,
-            duration_seconds=self._progress.elapsed_seconds,
-            error_paths=self._progress.error_paths.copy(),
-        )
+            try:
+                # Walk the directory tree
+                for file_record in self._walk_directory(drive, mode):
+                    # Check for pause
+                    self._pause_event.wait()
+
+                    # Check for cancellation
+                    if self._cancel_event.is_set():
+                        self._state = ScanState.CANCELLED
+                        self._progress.state = ScanState.CANCELLED
+                        logger.info("Scan cancelled")
+                        break
+
+                    # Add to batch
+                    self._file_batch.append(file_record)
+
+                    # Flush batch if full
+                    if len(self._file_batch) >= self.batch_size:
+                        self._flush_batch()
+
+                # Flush remaining files
+                if self._file_batch:
+                    self._flush_batch()
+
+                # Mark removed files
+                if not self._cancel_event.is_set():
+                    self._mark_removed_files(drive.id)
+
+                # Update drive stats
+                if not self._cancel_event.is_set():
+                    self._update_drive_stats(drive)
+                    self._state = ScanState.COMPLETED
+                    self._progress.state = ScanState.COMPLETED
+                    self.db.clear_scan_state(drive.id)
+                    logger.info(f"Scan completed: {self._progress.files_found} files found")
+
+            except Exception as e:
+                logger.error(f"Scan error: {e}")
+                self._state = ScanState.ERROR
+                self._progress.state = ScanState.ERROR
+                raise
+            finally:
+                self._scan_drive_id = None
+                self._scan_mode = None
+                self._scan_root = None
+                self._resume_path = None
+                self._resume_active = False
+                self._resume_reached = False
+                self._scan_started_at = None
+
+            # Calculate elapsed time
+            if self._progress.start_time:
+                self._progress.elapsed_seconds = (
+                    datetime.now() - self._progress.start_time
+                ).total_seconds()
+
+            # Return result
+            result = ScanResult(
+                drive_id=drive.id,
+                total_files=self._progress.files_found,
+                new_files=self._progress.files_new,
+                modified_files=self._progress.files_modified,
+                removed_files=self._progress.files_removed,
+                errors=self._progress.errors,
+                duration_seconds=self._progress.elapsed_seconds,
+                error_paths=self._progress.error_paths.copy(),
+            )
+
+        return result
 
     def pause(self) -> None:
         """Pause the current scan."""

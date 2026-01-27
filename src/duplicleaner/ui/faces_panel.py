@@ -53,6 +53,7 @@ class FacesPanel:
     TAG_FACE_RESET_SCOPE = "face_reset_scope"
     TAG_ASSIGN_DIALOG = "assign_person_dialog"
     TAG_ASSIGN_LIST = "assign_person_list"
+    TAG_ASSIGN_BUTTON = "assign_person_button"
     TAG_FACE_PREVIEW_DIALOG = "face_preview_dialog"
     TAG_FACE_PREVIEW_IMAGE = "face_preview_image"
     TAG_FACE_PREVIEW_TEXT = "face_preview_text"
@@ -149,6 +150,11 @@ class FacesPanel:
         self._auto_refresh_interval = 6.0
         self._auto_cluster_interval = 20.0
         self._pause_auto_refresh = False
+        self._pending_cluster_refresh = False
+        self._pending_stats_refresh = False
+        self._pending_cluster_done = False
+        self._pending_auto_cluster = False
+        self._pending_people_refresh = False
 
         # Thumbnail cache
         self._face_textures: dict[str, str] = {}
@@ -164,12 +170,16 @@ class FacesPanel:
         self._preview_dragging = False
         self._preview_drag_offset: tuple[float, float] = (0.0, 0.0)
         self._preview_resize_handle: Optional[str] = None
+        self._preview_hover_handle: Optional[str] = None
         self._preview_resize_start: tuple[float, float] = (0.0, 0.0)
         self._preview_bbox_start: Optional[tuple[int, int, int, int]] = None
         self._split_cluster_id: Optional[int] = None
         self._split_face_ids: list[int] = []
         self._split_selected: set[int] = set()
         self._cluster_run_id: Optional[int] = None
+        self._intermediate_person_id: Optional[int] = None
+        self._intermediate_suggestions: list[dict] = []
+        self._intermediate_auto_assigned: int = 0
 
         # New state for Phase 1-3 features
         self._pending_reset_mode: Optional[str] = None
@@ -448,50 +458,47 @@ class FacesPanel:
 
     def _create_dialogs(self) -> None:
         """Create modal dialogs."""
-        # Name person dialog
         with dpg.window(
-            label="Name This Person",
-            tag=self.TAG_NAME_DIALOG,
-            modal=True,
-            show=False,
-            width=500,
-            height=350,
-            no_resize=True,
-            pos=[180, 120],
-        ):
-            dpg.add_text("Sample faces from this cluster:")
-            with dpg.group(horizontal=True, tag=self.TAG_NAME_DIALOG_FACES):
-                # Face thumbnails will be populated dynamically
-                pass
-            dpg.add_spacer(height=10)
-            dpg.add_text("Enter a name for this person:")
-            dpg.add_input_text(tag="person_name_input", width=400)
-            dpg.add_spacer(height=10)
-            dpg.add_checkbox(label="Enable age tracking (for children)", tag="enable_age_tracking")
-            dpg.add_text("Birth year (approximate):")
-            dpg.add_input_int(tag="birth_year_input", default_value=2000, width=100)
-            dpg.add_spacer(height=20)
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="Save", callback=self._save_person_name)
-                dpg.add_button(label="Cancel", callback=self._cancel_person_naming)
-
-        # Assign cluster to existing person dialog
-        with dpg.window(
-            label="Assign to Existing Person",
+            label="Assign or Create Person",
             tag=self.TAG_ASSIGN_DIALOG,
             modal=True,
             show=False,
-            width=400,
-            height=240,
+            width=740,
+            height=360,
             no_resize=True,
-            pos=[220, 160],
+            pos=[140, 120],
         ):
-            dpg.add_text("Assign this cluster to:")
-            dpg.add_listbox(tag=self.TAG_ASSIGN_LIST, items=[], num_items=6, width=300)
+            dpg.add_text("Sample faces:")
+            with dpg.group(horizontal=True, tag=self.TAG_NAME_DIALOG_FACES):
+                pass
             dpg.add_spacer(height=10)
             with dpg.group(horizontal=True):
-                dpg.add_button(label="Assign", callback=self._assign_cluster_to_person)
-                dpg.add_button(label="Cancel", callback=self._cancel_assign_dialog)
+                with dpg.child_window(width=340, height=190, border=True):
+                    dpg.add_text("Create New Person", color=get_accent_color())
+                    dpg.add_spacer(height=6)
+                    dpg.add_text("Name:")
+                    dpg.add_input_text(tag="person_name_input", width=300)
+                    dpg.add_spacer(height=6)
+                    dpg.add_checkbox(label="Enable age tracking (for children)", tag="enable_age_tracking")
+                    dpg.add_text("Birth year (approximate):")
+                    dpg.add_input_int(tag="birth_year_input", default_value=2000, width=100)
+                    dpg.add_spacer(height=8)
+                    dpg.add_button(label="Create & Assign", callback=self._save_person_name, width=140)
+
+                with dpg.child_window(width=340, height=190, border=True):
+                    dpg.add_text("Assign to Existing", color=get_accent_color())
+                    dpg.add_spacer(height=6)
+                    dpg.add_listbox(tag=self.TAG_ASSIGN_LIST, items=[], num_items=6, width=300)
+                    dpg.add_spacer(height=8)
+                    dpg.add_button(
+                        label="Assign Selected",
+                        tag=self.TAG_ASSIGN_BUTTON,
+                        callback=self._assign_cluster_to_person,
+                        width=140,
+                    )
+
+            dpg.add_spacer(height=10)
+            dpg.add_button(label="Close", callback=self._cancel_assign_dialog, width=80)
 
         # Name pet dialog
         with dpg.window(
@@ -605,8 +612,28 @@ class FacesPanel:
                 )
             with dpg.handler_registry():
                 dpg.add_mouse_down_handler(callback=self._on_preview_mouse_down)
+                dpg.add_mouse_move_handler(callback=self._on_preview_mouse_move)
                 dpg.add_mouse_drag_handler(callback=self._on_preview_mouse_drag)
                 dpg.add_mouse_release_handler(callback=self._on_preview_mouse_up)
+
+        # Intermediate clusters dialog (review suggestions for a person)
+        with dpg.window(
+            label="Suggested Clusters",
+            tag=self.TAG_INTERMEDIATE_CLUSTERS_DIALOG,
+            modal=True,
+            show=False,
+            width=980,
+            height=680,
+            pos=[110, 90],
+        ):
+            dpg.add_text("", tag="intermediate_title", color=get_accent_color())
+            dpg.add_text("", tag="intermediate_summary", color=get_text_color("disabled"))
+            dpg.add_spacer(height=6)
+            with dpg.child_window(width=-1, height=520, border=True, tag=self.TAG_INTERMEDIATE_CONTAINER):
+                pass
+            dpg.add_spacer(height=6)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Close", callback=lambda: dpg.configure_item(self.TAG_INTERMEDIATE_CLUSTERS_DIALOG, show=False))
 
         # Split cluster dialog
         with dpg.window(
@@ -983,19 +1010,27 @@ class FacesPanel:
         """Run face clustering."""
         if self._is_clustering:
             return
-        try:
-            self._is_clustering = True
-            clusters = self.face_analyzer.cluster_faces()
-            run_id = self.db.create_face_cluster_run(method="auto")
-            cluster_face_ids = [c.face_ids for c in clusters]
-            self.db.save_face_clusters(run_id, cluster_face_ids, method="auto")
-            self._cluster_run_id = run_id
-            self._load_clusters_from_db()
-            self._update_stats()
-        except Exception as e:
-            logger.error(f"Face clustering error: {e}")
-        finally:
-            self._is_clustering = False
+        self._is_clustering = True
+        self._set_analysis_buttons_enabled(False)
+        if dpg.does_item_exist(self.TAG_FACE_ANALYSIS_STATUS):
+            dpg.set_value(self.TAG_FACE_ANALYSIS_STATUS, "Clustering faces...")
+
+        def run_clustering():
+            try:
+                clusters = self.face_analyzer.cluster_faces()
+                run_id = self.db.create_face_cluster_run(method="auto")
+                cluster_face_ids = [c.face_ids for c in clusters]
+                self.db.save_face_clusters(run_id, cluster_face_ids, method="auto")
+                self._cluster_run_id = run_id
+                self._pending_cluster_refresh = True
+                self._pending_stats_refresh = True
+            except Exception as e:
+                logger.error(f"Face clustering error: {e}")
+            finally:
+                self._is_clustering = False
+                self._pending_cluster_done = True
+
+        threading.Thread(target=run_clustering, daemon=True).start()
 
     def _on_cluster_pets(self) -> None:
         """Run pet clustering."""
@@ -1022,12 +1057,6 @@ class FacesPanel:
             with dpg.group(parent="face_clusters_container", horizontal=False):
                 with dpg.group(horizontal=True):
                     dpg.add_text(f"Cluster {cluster.cluster_id + 1}: {len(cluster.face_ids)} photos")
-                    dpg.add_button(
-                        label="Name Person",
-                        callback=lambda s, a, u: self._show_name_dialog(u),
-                        user_data=cluster.cluster_id,
-                        small=True,
-                    )
                     dpg.add_button(
                         label="Assign",
                         callback=lambda s, a, u: self._show_assign_dialog(u),
@@ -1133,24 +1162,7 @@ class FacesPanel:
 
     def _show_name_dialog(self, cluster_id: int) -> None:
         """Show dialog to name a person from cluster."""
-        cluster = next((c for c in self._face_clusters if c.cluster_id == cluster_id), None)
-        if not cluster:
-            self._notify_status("Cluster not found (refreshing).", level="warning")
-            self._refresh()
-            return
-        self._name_mode = "cluster"
-        self._selected_cluster_id = cluster_id
-        self._selected_cluster_snapshot = cluster
-        self._pause_auto_refresh = True
-        self._stop_auto_refresh()
-        dpg.set_value("person_name_input", "")
-        dpg.set_value("enable_age_tracking", False)
-        dpg.set_value("birth_year_input", 2000)
-
-        # Populate face thumbnails (up to 6)
-        self._populate_name_dialog_faces(cluster.sample_faces[:6] if cluster.sample_faces else [])
-
-        dpg.configure_item(self.TAG_NAME_DIALOG, show=True)
+        self._show_assign_dialog(cluster_id)
 
     def _populate_name_dialog_faces(self, faces: list) -> None:
         """Populate face thumbnails in the name dialog."""
@@ -1174,16 +1186,7 @@ class FacesPanel:
 
     def _show_name_dialog_for_split(self) -> None:
         """Show dialog to name a person from split selection."""
-        if not self._split_selected:
-            self._notify_status("Select faces to name first.", level="warning")
-            return
-        self._name_mode = "split"
-        self._pause_auto_refresh = True
-        self._stop_auto_refresh()
-        dpg.set_value("person_name_input", "")
-        dpg.set_value("enable_age_tracking", False)
-        dpg.set_value("birth_year_input", 2000)
-        dpg.configure_item(self.TAG_NAME_DIALOG, show=True)
+        self._show_assign_dialog_for_split()
 
     def _show_assign_dialog(self, cluster_id: int) -> None:
         """Show dialog to assign a cluster to an existing person."""
@@ -1193,17 +1196,22 @@ class FacesPanel:
             self._refresh()
             return
         self._assign_mode = "cluster"
-        persons = self.db.get_all_persons(named_only=True)
-        self._assign_person_map = [(p.name or f"Person {p.id}", p.id) for p in persons if p.id is not None]
-        if not self._assign_person_map:
-            self._notify_status("No named people yet. Name a person first.", level="warning")
-            return
+        self._name_mode = "cluster"
+        reference_embedding = self._get_cluster_reference_embedding(cluster)
+        self._assign_person_map = self._build_assign_person_map(reference_embedding)
         dpg.configure_item(self.TAG_ASSIGN_LIST, items=[name for name, _ in self._assign_person_map])
-        dpg.set_value(self.TAG_ASSIGN_LIST, self._assign_person_map[0][0])
+        if self._assign_person_map:
+            dpg.set_value(self.TAG_ASSIGN_LIST, self._assign_person_map[0][0])
         self._selected_cluster_id = cluster_id
         self._selected_cluster_snapshot = cluster
         self._pause_auto_refresh = True
         self._stop_auto_refresh()
+        dpg.set_value("person_name_input", "")
+        dpg.set_value("enable_age_tracking", False)
+        dpg.set_value("birth_year_input", 2000)
+        self._populate_name_dialog_faces(cluster.sample_faces[:6] if cluster.sample_faces else [])
+        if dpg.does_item_exist(self.TAG_ASSIGN_BUTTON):
+            dpg.configure_item(self.TAG_ASSIGN_BUTTON, enabled=bool(self._assign_person_map))
         dpg.configure_item(self.TAG_ASSIGN_DIALOG, show=True)
 
     def _show_assign_dialog_for_split(self) -> None:
@@ -1212,15 +1220,20 @@ class FacesPanel:
             self._notify_status("Select faces to assign first.", level="warning")
             return
         self._assign_mode = "split"
-        persons = self.db.get_all_persons(named_only=True)
-        self._assign_person_map = [(p.name or f"Person {p.id}", p.id) for p in persons if p.id is not None]
-        if not self._assign_person_map:
-            self._notify_status("No named people yet. Name a person first.", level="warning")
-            return
+        self._name_mode = "split"
+        reference_embedding = self._get_split_reference_embedding()
+        self._assign_person_map = self._build_assign_person_map(reference_embedding)
         dpg.configure_item(self.TAG_ASSIGN_LIST, items=[name for name, _ in self._assign_person_map])
-        dpg.set_value(self.TAG_ASSIGN_LIST, self._assign_person_map[0][0])
+        if self._assign_person_map:
+            dpg.set_value(self.TAG_ASSIGN_LIST, self._assign_person_map[0][0])
         self._pause_auto_refresh = True
         self._stop_auto_refresh()
+        dpg.set_value("person_name_input", "")
+        dpg.set_value("enable_age_tracking", False)
+        dpg.set_value("birth_year_input", 2000)
+        self._populate_name_dialog_faces([])
+        if dpg.does_item_exist(self.TAG_ASSIGN_BUTTON):
+            dpg.configure_item(self.TAG_ASSIGN_BUTTON, enabled=bool(self._assign_person_map))
         dpg.configure_item(self.TAG_ASSIGN_DIALOG, show=True)
 
     def _show_pet_name_dialog(self, cluster_id: int) -> None:
@@ -1241,7 +1254,7 @@ class FacesPanel:
 
     def _save_person_name(self) -> None:
         """Save person name from dialog."""
-        dpg.configure_item(self.TAG_NAME_DIALOG, show=False)
+        dpg.configure_item(self.TAG_ASSIGN_DIALOG, show=False)
 
         name = dpg.get_value("person_name_input").strip()
         if not name:
@@ -1285,8 +1298,8 @@ class FacesPanel:
             if self._name_mode == "cluster":
                 if cluster in self._face_clusters:
                     self._face_clusters.remove(cluster)
-                self._display_face_clusters()
-            self._update_stats()
+                self._pending_cluster_refresh = True
+            self._pending_stats_refresh = True
             threading.Thread(target=self._auto_refine_matches, daemon=True).start()
         self._resume_auto_refresh()
 
@@ -1320,8 +1333,8 @@ class FacesPanel:
             self.face_analyzer.assign_cluster_to_person(cluster, person_id)
             if cluster in self._face_clusters:
                 self._face_clusters.remove(cluster)
-        self._display_face_clusters()
-        self._update_stats()
+        self._pending_cluster_refresh = True
+        self._pending_stats_refresh = True
         threading.Thread(target=self._auto_refine_matches, daemon=True).start()
         self._resume_auto_refresh()
 
@@ -1332,8 +1345,57 @@ class FacesPanel:
 
     def _cancel_person_naming(self) -> None:
         """Cancel naming a person."""
-        dpg.configure_item(self.TAG_NAME_DIALOG, show=False)
+        dpg.configure_item(self.TAG_ASSIGN_DIALOG, show=False)
         self._resume_auto_refresh()
+
+    def _get_cluster_reference_embedding(self, cluster: FaceCluster) -> Optional[np.ndarray]:
+        """Return an average embedding for a cluster."""
+        if cluster.avg_embedding is not None and len(cluster.avg_embedding) > 0:
+            return np.asarray(cluster.avg_embedding, dtype=np.float32)
+        faces = self.db.get_faces_by_ids(cluster.face_ids)
+        embeddings = [np.frombuffer(face.embedding, dtype=np.float32) for face in faces if face.embedding]
+        if not embeddings:
+            return None
+        return np.mean(embeddings, axis=0)
+
+    def _get_split_reference_embedding(self) -> Optional[np.ndarray]:
+        """Return an average embedding for selected split faces."""
+        if not self._split_selected:
+            return None
+        faces = self.db.get_faces_by_ids(list(self._split_selected))
+        embeddings = [np.frombuffer(face.embedding, dtype=np.float32) for face in faces if face.embedding]
+        if not embeddings:
+            return None
+        return np.mean(embeddings, axis=0)
+
+    def _build_assign_person_map(self, reference_embedding: Optional[np.ndarray]) -> list[tuple[str, int]]:
+        """Build and sort assign list by similarity to the reference embedding."""
+        persons = [p for p in self.db.get_all_persons(named_only=True) if p.id is not None]
+        if not persons:
+            return []
+
+        scored: list[tuple[float | None, str, int]] = []
+        if reference_embedding is not None:
+            try:
+                self.face_analyzer.load_person_embeddings()
+            except Exception:
+                reference_embedding = None
+
+        for person in persons:
+            name = person.name or f"Person {person.id}"
+            score = None
+            if reference_embedding is not None:
+                embeddings = self.face_analyzer._person_embeddings.get(person.id, [])
+                if embeddings:
+                    score = max(
+                        self.face_analyzer.compute_similarity(reference_embedding, emb)
+                        for _stage, emb in embeddings
+                    )
+            label = f"{name} ({score:.2f})" if score is not None else f"{name} (n/a)"
+            scored.append((score, label, person.id))
+
+        scored.sort(key=lambda item: (-item[0] if item[0] is not None else 1.0, item[1].lower()))
+        return [(label, pid) for _score, label, pid in scored]
 
     def _on_face_settings_changed(self, sender, app_data, user_data) -> None:
         """Persist face analysis settings and update analyzer."""
@@ -1739,21 +1801,25 @@ class FacesPanel:
         person = self.db.get_person(person_id)
         person_name = person.name if person else f"Person {person_id}"
 
-        self._notify_status(f"Searching for more photos of {person_name}...")
+        self._notify_status(f"Finding more photos for {person_name}...")
 
         try:
-            matches, assigned = self.face_analyzer.find_more_faces_for_person(
-                person_id=person_id,
-                threshold=0.8,
-                auto_assign=True
-            )
-            if assigned > 0:
-                self._notify_status(f"Found {assigned} new photos of {person_name}")
-            else:
-                self._notify_status(f"No new photos found for {person_name}")
-            logger.info(f"Find more for {person_name}: {matches} matches, {assigned} assigned")
-            self._update_stats()
-            self._refresh_people_list()
+            if not self.db.get_latest_face_cluster_run():
+                matches, assigned = self.face_analyzer.find_more_faces_for_person(
+                    person_id=person_id,
+                    threshold=0.8,
+                    auto_assign=True
+                )
+                if assigned > 0:
+                    self._notify_status(f"Found {assigned} new photos of {person_name}")
+                else:
+                    self._notify_status(f"No new photos found for {person_name}")
+                logger.info(f"Find more (direct) for {person_name}: {matches} matches, {assigned} assigned")
+                self._update_stats()
+                self._refresh_people_list()
+                return
+
+            self._show_intermediate_clusters_dialog(person_id)
         except Exception as e:
             logger.error(f"Error finding photos for person {person_id}: {e}")
             self._notify_status(f"Error searching for {person_name}", level="error")
@@ -1785,6 +1851,181 @@ class FacesPanel:
         except Exception as e:
             logger.error(f"Error finding photos for pet {pet_id}: {e}")
             self._notify_status(f"Error searching for {pet_name}", level="error")
+
+    def _show_intermediate_clusters_dialog(self, person_id: int) -> None:
+        person = self.db.get_person(person_id)
+        if not person:
+            self._notify_status("Person not found.", level="warning")
+            return
+
+        run = self.db.get_latest_face_cluster_run()
+        if not run:
+            self._notify_status("No cluster run available. Run 'Cluster Faces' first.", level="warning")
+            return
+
+        run_id, _method = run
+        clusters = []
+        for cluster_id, face_ids in self.db.get_face_clusters_for_run(run_id):
+            faces = self.db.get_faces_by_ids(face_ids)
+            if not faces:
+                continue
+            unassigned = [face for face in faces if face.person_id is None]
+            if not unassigned:
+                continue
+            embeddings = []
+            for face in unassigned:
+                if face.embedding:
+                    embeddings.append(np.frombuffer(face.embedding, dtype=np.float32))
+            avg_embedding = np.mean(embeddings, axis=0) if embeddings else None
+            sample_faces = self._select_cluster_sample_faces(unassigned, avg_embedding, limit=8)
+            clusters.append(
+                FaceCluster(
+                    cluster_id=cluster_id,
+                    face_ids=[face.id for face in unassigned if face.id is not None],
+                    sample_faces=sample_faces,
+                    avg_embedding=avg_embedding,
+                )
+            )
+
+        auto_assigned, suggestions = self.face_analyzer.find_intermediate_clusters(person_id, clusters)
+
+        auto_count = 0
+        for cluster in auto_assigned:
+            for face_id in cluster.face_ids:
+                self.db.assign_face_to_person(face_id, person_id)
+                auto_count += 1
+            self.db.update_person_photo_count(person_id)
+
+        self._intermediate_person_id = person_id
+        self._intermediate_auto_assigned = auto_count
+        self._intermediate_suggestions = [
+            {
+                "cluster_id": c.cluster_id,
+                "score": score,
+                "face_ids": c.face_ids,
+                "sample_faces": c.sample_faces or [],
+            }
+            for c, score in suggestions
+        ]
+
+        dpg.set_value("intermediate_title", f"Suggested Clusters for {person.name}")
+        summary = f"Auto-assigned: {auto_count} faces | Suggestions: {len(self._intermediate_suggestions)} clusters"
+        dpg.set_value("intermediate_summary", summary)
+        self._render_intermediate_clusters()
+        dpg.configure_item(self.TAG_INTERMEDIATE_CLUSTERS_DIALOG, show=True)
+
+        self._update_stats()
+        self._refresh_people_list()
+
+    def _render_intermediate_clusters(self) -> None:
+        if not dpg.does_item_exist(self.TAG_INTERMEDIATE_CONTAINER):
+            return
+        for child in dpg.get_item_children(self.TAG_INTERMEDIATE_CONTAINER, 1) or []:
+            dpg.delete_item(child)
+
+        if not self._intermediate_suggestions:
+            dpg.add_text("No suggested clusters found.", parent=self.TAG_INTERMEDIATE_CONTAINER)
+            return
+
+        person_embeddings = self._get_person_embedding_vectors(self._intermediate_person_id)
+
+        for item in self._intermediate_suggestions:
+            cluster_id = item["cluster_id"]
+            score = item["score"]
+            face_ids = item["face_ids"]
+            sample_faces = item["sample_faces"]
+
+            with dpg.group(parent=self.TAG_INTERMEDIATE_CONTAINER, horizontal=False):
+                dpg.add_text(f"Cluster {cluster_id + 1} | score {score:.2f} | {len(face_ids)} faces")
+                row = dpg.add_group(horizontal=True, parent=self.TAG_INTERMEDIATE_CONTAINER)
+
+                # Order thumbnails by similarity to this person if possible
+                if person_embeddings and sample_faces:
+                    scored_faces = []
+                    for face in sample_faces:
+                        sim = self._score_face_for_person(face, person_embeddings)
+                        scored_faces.append((sim, face))
+                    scored_faces.sort(key=lambda s: s[0], reverse=True)
+                    sample_faces = [s[1] for s in scored_faces]
+
+                for face in sample_faces[:8]:
+                    thumb = self._get_face_thumbnail(face)
+                    if thumb:
+                        dpg.add_image_button(
+                            thumb,
+                            width=72,
+                            height=72,
+                            parent=row,
+                            user_data=face.id,
+                            callback=lambda s, a, u: self._show_face_preview(u),
+                        )
+                with dpg.group(horizontal=True, parent=self.TAG_INTERMEDIATE_CONTAINER):
+                    dpg.add_button(
+                        label="Approve",
+                        small=True,
+                        callback=lambda s, a, u: self._approve_intermediate_cluster(u),
+                        user_data=cluster_id,
+                    )
+                    dpg.add_button(
+                        label="Reject",
+                        small=True,
+                        callback=lambda s, a, u: self._reject_intermediate_cluster(u),
+                        user_data=cluster_id,
+                    )
+                    dpg.add_button(
+                        label="View All",
+                        small=True,
+                        callback=lambda s, a, u: self._show_all_faces_dialog(u[0], u[1]),
+                        user_data=(cluster_id, face_ids),
+                    )
+                dpg.add_separator(parent=self.TAG_INTERMEDIATE_CONTAINER)
+
+    def _approve_intermediate_cluster(self, cluster_id: int) -> None:
+        if not self._intermediate_person_id:
+            return
+        item = next((s for s in self._intermediate_suggestions if s["cluster_id"] == cluster_id), None)
+        if not item:
+            return
+        for face_id in item["face_ids"]:
+            self.db.assign_face_to_person(face_id, self._intermediate_person_id)
+        self.db.update_person_photo_count(self._intermediate_person_id)
+        self._intermediate_suggestions = [s for s in self._intermediate_suggestions if s["cluster_id"] != cluster_id]
+        self._update_intermediate_summary()
+        self._render_intermediate_clusters()
+        self._update_stats()
+        self._refresh_people_list()
+
+    def _reject_intermediate_cluster(self, cluster_id: int) -> None:
+        self._intermediate_suggestions = [s for s in self._intermediate_suggestions if s["cluster_id"] != cluster_id]
+        self._update_intermediate_summary()
+        self._render_intermediate_clusters()
+
+    def _update_intermediate_summary(self) -> None:
+        if not dpg.does_item_exist("intermediate_summary"):
+            return
+        summary = f"Auto-assigned: {self._intermediate_auto_assigned} faces | Suggestions: {len(self._intermediate_suggestions)} clusters"
+        dpg.set_value("intermediate_summary", summary)
+
+    def _get_person_embedding_vectors(self, person_id: Optional[int]) -> list[np.ndarray]:
+        if not person_id:
+            return []
+        self.face_analyzer.load_person_embeddings()
+        entries = self.face_analyzer._person_embeddings.get(person_id, [])
+        return [emb for _stage, emb in entries]
+
+    def _score_face_for_person(self, face: Face, person_embeddings: list[np.ndarray]) -> float:
+        if not face.embedding or not person_embeddings:
+            return -1.0
+        try:
+            emb = np.frombuffer(face.embedding, dtype=np.float32)
+            best = -1.0
+            for p_emb in person_embeddings:
+                sim = self.face_analyzer.compute_similarity(emb, p_emb)
+                if sim > best:
+                    best = sim
+            return best
+        except Exception:
+            return -1.0
 
     def _refresh(self) -> None:
         """Refresh all views."""
@@ -1854,12 +2095,12 @@ class FacesPanel:
             if face_count != self._last_face_count or unassigned != self._last_unassigned_faces:
                 self._last_face_count = face_count
                 self._last_unassigned_faces = unassigned
-                self._update_stats()
-                if self._current_view == "clusters":
+                self._pending_stats_refresh = True
+                if self._current_view == "clusters" and (self._background_face_analysis or self._is_analyzing):
                     now = time.time()
                     if not self._is_clustering and (now - self._last_cluster_time) >= self._auto_cluster_interval:
                         self._last_cluster_time = now
-                        threading.Thread(target=self._on_cluster_faces, daemon=True).start()
+                        self._pending_auto_cluster = True
         except Exception:
             pass
 
@@ -1900,10 +2141,14 @@ class FacesPanel:
             if not obox:
                 return None
             x, y, bw, bh = obox
-            left = max(0, int(x))
-            top = max(0, int(y))
-            right = min(width, int(x + bw))
-            bottom = min(height, int(y + bh))
+            left, top, right, bottom = self._square_crop_bounds(
+                x,
+                y,
+                bw,
+                bh,
+                width,
+                height,
+            )
             if right <= left or bottom <= top:
                 return None
             cropped = image.crop((left, top, right, bottom)).resize((64, 64), Image.BILINEAR)
@@ -1933,6 +2178,120 @@ class FacesPanel:
                 pass
             self._face_textures.pop(key, None)
 
+    def _get_face_thumbnail(self, face: Face, size: Optional[int] = None) -> Optional[str]:
+        """Return a cached thumbnail texture for a face crop."""
+        if face.id is None or face.file_id is None:
+            return None
+        thumb_size = size or self.GALLERY_THUMB_SIZE
+        key = f"{face.id}:{thumb_size}"
+        if key in self._gallery_photo_textures:
+            return self._gallery_photo_textures[key]
+
+        file_record = self.db.get_file(face.file_id)
+        if not file_record or not file_record.path:
+            return None
+
+        try:
+            raw_image = Image.open(file_record.path)
+            orientation = int(raw_image.getexif().get(274, 1))
+            raw_w, raw_h = raw_image.size
+            image = ImageOps.exif_transpose(raw_image).convert("RGB")
+            width, height = image.size
+
+            obox = self._apply_orientation_to_bbox_with_size(
+                (face.bbox_x, face.bbox_y, face.bbox_w, face.bbox_h),
+                orientation,
+                raw_w,
+                raw_h,
+            )
+            if not obox:
+                return None
+            x, y, bw, bh = obox
+            left, top, right, bottom = self._square_crop_bounds(
+                x,
+                y,
+                bw,
+                bh,
+                width,
+                height,
+            )
+            if right <= left or bottom <= top:
+                return None
+
+            cropped = image.crop((left, top, right, bottom))
+            cropped = cropped.resize((thumb_size, thumb_size), Image.BILINEAR)
+            rgba = cropped.convert("RGBA")
+            data = np.asarray(rgba).astype(np.float32) / 255.0
+
+            tex_tag = f"gallery_face_tex_{self._gallery_texture_counter}"
+            self._gallery_texture_counter += 1
+            dpg.add_static_texture(
+                thumb_size,
+                thumb_size,
+                data.flatten().tolist(),
+                tag=tex_tag,
+                parent=self.TAG_TEXTURE_REGISTRY,
+            )
+            self._gallery_photo_textures[key] = tex_tag
+            self._prune_gallery_textures(limit=300)
+            return tex_tag
+        except Exception:
+            return None
+
+    def _square_crop_bounds(
+        self,
+        x: float,
+        y: float,
+        bw: float,
+        bh: float,
+        width: int,
+        height: int,
+        pad: float = 0.35,
+    ) -> tuple[int, int, int, int]:
+        """Return a square crop centered on the bbox, with padding, clamped to image bounds."""
+        cx = x + (bw / 2.0)
+        cy = y + (bh / 2.0)
+        size = max(bw, bh) * (1.0 + 2.0 * pad)
+        size = max(1.0, size)
+        half = size / 2.0
+        left = cx - half
+        top = cy - half
+        right = cx + half
+        bottom = cy + half
+
+        # Shift to stay within bounds.
+        if left < 0:
+            right -= left
+            left = 0
+        if top < 0:
+            bottom -= top
+            top = 0
+        if right > width:
+            left -= (right - width)
+            right = width
+        if bottom > height:
+            top -= (bottom - height)
+            bottom = height
+
+        left = max(0, min(left, width))
+        top = max(0, min(top, height))
+        right = max(left + 1, min(right, width))
+        bottom = max(top + 1, min(bottom, height))
+
+        return int(left), int(top), int(right), int(bottom)
+
+    def _prune_gallery_textures(self, limit: int = 300) -> None:
+        if len(self._gallery_photo_textures) <= limit:
+            return
+        to_remove = list(self._gallery_photo_textures.items())[: len(self._gallery_photo_textures) - limit]
+        for key, tex_tag in to_remove:
+            try:
+                if dpg.does_item_exist(tex_tag):
+                    dpg.delete_item(tex_tag)
+            except Exception:
+                pass
+            self._gallery_photo_textures.pop(key, None)
+
     def _compute_face_similarity(self, face: Face, cluster: FaceCluster) -> Optional[float]:
         """Compute cosine similarity between face and cluster average embedding."""
         try:
@@ -1950,6 +2309,33 @@ class FacesPanel:
             return sim
         except Exception:
             return None
+
+    def _select_cluster_sample_faces(
+        self,
+        faces: list[Face],
+        avg_embedding: Optional[np.ndarray],
+        limit: int = 5,
+    ) -> list[Face]:
+        if not faces:
+            return []
+        scored = []
+        avg_norm = 0.0
+        avg_vec = None
+        if avg_embedding is not None:
+            avg_vec = np.asarray(avg_embedding, dtype=np.float32)
+            avg_norm = np.linalg.norm(avg_vec)
+        for face in faces:
+            sim = -1.0
+            if avg_vec is not None and avg_norm > 0 and face.embedding:
+                emb = np.frombuffer(face.embedding, dtype=np.float32)
+                emb_norm = np.linalg.norm(emb)
+                if emb_norm > 0:
+                    sim = float(np.dot(emb, avg_vec) / (emb_norm * avg_norm))
+            conf = face.confidence or 0.0
+            area = (face.bbox_w or 0) * (face.bbox_h or 0)
+            scored.append((sim, conf, area, face))
+        scored.sort(reverse=True, key=lambda s: (s[0], s[1], s[2]))
+        return [s[3] for s in scored[:limit]]
 
     def _get_preview_texture_tag(self) -> str:
         if self._preview_texture_tag and dpg.does_item_exist(self._preview_texture_tag):
@@ -2112,7 +2498,9 @@ class FacesPanel:
                 threshold=self.config.ai.face_recognition_threshold,
                 auto_assign=True,
             )
-            self._update_stats()
+            self._pending_stats_refresh = True
+            if self._current_view == "people":
+                self._pending_people_refresh = True
         except Exception:
             pass
 
@@ -2143,22 +2531,51 @@ class FacesPanel:
             faces = self.db.get_faces_by_ids(face_ids)
             if not faces:
                 continue
-            sample_faces = faces[:5]
+            unassigned = [face for face in faces if face.person_id is None]
+            if not unassigned:
+                continue
             embeddings = []
-            for face in faces:
+            for face in unassigned:
                 if face.embedding:
                     embeddings.append(np.frombuffer(face.embedding, dtype=np.float32))
             avg_embedding = np.mean(embeddings, axis=0) if embeddings else None
+            sample_faces = self._select_cluster_sample_faces(unassigned, avg_embedding, limit=5)
             clusters.append(
                 FaceCluster(
                     cluster_id=cluster_id,
-                    face_ids=face_ids,
+                    face_ids=[face.id for face in unassigned if face.id is not None],
                     sample_faces=sample_faces,
                     avg_embedding=avg_embedding,
                 )
             )
         self._face_clusters = clusters
         self._display_face_clusters()
+
+    def on_frame(self) -> None:
+        """Process UI updates on the main thread."""
+        if self._pending_cluster_refresh:
+            self._pending_cluster_refresh = False
+            self._load_clusters_from_db()
+
+        if self._pending_stats_refresh:
+            self._pending_stats_refresh = False
+            self._update_stats()
+
+        if self._pending_cluster_done:
+            self._pending_cluster_done = False
+            if dpg.does_item_exist(self.TAG_FACE_ANALYSIS_STATUS):
+                dpg.set_value(self.TAG_FACE_ANALYSIS_STATUS, "")
+            if not self._background_face_analysis and not self._is_analyzing:
+                self._set_analysis_buttons_enabled(True)
+
+        if self._pending_people_refresh:
+            self._pending_people_refresh = False
+            if self._current_view == "people":
+                self._refresh_people_list()
+
+        if self._pending_auto_cluster and not self._is_clustering:
+            self._pending_auto_cluster = False
+            self._on_cluster_faces()
 
     def _cancel_split_dialog(self) -> None:
         """Cancel split dialog."""
@@ -2422,7 +2839,7 @@ class FacesPanel:
                     thumb,
                     width=self.GALLERY_THUMB_SIZE,
                     height=self.GALLERY_THUMB_SIZE,
-                    user_data=face.id,
+                    user_data=(face.id, face.file_id),
                     callback=lambda s, a, u: self._on_gallery_photo_click(u),
                 )
             else:
@@ -2431,7 +2848,7 @@ class FacesPanel:
                     label="[Photo]",
                     width=self.GALLERY_THUMB_SIZE,
                     height=self.GALLERY_THUMB_SIZE,
-                    user_data=face.id,
+                    user_data=(face.id, face.file_id),
                     callback=lambda s, a, u: self._on_gallery_photo_click(u),
                 )
 
@@ -2445,11 +2862,52 @@ class FacesPanel:
                 date_str = file_record.modified.strftime("%Y-%m-%d")
                 dpg.add_text(date_str, color=get_text_color("disabled"))
 
+            # Actions
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Open",
+                    small=True,
+                    user_data=file_record.id,
+                    callback=lambda s, a, u: self._open_file_by_id(u),
+                )
+                dpg.add_button(
+                    label="Unassign",
+                    small=True,
+                    user_data=face.id,
+                    callback=lambda s, a, u: self._unassign_person_photo(u),
+                )
             dpg.add_spacer(height=8)
 
-    def _on_gallery_photo_click(self, face_id: int) -> None:
+    def _on_gallery_photo_click(self, payload) -> None:
         """Handle click on a photo in the gallery."""
+        face_id = None
+        file_id = None
+        if isinstance(payload, tuple) and len(payload) >= 2:
+            face_id, file_id = payload[0], payload[1]
+        else:
+            face_id = payload
+
+        if face_id is None and file_id and self._gallery_person_id:
+            faces = self.db.get_faces_for_file(file_id)
+            match = next((f for f in faces if f.person_id == self._gallery_person_id), None)
+            if match:
+                face_id = match.id
+
+        if face_id is None:
+            logger.warning(f"Gallery click has no face_id (file_id={file_id})")
+            self._notify_status("No face record found for this photo.", level="warning")
+            return
+
         self._show_photo_preview(face_id)
+
+    def _unassign_person_photo(self, face_id: Optional[int]) -> None:
+        if not face_id:
+            self._notify_status("No face record found for this photo.", level="warning")
+            return
+        self.db.unassign_face_from_person(face_id)
+        self._notify_status("Photo unassigned from person.", level="info")
+        if self._gallery_person_id:
+            self._show_person_gallery(self._gallery_person_id)
 
     def _on_gallery_sort_change(self, sender, app_data, user_data) -> None:
         """Handle sort dropdown change in gallery."""
@@ -2744,14 +3202,22 @@ class FacesPanel:
                 parent=self.TAG_FACE_PREVIEW_DRAW,
             )
             # Resize handles (corners)
-            handle_size = 10
+            handle_size = 12
             handles = [
                 (px, py),
                 (px + pw, py),
                 (px, py + ph),
                 (px + pw, py + ph),
             ]
-            for hx, hy in handles:
+            handle_keys = ["tl", "tr", "bl", "br"]
+            for (hx, hy), key in zip(handles, handle_keys):
+                is_active = self._preview_resize_handle == key
+                is_hover = self._preview_hover_handle == key
+                fill_color = (255, 200, 80, 255)
+                if is_active:
+                    fill_color = (255, 140, 60, 255)
+                elif is_hover:
+                    fill_color = (255, 230, 120, 255)
                 dpg.draw_rectangle(
                     (hx - handle_size - 1, hy - handle_size - 1),
                     (hx + handle_size + 1, hy + handle_size + 1),
@@ -2762,8 +3228,8 @@ class FacesPanel:
                 dpg.draw_rectangle(
                     (hx - handle_size, hy - handle_size),
                     (hx + handle_size, hy + handle_size),
-                    color=(255, 200, 80, 255),
-                    fill=(255, 200, 80, 255),
+                    color=fill_color,
+                    fill=fill_color,
                     parent=self.TAG_FACE_PREVIEW_DRAW,
                 )
 
@@ -2778,6 +3244,40 @@ class FacesPanel:
         if mouse_x > rect_max[0] or mouse_y > rect_max[1]:
             return None
         return (mouse_x - rect_min[0], mouse_y - rect_min[1])
+
+    def _on_preview_mouse_move(self, sender, app_data, user_data) -> None:
+        if not self._preview_bbox:
+            return
+        pos = self._preview_local_pos()
+        if not pos:
+            if self._preview_hover_handle is not None:
+                self._preview_hover_handle = None
+                self._render_face_preview()
+            return
+        obox = self._apply_orientation_to_bbox(self._preview_bbox)
+        if not obox:
+            return
+        x, y, bw, bh = obox
+        px = x * self._preview_scale
+        py = y * self._preview_scale
+        pw = bw * self._preview_scale
+        ph = bh * self._preview_scale
+        hit_size = 24
+        corners = {
+            "tl": (px, py),
+            "tr": (px + pw, py),
+            "bl": (px, py + ph),
+            "br": (px + pw, py + ph),
+        }
+        hover = None
+        pos_x, pos_y = pos
+        for key, (hx, hy) in corners.items():
+            if abs(pos_x - hx) <= hit_size and abs(pos_y - hy) <= hit_size:
+                hover = key
+                break
+        if hover != self._preview_hover_handle:
+            self._preview_hover_handle = hover
+            self._render_face_preview()
 
     def _on_preview_mouse_down(self, sender, app_data, user_data) -> None:
         if not self._preview_bbox:
@@ -2794,7 +3294,7 @@ class FacesPanel:
         pw = bw * self._preview_scale
         ph = bh * self._preview_scale
         handle_size = 10
-        hit_size = 16
+        hit_size = 24
         corners = {
             "tl": (px, py),
             "tr": (px + pw, py),
@@ -2807,7 +3307,8 @@ class FacesPanel:
             if abs(pos_x - hx) <= hit_size and abs(pos_y - hy) <= hit_size:
                 self._preview_resize_handle = key
                 self._preview_resize_start = pos
-                self._preview_bbox_start = (x, y, bw, bh)
+                self._preview_bbox_start = self._preview_bbox
+                self._preview_dragging = False
                 return
         if px <= pos[0] <= px + pw and py <= pos[1] <= py + ph:
             self._preview_dragging = True

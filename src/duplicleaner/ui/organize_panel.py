@@ -6,7 +6,7 @@ Dear PyGui UI component for organizing photos into date/location-based folder st
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import dearpygui.dearpygui as dpg
 
@@ -47,6 +47,7 @@ class OrganizePanel:
     TAG_SOURCE_INPUT = "org_source_input"
     TAG_DEST_INPUT = "org_dest_input"
     TAG_PREVIEW_TABLE = "org_preview_table"
+    TAG_PREVIEW_GALLERY = "org_preview_gallery"
     TAG_PROGRESS_GROUP = "org_progress_group"
     TAG_PROGRESS_BAR = "org_progress_bar"
     TAG_PROGRESS_TEXT = "org_progress_text"
@@ -58,6 +59,7 @@ class OrganizePanel:
     TAG_DEST_DIALOG = "org_dest_dialog"
     TAG_EXPORT_DIALOG = "org_export_dialog"
     TAG_PREVIEW_BTN = "org_preview_btn"
+    TAG_TEXTURE_REGISTRY = "org_texture_registry"
 
     def __init__(
         self,
@@ -84,6 +86,10 @@ class OrganizePanel:
 
         # Settings
         self._settings = OrganizeSettings()
+
+        # UI State
+        self._texture_registry: dict[str, int | str] = {}
+        self._thumbnail_registry: dict[str, Any] = {}
 
         # Build UI
         self._build_ui()
@@ -277,6 +283,25 @@ class OrganizePanel:
                         )
                         add_tooltip(ctrl, ORGANIZE_TOOLTIPS["dry_run"])
 
+                    # AI column - New
+                    with dpg.child_window(width=350, height=320, border=False):
+                        dpg.add_text("AI Analysis", color=get_accent_color())
+                        dpg.add_separator()
+                        ctrl = dpg.add_checkbox(
+                            label="Run Object Detection",
+                            default_value=False,
+                            callback=self._on_ai_settings_change,
+                            tag="org_run_object_detection"
+                        )
+                        add_tooltip(ctrl, "Analyzes image content to generate searchable tags (e.g., 'dog', 'car'). Can be slow.")
+                        ctrl = dpg.add_checkbox(
+                            label="Run Document Classification",
+                            default_value=False,
+                            callback=self._on_ai_settings_change,
+                            tag="org_run_doc_classification"
+                        )
+                        add_tooltip(ctrl, "Uses OCR to determine if an image is a document or a photo. Can be slow.")
+
             dpg.add_spacer(height=10)
 
             # Action buttons
@@ -321,41 +346,53 @@ class OrganizePanel:
             dpg.add_text("Preview", color=get_accent_color())
             dpg.add_spacer(height=5)
 
-            # Two-column layout: folder tree and file list
-            with dpg.group(horizontal=True):
-                # Folder tree
-                with dpg.child_window(width=300, height=400, border=True):
-                    dpg.add_text("Folders to Create", color=get_accent_color())
-                    dpg.add_separator()
-                    with dpg.tree_node(label="Organized Photos", tag=self.TAG_FOLDER_TREE, default_open=True):
-                        dpg.add_text("Run preview to see folder structure", color=get_text_color("disabled"))
+            with dpg.tab_bar(tag="org_preview_tab_bar"):
+                with dpg.tab(label="File List"):
+                    # Two-column layout: folder tree and file list
+                    with dpg.group(horizontal=True):
+                        # Folder tree
+                        with dpg.child_window(width=300, height=400, border=True):
+                            dpg.add_text("Folders to Create", color=get_accent_color())
+                            dpg.add_separator()
+                            with dpg.tree_node(label="Organized Photos", tag=self.TAG_FOLDER_TREE, default_open=True):
+                                dpg.add_text("Run preview to see folder structure", color=get_text_color("disabled"))
 
-                # File list table
-                with dpg.child_window(width=-1, height=400, border=True):
-                    dpg.add_text("Files to Organize", color=get_accent_color())
-                    dpg.add_separator()
-                    with dpg.table(
-                        tag=self.TAG_PREVIEW_TABLE,
-                        header_row=True,
-                        borders_innerH=True,
-                        borders_outerH=True,
-                        borders_innerV=True,
-                        borders_outerV=True,
-                        resizable=True,
-                        policy=dpg.mvTable_SizingStretchProp,
-                        row_background=True,
-                        scrollY=True,
-                        height=350,
-                    ):
-                        dpg.add_table_column(label="Source", init_width_or_weight=200)
-                        dpg.add_table_column(label="Destination", init_width_or_weight=300)
-                        dpg.add_table_column(label="Date", init_width_or_weight=50)
-                        dpg.add_table_column(label="Location", init_width_or_weight=80)
-                        dpg.add_table_column(label="Burst", init_width_or_weight=50)
-                        dpg.add_table_column(label="Live", init_width_or_weight=40)
+                        # File list table
+                        with dpg.child_window(width=-1, height=400, border=True):
+                            dpg.add_text("Files to Organize", color=get_accent_color())
+                            dpg.add_separator()
+                            with dpg.table(
+                                tag=self.TAG_PREVIEW_TABLE,
+                                header_row=True,
+                                borders_innerH=True,
+                                borders_outerH=True,
+                                borders_innerV=True,
+                                borders_outerV=True,
+                                resizable=True,
+                                policy=dpg.mvTable_SizingStretchProp,
+                                row_background=True,
+                                scrollY=True,
+                                height=350,
+                            ):
+                                dpg.add_table_column(label="Source", init_width_or_weight=200)
+                                dpg.add_table_column(label="Destination", init_width_or_weight=300)
+                                dpg.add_table_column(label="Date", init_width_or_weight=50)
+                                dpg.add_table_column(label="Location", init_width_or_weight=80)
+                                dpg.add_table_column(label="Burst", init_width_or_weight=50)
+                                dpg.add_table_column(label="Live", init_width_or_weight=40)
+                
+                with dpg.tab(label="Image Gallery"):
+                    with dpg.child_window(tag=self.TAG_PREVIEW_GALLERY, width=-1, height=400):
+                        dpg.add_text("Run preview with AI analysis to see image gallery.", color=get_text_color("disabled"))
+
 
         # File dialogs
         self._create_file_dialogs()
+
+        # Texture registry for thumbnails
+        with dpg.texture_registry(tag=self.TAG_TEXTURE_REGISTRY):
+            pass
+
 
     def _create_file_dialogs(self) -> None:
         """Create file/folder dialogs."""
@@ -515,6 +552,10 @@ class OrganizePanel:
             dpg.get_value("org_conflict"), ConflictResolution.ADD_SEQUENCE
         )
 
+        # AI Settings
+        self._settings.run_object_detection = dpg.get_value("org_run_object_detection")
+        self._settings.run_document_classification = dpg.get_value("org_run_doc_classification")
+
     def _on_date_format_change(self, sender, app_data) -> None:
         """Handle date format change."""
         self._update_settings_from_ui()
@@ -569,6 +610,10 @@ class OrganizePanel:
 
     def _on_dryrun_toggle(self, sender, app_data) -> None:
         """Handle dry run toggle."""
+        self._update_settings_from_ui()
+
+    def _on_ai_settings_change(self, sender, app_data) -> None:
+        """Handle AI settings change."""
         self._update_settings_from_ui()
 
     def _set_buttons_enabled(self, enabled: bool) -> None:
@@ -726,8 +771,56 @@ class OrganizePanel:
                 dpg.add_text("")
                 dpg.add_text("")
 
+        # Update image gallery
+        self._update_gallery_view(preview)
+
         # Enable export and organize buttons
         dpg.configure_item("org_export_btn", enabled=True)
+
+    def _update_gallery_view(self, preview: OrganizePreview) -> None:
+        """Update the image gallery view with thumbnails and AI data."""
+        # Clear existing gallery content
+        dpg.delete_item(self.TAG_PREVIEW_GALLERY, children_only=True)
+
+        # Unload previous textures
+        for path, texture_id in self._texture_registry.items():
+            if dpg.does_item_exist(texture_id):
+                dpg.delete_item(texture_id)
+        self._texture_registry.clear()
+
+        # Filter for changes with thumbnails and add them to the gallery
+        image_changes = [c for c in preview.changes if c.thumbnail_path]
+        if not image_changes:
+            dpg.add_text(
+                "No images to display. Run preview on a folder with images.",
+                parent=self.TAG_PREVIEW_GALLERY,
+                color=get_text_color("disabled")
+            )
+            return
+
+        for change in image_changes:
+            if not change.thumbnail_path or not Path(change.thumbnail_path).exists():
+                continue
+
+            try:
+                width, height, channels, data = dpg.load_image(change.thumbnail_path)
+                texture_id = dpg.add_static_texture(width, height, data, parent=self.TAG_TEXTURE_REGISTRY)
+                self._texture_registry[change.source_path] = texture_id
+
+                with dpg.group(parent=self.TAG_PREVIEW_GALLERY, horizontal=True):
+                    dpg.add_image(texture_id, width=128, height=128)
+                    with dpg.group():
+                        dpg.add_text(Path(change.source_path).name, wrap=400)
+                        if change.is_document:
+                            dpg.add_text("Type: Document", color=get_status_color("info"))
+                        if change.ai_tags:
+                            dpg.add_text(f"Tags: {', '.join(change.ai_tags)}", wrap=400)
+                        dpg.add_text(f"-> {change.dest_path}", wrap=400, color=get_text_color("disabled"))
+                dpg.add_separator(parent=self.TAG_PREVIEW_GALLERY)
+
+            except Exception as e:
+                logger.warning(f"Failed to load thumbnail for {change.source_path}: {e}")
+                continue
 
     def _on_organize_click(self) -> None:
         """Handle organize button click."""

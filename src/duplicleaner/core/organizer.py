@@ -17,6 +17,9 @@ from typing import Callable, Optional
 from duplicleaner.db.database import Database, get_database
 from duplicleaner.db.models import FileRecord, FileMetadata, ActionLogEntry, ActionType
 from duplicleaner.utils.logging import get_logger
+from duplicleaner.ai.objects import ObjectDetector
+from duplicleaner.ai.ocr import OCREngine
+import tempfile
 
 logger = get_logger(__name__)
 
@@ -127,6 +130,11 @@ class OrganizeSettings:
     # Location settings
     location_level: str = "city"  # city, city_country, full
 
+    # AI Features
+    generate_thumbnails: bool = True
+    run_object_detection: bool = False
+    run_document_classification: bool = False
+
 
 @dataclass
 class OrganizeResult:
@@ -142,6 +150,11 @@ class OrganizeResult:
     event_name: Optional[str] = None
     burst_group: Optional[int] = None  # Burst group ID if part of a burst
     is_live_photo: bool = False  # True if this is part of a Live Photo pair
+    # AI Fields
+    ai_tags: list[str] = field(default_factory=list)
+    is_document: bool = False
+    thumbnail_path: Optional[str] = None
+
 
 
 @dataclass
@@ -195,24 +208,40 @@ class Organizer:
         "January", "February", "March", "April", "May", "June",
         "July", "August", "September", "October", "November", "December"
     ]
+    IMAGE_FILE_TYPES = [
+        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
+        '.webp', '.heic', '.heif', '.raw', '.cr2', '.nef', '.arw'
+    ]
+    VIDEO_FILE_TYPES = [
+        '.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mts'
+    ]
 
     def __init__(
         self,
         db: Optional[Database] = None,
-        settings: Optional[OrganizeSettings] = None
+        settings: Optional[OrganizeSettings] = None,
+        object_detector: Optional[ObjectDetector] = None,
+        ocr_engine: Optional[OCREngine] = None,
     ):
         """Initialize the organizer.
 
         Args:
             db: Database instance (uses singleton if not provided)
             settings: Organization settings (uses defaults if not provided)
+            object_detector: Optional pre-initialized object detector
+            ocr_engine: Optional pre-initialized OCR engine
         """
         self.db = db or get_database()
         self.settings = settings or OrganizeSettings()
         self.progress = OrganizeProgress()
 
+        # AI Engines
+        self._object_detector = object_detector
+        self._ocr_engine = ocr_engine
+
         # Location cache to avoid repeated lookups
         self._location_cache: dict[tuple[float, float], str] = {}
+        self._thumbnail_cache_dir = tempfile.mkdtemp(prefix="duplicleaner_thumbs_")
 
         # Geocoder instance
         self._geocoder = None
@@ -222,6 +251,30 @@ class Organizer:
         # Callbacks
         self._progress_callback: Optional[Callable[[OrganizeProgress], None]] = None
         self._cancel_requested = False
+
+    def _generate_thumbnail(self, image_path: str, size=(128, 128)) -> Optional[str]:
+        """Generate a thumbnail for an image and save it to the cache."""
+        if not HAS_PIL:
+            return None
+
+        try:
+            path = Path(image_path)
+            thumb_name = f"{path.stem}_{path.stat().st_mtime}.jpg"
+            thumb_path = Path(self._thumbnail_cache_dir) / thumb_name
+
+            if thumb_path.exists():
+                return str(thumb_path)
+
+            with Image.open(image_path) as img:
+                img.thumbnail(size)
+                # Ensure image is RGB before saving as JPEG
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+                img.save(thumb_path, "JPEG")
+            return str(thumb_path)
+        except Exception as e:
+            logger.debug(f"Thumbnail generation failed for {image_path}: {e}")
+            return None
 
     def set_progress_callback(
         self,
@@ -733,12 +786,16 @@ class Organizer:
         source_path = Path(source_dir)
         dest_path = Path(dest_dir)
 
+        # Initialize AI engines if needed and enabled
+        if self.settings.run_object_detection and self._object_detector is None:
+            self._object_detector = ObjectDetector(self.db)
+            self._object_detector.load_model()
+        if self.settings.run_document_classification and self._ocr_engine is None:
+            self._ocr_engine = OCREngine(self.db)
+            self._ocr_engine.load_model()
+
         if file_types is None:
-            file_types = [
-                '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
-                '.webp', '.heic', '.heif', '.raw', '.cr2', '.nef', '.arw',
-                '.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mts'
-            ]
+            file_types = self.IMAGE_FILE_TYPES + self.VIDEO_FILE_TYPES
 
         # Collect all files with dates
         files_with_dates: list[tuple[str, datetime, str]] = []
@@ -799,6 +856,26 @@ class Organizer:
         folders_to_create: set[str] = set()
 
         for file_path, date, date_source in files_with_dates:
+            # AI analysis
+            ai_tags = []
+            is_document = False
+            thumbnail_path = None
+
+            is_image = Path(file_path).suffix.lower() in self.IMAGE_FILE_TYPES
+            if is_image:
+                if self.settings.generate_thumbnails:
+                    thumbnail_path = self._generate_thumbnail(file_path)
+
+                if self.settings.run_object_detection and self._object_detector:
+                    obj_result = self._object_detector.detect_objects(file_path)
+                    if obj_result:
+                        ai_tags = obj_result.unique_labels
+
+                if self.settings.run_document_classification and self._ocr_engine:
+                    ocr_result = self._ocr_engine.extract_text(file_path)
+                    if ocr_result and len(ocr_result.full_text) > 100: # Heuristic for being a document
+                        is_document = True
+
             # Handle undated files
             if date == datetime.min:
                 folder = "Undated"
@@ -876,6 +953,9 @@ class Organizer:
                 event_name=event_name,
                 burst_group=burst_group,
                 is_live_photo=is_live_photo,
+                ai_tags=ai_tags,
+                is_document=is_document,
+                thumbnail_path=thumbnail_path,
             )
             preview.changes.append(result)
 
@@ -936,6 +1016,9 @@ class Organizer:
                     event_name=change.event_name,
                     burst_group=change.burst_group,
                     is_live_photo=change.is_live_photo,
+                    ai_tags=change.ai_tags,
+                    is_document=change.is_document,
+                    thumbnail_path=change.thumbnail_path,
                 )
                 results.append(result)
                 self.progress.successful += 1
@@ -976,6 +1059,31 @@ class Organizer:
                     shutil.copy2(change.source_path, str(dest_file))
                     action = "copy"
 
+                # After successful move/copy, save AI data to the database
+                new_file_record = self.db.get_file_by_path_any(str(dest_file))
+                if new_file_record and new_file_record.id:
+                    file_id = new_file_record.id
+                    # Save scene analysis (tags)
+                    if change.ai_tags:
+                        from duplicleaner.db.models import SceneAnalysis
+                        scene_analysis = SceneAnalysis(
+                            file_id=file_id,
+                            objects=json.dumps(change.ai_tags),
+                            analyzed_at=datetime.now()
+                        )
+                        self.db.add_scene_analysis(scene_analysis)
+
+                    # Save OCR result (document classification)
+                    if change.is_document:
+                        from duplicleaner.db.models import OCRResult
+                        ocr_result = OCRResult(
+                            file_id=file_id,
+                            is_document=True,
+                            extracted_text="",  # We only have the flag for now
+                            analyzed_at=datetime.now()
+                        )
+                        self.db.add_ocr_result(ocr_result)
+
                 # Log action
                 self.db.log_action(ActionLogEntry(
                     action_type=ActionType.MOVE if self.settings.move_files else ActionType.COPY,
@@ -987,6 +1095,8 @@ class Organizer:
                         "event": change.event_name,
                         "burst_group": change.burst_group,
                         "is_live_photo": change.is_live_photo,
+                        "ai_tags": change.ai_tags,
+                        "is_document": change.is_document,
                     })
                 ))
 
@@ -1000,6 +1110,9 @@ class Organizer:
                     event_name=change.event_name,
                     burst_group=change.burst_group,
                     is_live_photo=change.is_live_photo,
+                    ai_tags=change.ai_tags,
+                    is_document=change.is_document,
+                    thumbnail_path=change.thumbnail_path,
                 )
                 results.append(result)
                 self.progress.successful += 1
@@ -1011,7 +1124,10 @@ class Organizer:
                     dest_path=change.dest_path,
                     success=False,
                     action="error",
-                    error=str(e)
+                    error=str(e),
+                    ai_tags=change.ai_tags,
+                    is_document=change.is_document,
+                    thumbnail_path=change.thumbnail_path,
                 )
                 results.append(result)
                 self.progress.failed += 1

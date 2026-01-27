@@ -33,6 +33,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging"
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable startup profiling and timing logs"
+    )
+    parser.add_argument(
+        "--profile-output",
+        metavar="PATH",
+        help="Write cProfile output to PATH (dir or file)"
+    )
+    parser.add_argument(
+        "--profile-min-ms",
+        type=float,
+        default=0.0,
+        help="Minimum milliseconds for timing logs (default: 0)"
+    )
 
     # Subcommands for CLI operations
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -86,6 +102,13 @@ def main() -> int:
     """Main entry point."""
     args = parse_args()
 
+    # Enable profiling before startup work
+    profiler_session = None
+    if args.profile:
+        from duplicleaner.utils.profiling import enable_profiling, start_cpu_profiler
+        enable_profiling(min_ms=max(0.0, float(args.profile_min_ms)))
+        profiler_session = start_cpu_profiler(args.profile_output)
+
     # Set up logging
     import logging
     from duplicleaner.utils.logging import setup_logging
@@ -94,13 +117,18 @@ def main() -> int:
     setup_logging(level=log_level)
 
     # Handle subcommands (CLI mode)
-    if args.command:
-        return run_cli_command(args)
+    try:
+        if args.command:
+            return run_cli_command(args)
 
-    # GUI mode
-    from duplicleaner.app import run_app
-    run_app()
-    return 0
+        # GUI mode
+        from duplicleaner.app import run_app
+        run_app()
+        return 0
+    finally:
+        if profiler_session:
+            from duplicleaner.utils.profiling import stop_cpu_profiler
+            stop_cpu_profiler(profiler_session)
 
 
 def run_cli_command(args: argparse.Namespace) -> int:

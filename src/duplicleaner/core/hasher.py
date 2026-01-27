@@ -19,6 +19,7 @@ from duplicleaner.db.database import Database, get_database
 from duplicleaner.db.models import FileRecord
 from duplicleaner.utils.config import get_config
 from duplicleaner.utils.logging import get_logger
+from duplicleaner.utils.profiling import profile_block
 
 logger = get_logger(__name__)
 
@@ -210,148 +211,152 @@ class Hasher:
         """
         logger.info(f"Starting hash operation (drive={drive_id}, force={force_rehash})")
 
-        # Reset state
-        self._reset_progress()
-        self._state = HashState.HASHING
-        self._progress.state = HashState.HASHING
-        self._progress.start_time = datetime.now()
-        self._cancel_event.clear()
-        self._pause_event.set()
+        with profile_block("hash_files.total"):
+            # Reset state
+            self._reset_progress()
+            self._state = HashState.HASHING
+            self._progress.state = HashState.HASHING
+            self._progress.start_time = datetime.now()
+            self._cancel_event.clear()
+            self._pause_event.set()
 
-        files_hashed = 0
-        files_skipped = 0
-        duplicate_candidates = 0
-        exact_duplicates = 0
-        errors = 0
+            files_hashed = 0
+            files_skipped = 0
+            duplicate_candidates = 0
+            exact_duplicates = 0
+            errors = 0
 
-        try:
-            # Get files that need hashing (files sharing size with others)
-            files_to_hash = self.db.get_files_needing_hash(drive_id)
-            self._progress.files_to_hash = len(files_to_hash)
+            try:
+                # Get files that need hashing (files sharing size with others)
+                files_to_hash = self.db.get_files_needing_hash(drive_id)
+                self._progress.files_to_hash = len(files_to_hash)
 
-            # Calculate total bytes
-            self._progress.bytes_total = sum(f.size for f in files_to_hash)
+                # Calculate total bytes
+                self._progress.bytes_total = sum(f.size for f in files_to_hash)
 
-            logger.info(f"Found {len(files_to_hash)} files to hash "
-                       f"({self._progress.bytes_total / (1024**3):.2f} GB)")
+                logger.info(f"Found {len(files_to_hash)} files to hash "
+                           f"({self._progress.bytes_total / (1024**3):.2f} GB)")
 
-            # Phase 1: Compute quick hashes
-            quick_hash_groups: dict[str, list[FileRecord]] = {}
+                # Phase 1: Compute quick hashes
+                quick_hash_groups: dict[str, list[FileRecord]] = {}
+                with profile_block("hash_files.quick_hash"):
+                    for file in files_to_hash:
+                        # Check for pause/cancel
+                        self._pause_event.wait()
+                        if self._cancel_event.is_set():
+                            self._state = HashState.CANCELLED
+                            self._progress.state = HashState.CANCELLED
+                            break
 
-            for file in files_to_hash:
-                # Check for pause/cancel
-                self._pause_event.wait()
-                if self._cancel_event.is_set():
-                    self._state = HashState.CANCELLED
-                    self._progress.state = HashState.CANCELLED
-                    break
-
-                self._progress.current_file = file.path
-                self._update_progress()
-
-                # Skip if already has quick hash and not forcing rehash
-                if file.quick_hash and not force_rehash:
-                    quick_hash = file.quick_hash
-                else:
-                    quick_hash = self.compute_quick_hash(file.path)
-                    if quick_hash:
-                        self.db.update_file_hash(file.id, quick_hash=quick_hash)
-                    else:
-                        errors += 1
-                        self._progress.errors += 1
-                        self._progress.error_paths.append(file.path)
-                        continue
-
-                # Group by quick hash
-                if quick_hash not in quick_hash_groups:
-                    quick_hash_groups[quick_hash] = []
-                quick_hash_groups[quick_hash].append(file)
-
-                self._progress.files_completed += 1
-                self._progress.bytes_processed += file.size
-                self._update_progress()
-
-            # Filter to only groups with potential duplicates
-            potential_duplicates = {
-                h: files for h, files in quick_hash_groups.items()
-                if len(files) > 1
-            }
-            duplicate_candidates = sum(len(files) for files in potential_duplicates.values())
-
-            logger.info(f"Found {len(potential_duplicates)} groups with "
-                       f"{duplicate_candidates} potential duplicates")
-
-            # Phase 2: Compute full hashes for potential duplicates
-            for quick_hash, files in potential_duplicates.items():
-                if self._cancel_event.is_set():
-                    break
-
-                for file in files:
-                    # Check for pause/cancel
-                    self._pause_event.wait()
-                    if self._cancel_event.is_set():
-                        break
-
-                    self._progress.current_file = file.path
-                    self._progress.current_file_progress = 0.0
-                    self._update_progress()
-
-                    # Skip if already has full hash and not forcing rehash
-                    if file.content_hash and not force_rehash:
-                        files_skipped += 1
-                        self._progress.files_skipped += 1
-                        continue
-
-                    # Compute full hash with progress for large files
-                    def file_progress(p: float) -> None:
-                        self._progress.current_file_progress = p
+                        self._progress.current_file = file.path
                         self._update_progress()
 
-                    content_hash = self.compute_full_hash(
-                        file.path,
-                        progress_callback=file_progress if file.size > 100 * 1024 * 1024 else None
-                    )
+                        # Skip if already has quick hash and not forcing rehash
+                        if file.quick_hash and not force_rehash:
+                            quick_hash = file.quick_hash
+                        else:
+                            quick_hash = self.compute_quick_hash(file.path)
+                            if quick_hash:
+                                self.db.update_file_hash(file.id, quick_hash=quick_hash)
+                            else:
+                                errors += 1
+                                self._progress.errors += 1
+                                self._progress.error_paths.append(file.path)
+                                continue
 
-                    if content_hash:
-                        self.db.update_file_hash(file.id, content_hash=content_hash)
-                        files_hashed += 1
+                        # Group by quick hash
+                        if quick_hash not in quick_hash_groups:
+                            quick_hash_groups[quick_hash] = []
+                        quick_hash_groups[quick_hash].append(file)
 
-                        # Check for exact duplicates
-                        matching_files = self.db.get_files_by_hash(content_hash)
-                        if len(matching_files) > 1:
-                            exact_duplicates += 1
-                    else:
-                        if not self._cancel_event.is_set():
-                            errors += 1
-                            self._progress.errors += 1
-                            self._progress.error_paths.append(file.path)
+                        self._progress.files_completed += 1
+                        self._progress.bytes_processed += file.size
+                        self._update_progress()
 
-            if not self._cancel_event.is_set():
-                self._state = HashState.COMPLETED
-                self._progress.state = HashState.COMPLETED
-                logger.info(f"Hashing completed: {files_hashed} files hashed, "
-                           f"{exact_duplicates} exact duplicates found")
+                # Filter to only groups with potential duplicates
+                potential_duplicates = {
+                    h: files for h, files in quick_hash_groups.items()
+                    if len(files) > 1
+                }
+                duplicate_candidates = sum(len(files) for files in potential_duplicates.values())
 
-        except Exception as e:
-            logger.error(f"Hash error: {e}")
-            self._state = HashState.ERROR
-            self._progress.state = HashState.ERROR
-            raise
+                logger.info(f"Found {len(potential_duplicates)} groups with "
+                           f"{duplicate_candidates} potential duplicates")
 
-        # Calculate elapsed time
-        if self._progress.start_time:
-            self._progress.elapsed_seconds = (
-                datetime.now() - self._progress.start_time
-            ).total_seconds()
+                # Phase 2: Compute full hashes for potential duplicates
+                with profile_block("hash_files.full_hash"):
+                    for quick_hash, files in potential_duplicates.items():
+                        if self._cancel_event.is_set():
+                            break
 
-        return HashResult(
-            files_hashed=files_hashed,
-            files_skipped=files_skipped,
-            duplicate_candidates=duplicate_candidates,
-            exact_duplicates=exact_duplicates,
-            errors=errors,
-            duration_seconds=self._progress.elapsed_seconds,
-        )
+                        for file in files:
+                            # Check for pause/cancel
+                            self._pause_event.wait()
+                            if self._cancel_event.is_set():
+                                break
+
+                            self._progress.current_file = file.path
+                            self._progress.current_file_progress = 0.0
+                            self._update_progress()
+
+                            # Skip if already has full hash and not forcing rehash
+                            if file.content_hash and not force_rehash:
+                                files_skipped += 1
+                                self._progress.files_skipped += 1
+                                continue
+
+                            # Compute full hash with progress for large files
+                            def file_progress(p: float) -> None:
+                                self._progress.current_file_progress = p
+                                self._update_progress()
+
+                            content_hash = self.compute_full_hash(
+                                file.path,
+                                progress_callback=file_progress if file.size > 100 * 1024 * 1024 else None
+                            )
+
+                            if content_hash:
+                                self.db.update_file_hash(file.id, content_hash=content_hash)
+                                files_hashed += 1
+
+                                # Check for exact duplicates
+                                matching_files = self.db.get_files_by_hash(content_hash)
+                                if len(matching_files) > 1:
+                                    exact_duplicates += 1
+                            else:
+                                if not self._cancel_event.is_set():
+                                    errors += 1
+                                    self._progress.errors += 1
+                                    self._progress.error_paths.append(file.path)
+
+                if not self._cancel_event.is_set():
+                    self._state = HashState.COMPLETED
+                    self._progress.state = HashState.COMPLETED
+                    logger.info(f"Hashing completed: {files_hashed} files hashed, "
+                               f"{exact_duplicates} exact duplicates found")
+
+            except Exception as e:
+                logger.error(f"Hash error: {e}")
+                self._state = HashState.ERROR
+                self._progress.state = HashState.ERROR
+                raise
+
+            # Calculate elapsed time
+            if self._progress.start_time:
+                self._progress.elapsed_seconds = (
+                    datetime.now() - self._progress.start_time
+                ).total_seconds()
+
+            result = HashResult(
+                files_hashed=files_hashed,
+                files_skipped=files_skipped,
+                duplicate_candidates=duplicate_candidates,
+                exact_duplicates=exact_duplicates,
+                errors=errors,
+                duration_seconds=self._progress.elapsed_seconds,
+            )
+
+        return result
 
     def hash_single_file(
         self,

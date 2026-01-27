@@ -17,6 +17,7 @@ import threading
 import dearpygui.dearpygui as dpg
 
 from duplicleaner.utils.logging import get_logger, setup_logging
+from duplicleaner.utils.profiling import profile_block
 from duplicleaner.utils.config import get_config, save_config
 from duplicleaner.utils.keystore import AIProvider, get_keystore, mask_api_key
 from duplicleaner.db.database import get_database
@@ -126,9 +127,12 @@ class DupliCleanerApp:
 
     def __init__(self) -> None:
         """Initialize the application."""
-        self.config = get_config()
-        self.db = get_database()
-        self.keystore = get_keystore()
+        with profile_block("startup.config"):
+            self.config = get_config()
+        with profile_block("startup.database"):
+            self.db = get_database()
+        with profile_block("startup.keystore"):
+            self.keystore = get_keystore()
         self.search_panel: Optional[SearchPanel] = None
         self.status_log_panel: Optional[StatusLogPanel] = None
         self.drive_manager = DriveManager(self.db)
@@ -156,34 +160,42 @@ class DupliCleanerApp:
         self._callbacks: dict[str, list[Callable]] = {}
 
         # Detect CUDA availability once at startup
-        self._cuda_available = self._detect_cuda_available()
-        self._apply_gpu_defaults()
+        with profile_block("startup.gpu_detect"):
+            self._cuda_available = self._detect_cuda_available()
+            self._apply_gpu_defaults()
 
         logger.info("DupliCleaner application initialized")
 
     def setup(self) -> None:
         """Set up Dear PyGui context and create the UI."""
-        dpg.create_context()
+        with profile_block("startup.dpg.create_context"):
+            dpg.create_context()
 
         # Configure viewport
-        dpg.create_viewport(
-            title="DupliCleaner",
-            width=self.config.ui.window_width,
-            height=self.config.ui.window_height,
-            min_width=800,
-            min_height=600,
-        )
+        with profile_block("startup.dpg.create_viewport"):
+            dpg.create_viewport(
+                title="DupliCleaner",
+                width=self.config.ui.window_width,
+                height=self.config.ui.window_height,
+                min_width=800,
+                min_height=600,
+            )
 
         # Set up theme
-        self._setup_theme()
+        with profile_block("startup.theme"):
+            self._setup_theme()
 
         # Create main window
-        self._create_main_window()
-        self._create_setup_wizard()
+        with profile_block("startup.main_window"):
+            self._create_main_window()
+        with profile_block("startup.setup_wizard"):
+            self._create_setup_wizard()
 
         # Set up Dear PyGui
-        dpg.setup_dearpygui()
-        dpg.show_viewport()
+        with profile_block("startup.dpg.setup"):
+            dpg.setup_dearpygui()
+        with profile_block("startup.dpg.show_viewport"):
+            dpg.show_viewport()
 
         # Set the main window as primary
         dpg.set_primary_window(self.TAG_MAIN_WINDOW, True)
@@ -194,7 +206,10 @@ class DupliCleanerApp:
         logger.info("UI setup complete")
 
         # Sync GPU status after UI is ready
-        self._refresh_gpu_ui_state()
+        with profile_block("startup.refresh_gpu"):
+            self._refresh_gpu_ui_state()
+        with profile_block("startup.recent_changes"):
+            self._refresh_recent_changes()
 
     def _setup_theme(self) -> None:
         """Set up the application theme."""
@@ -613,6 +628,82 @@ class DupliCleanerApp:
             dpg.configure_item(tag, color=color)
         except Exception:
             pass
+
+    def _add_model_row(self, model_name: str, model_key: str, status_tag: str) -> None:
+        """Add a row to the AI Models table."""
+        with dpg.table_row():
+            dpg.add_text(model_name)
+            dpg.add_text("Not checked", tag=status_tag, color=get_text_color("secondary"))
+            dpg.add_button(
+                label="Download",
+                callback=self._on_model_download_clicked,
+                user_data={"key": model_key, "tag": status_tag},
+            )
+
+    def _on_model_download_clicked(self, sender, app_data, user_data) -> None:
+        """Handle model download button click."""
+        model_key = user_data["key"]
+        status_tag = user_data["tag"]
+        dpg.set_value(status_tag, "Queued for download...")
+        dpg.configure_item(status_tag, color=get_status_color("info"))
+        # Run download in a separate thread to avoid blocking UI
+        thread = threading.Thread(target=self._download_model, args=(model_key, status_tag), daemon=True)
+        thread.start()
+
+    def _download_model(self, model_key: str, status_tag: str) -> None:
+        """Download a model and update the UI."""
+        manager = ModelManager(progress_callback=self.update_status)
+        download_methods = {
+            "faces": manager.download_faces,
+            "clip": manager.download_clip,
+            "yolo": manager.download_yolo,
+            "ocr": manager.download_ocr,
+        }
+
+        if model_key in download_methods:
+            dpg.set_value(status_tag, "Downloading...")
+            result = download_methods[model_key]()
+            if result.success:
+                self.config.ai.downloaded_models[model_key] = True
+                save_config()
+            color = get_status_color("success") if result.success else get_status_color("error")
+            dpg.set_value(status_tag, result.message)
+            dpg.configure_item(status_tag, color=color)
+            self.update_status(result.message, level="info" if result.success else "error")
+
+    def _refresh_model_status(self) -> None:
+        """Refresh the status of all models."""
+        # This method needs to be implemented.
+        self.update_status("Model status refresh not yet implemented.", level="warning")
+
+    def _verify_models(self) -> None:
+        """Verify the integrity of all models."""
+        # This method needs to be implemented.
+        self.update_status("Model verification not yet implemented.", level="warning")
+
+    def _install_ai_dependencies(self) -> None:
+        """Install AI dependencies."""
+        # This method needs to be implemented.
+        self.update_status("AI dependency installation not yet implemented.", level="warning")
+
+    def _on_ai_deps_variant_changed(self, sender, app_data, user_data) -> None:
+        """Handle AI dependency variant change."""
+        # This method needs to be implemented.
+        self.update_status("AI dependency variant change not yet implemented.", level="warning")
+
+    def _format_extension_list(self, extensions: list[str]) -> str:
+        """Format a list of extensions into a comma-separated string."""
+        return ", ".join(extensions)
+
+    def _on_run_analysis(self, sender, app_data, user_data) -> None:
+        """Handle run analysis button click."""
+        # This method needs to be implemented.
+        self.update_status("Run analysis not yet implemented.", level="warning")
+
+    def _on_cancel_analysis(self, sender, app_data, user_data) -> None:
+        """Handle cancel analysis button click."""
+        # This method needs to be implemented.
+        self.update_status("Cancel analysis not yet implemented.", level="warning")
 
     def _create_settings_panel(self) -> None:
         """Create the settings panel."""
@@ -1113,23 +1204,379 @@ class DupliCleanerApp:
         self._refresh_recent_changes()
         self.update_status("Preferences saved (general, duplicates, scan, AI, summaries, metadata)")
 
+    def _on_add_tracked_folder(self) -> None:
+        """Add a folder to version tracking."""
+        raw_path = dpg.get_value(self.TAG_VERSION_FOLDER_INPUT).strip().strip('"')
+        if not raw_path:
+            self.update_status("Enter a folder path to track.", level="warning")
+            return
+
+        normalized = normalize_path(raw_path)
+        if not os.path.exists(normalized):
+            self.update_status(f"Folder does not exist: {normalized}", level="error")
+            return
+        if not os.path.isdir(normalized):
+            self.update_status(f"Path is not a folder: {normalized}", level="error")
+            return
+
+        existing = {normalize_path(p).lower() for p in self.config.versioning.tracked_folders}
+        if normalized.lower() in existing:
+            self.update_status("Folder is already tracked.", level="warning")
+            dpg.configure_item(self.TAG_VERSION_FOLDER_LIST, items=self.config.versioning.tracked_folders)
+            return
+
+        self.config.versioning.tracked_folders.append(normalized)
+        save_config()
+        dpg.set_value(self.TAG_VERSION_FOLDER_INPUT, "")
+        dpg.configure_item(self.TAG_VERSION_FOLDER_LIST, items=self.config.versioning.tracked_folders)
+        self.versioning_service.refresh_tracked_folders()
+        self._refresh_recent_changes()
+        self.update_status("Added folder to version tracking.", level="info")
+
+    def _on_remove_tracked_folder(self) -> None:
+        """Remove the selected tracked folder."""
+        selected = dpg.get_value(self.TAG_VERSION_FOLDER_LIST)
+        if not selected:
+            self.update_status("Select a folder to remove.", level="warning")
+            return
+
+        normalized = normalize_path(selected)
+        self.config.versioning.tracked_folders = [
+            path for path in self.config.versioning.tracked_folders
+            if normalize_path(path).lower() != normalized.lower()
+        ]
+        save_config()
+        dpg.configure_item(self.TAG_VERSION_FOLDER_LIST, items=self.config.versioning.tracked_folders)
+        self.versioning_service.refresh_tracked_folders()
+        self._refresh_recent_changes()
+        self.update_status("Removed tracked folder.", level="info")
+
+    def _on_versioning_settings_changed(self, sender, app_data, user_data) -> None:
+        """Persist versioning settings as they change."""
+        self.config.versioning.include_subfolders = bool(dpg.get_value(self.TAG_VERSION_INCLUDE_SUBFOLDERS))
+        self.config.versioning.auto_commit_mode = dpg.get_value(self.TAG_VERSION_AUTO_MODE)
+        max_size = dpg.get_value(self.TAG_VERSION_MAX_SIZE)
+        try:
+            self.config.versioning.max_file_size_mb = max(1.0, float(max_size))
+        except (TypeError, ValueError):
+            self.config.versioning.max_file_size_mb = 50.0
+            dpg.set_value(self.TAG_VERSION_MAX_SIZE, 50.0)
+
+        save_config()
+        self.versioning_service.refresh_tracked_folders()
+        self.update_status("Version tracking settings updated.", level="info")
+
+    def _show_version_file_dialog(self) -> None:
+        """Show file dialog for version history."""
+        if not dpg.does_item_exist(self.TAG_VERSION_FILE_DIALOG):
+            with dpg.file_dialog(
+                tag=self.TAG_VERSION_FILE_DIALOG,
+                show=False,
+                modal=True,
+                width=700,
+                height=400,
+                callback=self._on_version_file_selected,
+            ):
+                dpg.add_file_extension(".*", color=(255, 255, 255))
+
+        dpg.show_item(self.TAG_VERSION_FILE_DIALOG)
+
+    def _on_version_file_selected(self, sender, app_data) -> None:
+        """Handle file selection for version history."""
+        path = app_data.get("file_path_name")
+        if path:
+            dpg.set_value(self.TAG_VERSION_FILE_INPUT, path)
+
+    def _on_view_history(self) -> None:
+        """Open version history dialog for the selected file."""
+        raw_path = dpg.get_value(self.TAG_VERSION_FILE_INPUT).strip().strip('"')
+        if not raw_path:
+            self.update_status("Choose a file to view history.", level="warning")
+            return
+
+        file_path = Path(raw_path)
+        if not file_path.exists():
+            self.update_status(f"File not found: {file_path}", level="error")
+            return
+
+        tracker = self._get_tracker_for_path(file_path)
+        if tracker is None:
+            self.update_status("File is not inside a tracked folder.", level="warning")
+            return
+        if not tracker.is_available():
+            self.update_status("Version tracking unavailable (GitPython missing).", level="warning")
+            return
+        if not tracker.init_repository():
+            self.update_status("Failed to initialize version tracking repository.", level="error")
+            return
+
+        history = tracker.get_file_history(file_path)
+        if not history:
+            self.update_status("No history found for this file.", level="warning")
+            return
+
+        self._version_history_file = file_path
+        self._version_history_entries = history
+        self._selected_history_commit = None
+        self._ensure_version_history_dialog()
+        dpg.set_value(self.TAG_VERSION_HISTORY_LABEL, f"History for: {file_path}")
+        self._populate_version_history_table(history)
+        dpg.set_value(self.TAG_VERSION_DIFF_TEXT, "")
+        dpg.set_value(self.TAG_VERSION_DIFF_LABEL, "Diff (select a commit)")
+        dpg.configure_item(self.TAG_VERSION_RESTORE_BUTTON, enabled=False)
+        dpg.configure_item(self.TAG_VERSION_OPEN_BUTTON, enabled=file_path.exists())
+        dpg.show_item(self.TAG_VERSION_HISTORY_DIALOG)
+
+    def _on_save_version(self) -> None:
+        """Manually save a version for the selected file."""
+        raw_path = dpg.get_value(self.TAG_VERSION_FILE_INPUT).strip().strip('"')
+        if not raw_path:
+            self.update_status("Choose a file to save a version.", level="warning")
+            return
+
+        file_path = Path(raw_path)
+        if not file_path.exists():
+            self.update_status(f"File not found: {file_path}", level="error")
+            return
+
+        tracker = self._get_tracker_for_path(file_path)
+        if tracker is None:
+            self.update_status("File is not inside a tracked folder.", level="warning")
+            return
+        if not tracker.is_available():
+            self.update_status("Version tracking unavailable (GitPython missing).", level="warning")
+            return
+        if not tracker.init_repository():
+            self.update_status("Failed to initialize version tracking repository.", level="error")
+            return
+
+        committed = tracker.commit_files([file_path], f"Manual save: {file_path.name}")
+        if committed:
+            self.update_status("Version saved.", level="info")
+            self._refresh_recent_changes()
+        else:
+            self.update_status("No changes to save.", level="warning")
+
+    def _refresh_recent_changes(self) -> None:
+        """Refresh the recent changes table."""
+        if not dpg.does_item_exist(self.TAG_VERSION_RECENT_TABLE):
+            return
+
+        children = dpg.get_item_children(self.TAG_VERSION_RECENT_TABLE, slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+        tracked = self.config.versioning.tracked_folders
+        if not tracked:
+            return
+
+        changes: list[ChangeEntry] = []
+        for folder in tracked:
+            tracker = self._build_tracker(folder)
+            if tracker is None or not tracker.is_available():
+                continue
+            if not tracker.init_repository():
+                continue
+            changes.extend(tracker.get_recent_changes(limit=50))
+
+        changes.sort(key=lambda item: item.committed_at, reverse=True)
+        for change in changes[:50]:
+            with dpg.table_row(parent=self.TAG_VERSION_RECENT_TABLE):
+                dpg.add_text(change.file_path)
+                dpg.add_text(change.committed_at.strftime("%Y-%m-%d %H:%M"))
+                dpg.add_text(change.message)
+
+    def _ensure_version_history_dialog(self) -> None:
+        """Create the version history dialog if missing."""
+        if dpg.does_item_exist(self.TAG_VERSION_HISTORY_DIALOG):
+            return
+
+        with dpg.window(
+            tag=self.TAG_VERSION_HISTORY_DIALOG,
+            label="Version History",
+            modal=True,
+            show=False,
+            width=900,
+            height=520,
+            no_resize=True,
+        ):
+            dpg.add_text("", tag=self.TAG_VERSION_HISTORY_LABEL, color=get_text_color("secondary"))
+            dpg.add_spacer(height=5)
+            with dpg.table(
+                tag=self.TAG_VERSION_HISTORY_TABLE,
+                header_row=True,
+                borders_innerH=True,
+                borders_outerH=True,
+                borders_innerV=True,
+                borders_outerV=True,
+                resizable=True,
+                policy=dpg.mvTable_SizingStretchProp,
+                row_background=True,
+                scrollY=True,
+                height=220,
+            ):
+                dpg.add_table_column(label="Date", init_width_or_weight=140)
+                dpg.add_table_column(label="Author", init_width_or_weight=160)
+                dpg.add_table_column(label="Message", init_width_or_weight=240)
+                dpg.add_table_column(label="Size", init_width_or_weight=80)
+                dpg.add_table_column(label="Changes", init_width_or_weight=100)
+
+            dpg.add_spacer(height=6)
+            dpg.add_text("Diff", tag=self.TAG_VERSION_DIFF_LABEL, color=get_text_color("secondary"))
+            dpg.add_input_text(
+                tag=self.TAG_VERSION_DIFF_TEXT,
+                multiline=True,
+                readonly=True,
+                width=-1,
+                height=140,
+            )
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Restore Selected",
+                    tag=self.TAG_VERSION_RESTORE_BUTTON,
+                    callback=self._on_restore_version,
+                    enabled=False,
+                )
+                dpg.add_button(
+                    label="Open File",
+                    tag=self.TAG_VERSION_OPEN_BUTTON,
+                    callback=self._on_open_history_file,
+                    enabled=False,
+                )
+                dpg.add_spacer(width=10)
+                dpg.add_button(label="Close", callback=lambda: dpg.hide_item(self.TAG_VERSION_HISTORY_DIALOG))
+
+    def _populate_version_history_table(self, history: list[VersionEntry]) -> None:
+        """Render history table rows."""
+        children = dpg.get_item_children(self.TAG_VERSION_HISTORY_TABLE, slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+        for entry in history:
+            with dpg.table_row(parent=self.TAG_VERSION_HISTORY_TABLE):
+                label = entry.committed_at.strftime("%Y-%m-%d %H:%M")
+                dpg.add_selectable(
+                    label=label,
+                    callback=self._on_history_selected,
+                    user_data=entry.commit_hash,
+                    span_columns=False,
+                )
+                dpg.add_text(entry.author)
+                dpg.add_text(entry.message)
+                dpg.add_text(self._format_bytes(entry.size_bytes or 0))
+                if entry.insertions is not None and entry.deletions is not None:
+                    dpg.add_text(f"+{entry.insertions} / -{entry.deletions}")
+                else:
+                    dpg.add_text("-")
+
+    def _on_history_selected(self, sender, app_data, user_data) -> None:
+        """Handle version history row selection."""
+        commit_hash = str(user_data)
+        self._selected_history_commit = commit_hash
+        dpg.configure_item(self.TAG_VERSION_RESTORE_BUTTON, enabled=True)
+
+        if not self._version_history_file or not self._version_history_entries:
+            return
+
+        tracker = self._get_tracker_for_path(self._version_history_file)
+        if tracker is None:
+            return
+
+        diff_text = ""
+        label = "Diff"
+        for idx, entry in enumerate(self._version_history_entries):
+            if entry.commit_hash == commit_hash:
+                parent_hash = None
+                if idx + 1 < len(self._version_history_entries):
+                    parent_hash = self._version_history_entries[idx + 1].commit_hash
+                if parent_hash:
+                    diff_text = tracker.diff_versions(self._version_history_file, parent_hash, commit_hash)
+                    label = f"Diff {parent_hash[:8]} -> {commit_hash[:8]}"
+                else:
+                    label = f"Diff (initial commit {commit_hash[:8]})"
+                break
+
+        dpg.set_value(self.TAG_VERSION_DIFF_TEXT, diff_text)
+        dpg.set_value(self.TAG_VERSION_DIFF_LABEL, label)
+
+    def _on_restore_version(self) -> None:
+        """Restore the selected version of the file."""
+        if not self._version_history_file or not self._selected_history_commit:
+            self.update_status("Select a version to restore.", level="warning")
+            return
+
+        tracker = self._get_tracker_for_path(self._version_history_file)
+        if tracker is None:
+            self.update_status("Tracked repository not found.", level="warning")
+            return
+
+        restored = tracker.restore_file(self._version_history_file, self._selected_history_commit)
+        if restored:
+            self.update_status("Version restored.", level="info")
+            self._on_view_history()
+            self._refresh_recent_changes()
+        else:
+            self.update_status("Failed to restore version.", level="error")
+
+    def _on_open_history_file(self) -> None:
+        """Open the history file in the default application."""
+        if not self._version_history_file:
+            return
+        try:
+            os.startfile(str(self._version_history_file))
+        except Exception as exc:
+            logger.error("Failed to open file: %s", exc)
+            self.update_status("Failed to open file.", level="error")
+
+    def _get_tracker_for_path(self, file_path: Path) -> Optional[VersionTracker]:
+        """Return a VersionTracker for a file if it is in a tracked folder."""
+        resolved = file_path.resolve()
+        for folder in self.config.versioning.tracked_folders:
+            root = Path(folder).resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            return self._build_tracker(root)
+        return None
+
+    def _build_tracker(self, root_path: str | Path) -> Optional[VersionTracker]:
+        """Build a VersionTracker for the given root path."""
+        root = Path(root_path)
+        if not root.exists():
+            return None
+        return VersionTracker(
+            root_path=str(root),
+            include_patterns=self.config.versioning.include_patterns or None,
+            exclude_patterns=self.config.versioning.exclude_patterns,
+            include_subfolders=self.config.versioning.include_subfolders,
+            max_file_size_mb=self.config.versioning.max_file_size_mb,
+        )
+
     def run(self) -> None:
         """Run the application main loop."""
         logger.info("Starting DupliCleaner")
 
         # Update initial status
-        stats = self.db.get_statistics()
-        self.update_file_count(stats["total_files"])
-        self.update_storage_info(stats["total_size"])
+        with profile_block("startup.db_statistics"):
+            stats = self.db.get_statistics()
+            self.update_file_count(stats["total_files"])
+            self.update_storage_info(stats["total_size"])
 
         # Check GPU availability
-        self._refresh_gpu_ui_state()
+        with profile_block("startup.gpu_ui"):
+            self._refresh_gpu_ui_state()
 
         # Start background version tracking
-        self.versioning_service.start()
+        with profile_block("startup.versioning_service.start"):
+            self.versioning_service.start()
 
         # Main render loop
         while dpg.is_dearpygui_running():
+            if self.faces_panel:
+                self.faces_panel.on_frame()
             dpg.render_dearpygui_frame()
 
         self.cleanup()

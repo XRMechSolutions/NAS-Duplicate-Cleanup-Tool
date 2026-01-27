@@ -292,8 +292,15 @@ class FaceAnalyzer:
             import cv2
             img = cv2.imread(image_path)
             if img is None:
-                logger.warning(f"Could not read image: {image_path}")
-                return []
+                try:
+                    from PIL import Image, ImageOps
+                    with Image.open(image_path) as pil_img:
+                        pil_img = ImageOps.exif_transpose(pil_img)
+                        pil_img = pil_img.convert("RGB")
+                        img = np.array(pil_img)[:, :, ::-1]
+                except Exception:
+                    logger.warning(f"Could not read image: {image_path}")
+                    return []
 
             # Run face detection
             faces = self._model.get(img)
@@ -458,6 +465,7 @@ class FaceAnalyzer:
         faces: Optional[list[Face]] = None,
         eps: Optional[float] = None,
         min_samples: int = DBSCAN_MIN_SAMPLES,
+        use_known: bool = True,
     ) -> list[FaceCluster]:
         """Cluster unassigned faces into groups.
 
@@ -465,6 +473,7 @@ class FaceAnalyzer:
             faces: Faces to cluster (if None, gets unassigned from DB)
             eps: DBSCAN epsilon parameter
             min_samples: Minimum samples for a cluster
+            use_known: If True, try to auto-assign faces to known people before clustering
 
         Returns:
             List of FaceCluster objects
@@ -475,6 +484,17 @@ class FaceAnalyzer:
 
         # Get unassigned faces if not provided
         if faces is None:
+            if use_known:
+                try:
+                    _, assigned = self.match_and_assign_faces(
+                        faces=None,
+                        threshold=self.match_threshold,
+                        auto_assign=True,
+                    )
+                    if assigned:
+                        logger.info(f"Auto-assigned {assigned} faces to known people before clustering")
+                except Exception as exc:
+                    logger.warning(f"Auto-assign before clustering failed: {exc}")
             faces = self.db.get_unassigned_faces(min_confidence=self.det_conf_threshold)
 
         if len(faces) < min_samples:
@@ -547,7 +567,19 @@ class FaceAnalyzer:
             avg_embedding = np.mean(cluster_embeddings, axis=0)
 
             # Select sample faces (up to 5)
-            sample_faces = cluster_faces[:5]
+            avg_norm = np.linalg.norm(avg_embedding)
+            scored = []
+            for face, emb in zip(cluster_faces, cluster_embeddings):
+                emb_norm = np.linalg.norm(emb)
+                if emb_norm > 0 and avg_norm > 0:
+                    sim = float(np.dot(emb, avg_embedding) / (emb_norm * avg_norm))
+                else:
+                    sim = -1.0
+                conf = face.confidence or 0.0
+                area = (face.bbox_w or 0) * (face.bbox_h or 0)
+                scored.append((sim, conf, area, face))
+            scored.sort(reverse=True, key=lambda s: (s[0], s[1], s[2]))
+            sample_faces = [s[3] for s in scored[:5]]
 
             cluster = FaceCluster(
                 cluster_id=int(label),

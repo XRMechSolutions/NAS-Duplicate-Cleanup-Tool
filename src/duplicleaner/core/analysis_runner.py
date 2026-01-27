@@ -15,6 +15,7 @@ from duplicleaner.core.metadata_extractor import MetadataExtractor
 from duplicleaner.db.database import Database
 from duplicleaner.utils.config import get_config
 from duplicleaner.utils.logging import get_logger
+from duplicleaner.utils.profiling import profile_block
 
 logger = get_logger(__name__)
 
@@ -63,17 +64,23 @@ class AnalysisRunner:
 
     def run(self, options: AnalysisOptions) -> AnalysisStats:
         stats = AnalysisStats()
-        self._emit_preflight(options)
-        if options.include_metadata and options.include_images:
-            stats.metadata = self._run_metadata(options)
-        if options.include_scenes and options.include_images:
-            stats.scenes = self._run_scenes(options)
-        if options.include_objects and options.include_images:
-            stats.objects = self._run_objects(options)
-        if options.include_ocr:
-            stats.ocr = self._run_ocr(options)
-        if options.include_summaries:
-            stats.summaries = self._run_summaries(options)
+        with profile_block("analysis.run"):
+            self._emit_preflight(options)
+            if options.include_metadata and options.include_images:
+                with profile_block("analysis.metadata"):
+                    stats.metadata = self._run_metadata(options)
+            if options.include_scenes and options.include_images:
+                with profile_block("analysis.scenes"):
+                    stats.scenes = self._run_scenes(options)
+            if options.include_objects and options.include_images:
+                with profile_block("analysis.objects"):
+                    stats.objects = self._run_objects(options)
+            if options.include_ocr:
+                with profile_block("analysis.ocr"):
+                    stats.ocr = self._run_ocr(options)
+            if options.include_summaries:
+                with profile_block("analysis.summaries"):
+                    stats.summaries = self._run_summaries(options)
         return stats
 
     def _notify(self, message: str) -> None:

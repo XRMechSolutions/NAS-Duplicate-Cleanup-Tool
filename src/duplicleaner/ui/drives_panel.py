@@ -5,6 +5,7 @@ Dear PyGui UI component for managing drives and initiating scans.
 
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -142,10 +143,13 @@ class DrivesPanel:
         self._scan_all_queue: list[str] = []
         self._scan_all_mode: Optional[ScanMode] = None
         self._scan_all_active = False
+        self._pending_full_refresh = True
+        self._full_refresh_after = time.time() + 0.5
+        self._pending_monitor_start = True
+        self._monitor_start_after = time.time() + 0.5
 
         # Build UI
         self._build_ui()
-        self.drive_manager.start_monitoring()
 
     def _build_ui(self) -> None:
         """Build the panel UI."""
@@ -551,8 +555,8 @@ class DrivesPanel:
         self._create_scan_all_dialog()
         self._update_background_status()
 
-        # Initial refresh
-        self._refresh_drive_list()
+        # Initial refresh (fast, no probing)
+        self._refresh_drive_list(probe=False)
         self._refresh_backup_targets()
         self._refresh_resume_button()
 
@@ -668,7 +672,7 @@ class DrivesPanel:
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=enabled)
 
-    def _refresh_drive_list(self) -> None:
+    def _refresh_drive_list(self, probe: bool = True) -> None:
         """Refresh the drive list table."""
         # Clear existing rows
         children = dpg.get_item_children(self.TAG_DRIVE_LIST, slot=1)
@@ -696,8 +700,38 @@ class DrivesPanel:
 
         # Add rows for each drive
         for drive in drives:
-            status = self.drive_manager.get_drive_status(drive.id)
-            space = self.drive_manager.get_space_info(drive.path) if status == DriveStatus.CONNECTED else None
+            status = None
+            status_label = "Checking"
+            status_color = (160, 160, 160)
+            if probe:
+                status = self.drive_manager.get_drive_status(drive.id)
+            else:
+                status = self.drive_manager._status_cache.get(drive.id)
+            if status is not None:
+                status_label = status.value.title()
+                status_colors = {
+                    DriveStatus.CONNECTED: (100, 200, 100),
+                    DriveStatus.DISCONNECTED: (200, 100, 100),
+                    DriveStatus.SCANNING: (100, 150, 255),
+                    DriveStatus.ERROR: (255, 100, 100),
+                    DriveStatus.NEEDS_SCAN: (200, 200, 100),
+                }
+                status_color = status_colors.get(status, (200, 200, 200))
+
+            space = None
+            if probe and status == DriveStatus.CONNECTED:
+                space = self.drive_manager.get_space_info(drive.path)
+            elif not probe and drive.total_space and drive.free_space:
+                used_bytes = max(drive.total_space - drive.free_space, 0)
+                space = DriveInfo(
+                    drive=drive,
+                    status=status or DriveStatus.NEEDS_SCAN,
+                    is_network=drive.is_network,
+                )
+                # Attach lightweight fields for display
+                space.total_bytes = drive.total_space
+                space.free_bytes = drive.free_space
+                space.used_bytes = used_bytes
 
             with dpg.table_row(parent=self.TAG_DRIVE_LIST):
                 # Selection checkbox
@@ -717,14 +751,7 @@ class DrivesPanel:
                 dpg.add_text(drive.path)
 
                 # Status with color
-                status_colors = {
-                    DriveStatus.CONNECTED: (100, 200, 100),
-                    DriveStatus.DISCONNECTED: (200, 100, 100),
-                    DriveStatus.SCANNING: (100, 150, 255),
-                    DriveStatus.ERROR: (255, 100, 100),
-                    DriveStatus.NEEDS_SCAN: (200, 200, 100),
-                }
-                dpg.add_text(status.value.title(), color=status_colors.get(status, (200, 200, 200)))
+                dpg.add_text(status_label, color=status_color)
 
                 # Files
                 dpg.add_text(f"{drive.file_count:,}" if drive.file_count else "-")
@@ -753,6 +780,16 @@ class DrivesPanel:
         self._set_section_visibility(True)
         self._update_selected_summary()
         self._refresh_action_states(True)
+
+    def on_frame(self) -> None:
+        """Run deferred startup actions on the main thread."""
+        now = time.time()
+        if self._pending_full_refresh and now >= self._full_refresh_after:
+            self._pending_full_refresh = False
+            self._refresh_drive_list(probe=True)
+        if self._pending_monitor_start and now >= self._monitor_start_after:
+            self._pending_monitor_start = False
+            self.drive_manager.start_monitoring()
 
     def _on_drive_selection_changed(self, sender, app_data, user_data) -> None:
         """Handle single-drive selection changes."""

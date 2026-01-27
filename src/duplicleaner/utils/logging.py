@@ -5,6 +5,8 @@ Log files are stored in the user's AppData directory.
 """
 
 import logging
+import faulthandler
+import threading
 import os
 import sys
 from datetime import datetime
@@ -15,6 +17,7 @@ from typing import Optional
 # Module-level logger cache
 _loggers: dict[str, logging.Logger] = {}
 _initialized = False
+_log_file_path: Optional[Path] = None
 
 
 def get_log_directory() -> Path:
@@ -59,6 +62,7 @@ def setup_logging(
         backup_count: Number of backup log files to keep
     """
     global _initialized
+    global _log_file_path
 
     if _initialized:
         return
@@ -109,9 +113,39 @@ def setup_logging(
         file_handler.setLevel(logging.DEBUG)  # File gets everything
         file_handler.setFormatter(detailed_format)
         root_logger.addHandler(file_handler)
+        _log_file_path = log_file
 
     _initialized = True
     root_logger.info("Logging initialized")
+    _install_exception_hooks()
+
+
+def _install_exception_hooks() -> None:
+    """Capture unhandled exceptions (main + threads) to the log file."""
+    if not _log_file_path:
+        return
+    try:
+        log_handle = open(_log_file_path, "a", encoding="utf-8")
+    except OSError:
+        return
+
+    try:
+        faulthandler.enable(log_handle, all_threads=True)
+    except Exception:
+        pass
+
+    def _log_exception(exc_type, exc_value, exc_traceback) -> None:
+        logger = logging.getLogger("duplicleaner")
+        logger.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+    sys.excepthook = _log_exception
+
+    def _thread_excepthook(args: threading.ExceptHookArgs) -> None:
+        logger = logging.getLogger("duplicleaner")
+        logger.critical("Unhandled thread exception", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_excepthook
 
 
 def get_logger(name: str) -> logging.Logger:
