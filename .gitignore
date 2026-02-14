@@ -30,6 +30,9 @@ Thumbs.db
 CLAUDE.md
 AGENTS.md
 
+# Accidentally copied packages
+Python312Libsite-packages/
+
 # Coverage
 .coverage
 coverage.xml
