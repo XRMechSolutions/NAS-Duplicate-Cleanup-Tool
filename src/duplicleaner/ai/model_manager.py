@@ -5,9 +5,10 @@ Triggers downloads for optional AI models using their respective libraries.
 
 from __future__ import annotations
 
+import contextlib
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 
 from duplicleaner.utils.config import get_config
 from duplicleaner.utils.logging import get_logger
@@ -25,20 +26,17 @@ class ModelDownloadResult:
 class ModelManager:
     """Download manager for AI models."""
 
-    def __init__(self, progress_callback: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, progress_callback: Callable[[str], None] | None = None) -> None:
         self.progress_callback = progress_callback
 
     def _notify(self, message: str) -> None:
         if self.progress_callback:
-            try:
+            with contextlib.suppress(Exception):
                 self.progress_callback(message)
-            except Exception:
-                pass
 
     def download_faces(self) -> ModelDownloadResult:
         """Download InsightFace models (buffalo_l)."""
         try:
-            import insightface
             from insightface.app import FaceAnalysis
         except Exception:
             return ModelDownloadResult("faces", False, "InsightFace not installed")
@@ -58,7 +56,6 @@ class ModelManager:
         """Download CLIP model weights."""
         try:
             import open_clip
-            import torch
         except Exception:
             return ModelDownloadResult("clip", False, "open-clip-torch not installed")
 

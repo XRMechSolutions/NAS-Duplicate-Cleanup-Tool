@@ -4,9 +4,9 @@ Uses YOLOv8 for detecting objects in images and generating tags.
 """
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event
-from typing import Callable, Optional
 
 from ..db.database import Database
 from ..db.models import FileRecord
@@ -102,16 +102,16 @@ class ObjectDetector:
         self.use_gpu = use_gpu
         self.confidence_threshold = confidence_threshold
 
-        self._model: Optional["YOLO"] = None
+        self._model: YOLO | None = None
         self._model_loaded = False
 
         # Progress tracking
         self.progress = ObjectDetectionProgress()
         self._cancel_event = Event()
-        self._progress_callback: Optional[Callable[[ObjectDetectionProgress], None]] = None
+        self._progress_callback: Callable[[ObjectDetectionProgress], None] | None = None
 
     def set_progress_callback(
-        self, callback: Optional[Callable[[ObjectDetectionProgress], None]]
+        self, callback: Callable[[ObjectDetectionProgress], None] | None
     ) -> None:
         """Set callback for progress updates."""
         self._progress_callback = callback
@@ -177,7 +177,7 @@ class ObjectDetector:
         self._model_loaded = False
         logger.info("YOLO model unloaded")
 
-    def detect_objects(self, image_path: str) -> Optional[ObjectDetectionResult]:
+    def detect_objects(self, image_path: str) -> ObjectDetectionResult | None:
         """Detect objects in an image.
 
         Args:
@@ -186,9 +186,8 @@ class ObjectDetector:
         Returns:
             ObjectDetectionResult or None on error
         """
-        if not self._model_loaded:
-            if not self.load_model():
-                return None
+        if not self._model_loaded and not self.load_model():
+            return None
 
         try:
             # Run detection
@@ -218,7 +217,7 @@ class ObjectDetector:
                     ))
 
             # Get unique labels
-            unique_labels = list(set(obj.class_name for obj in detected_objects))
+            unique_labels = list({obj.class_name for obj in detected_objects})
 
             return ObjectDetectionResult(
                 file_id=0,  # Will be set by caller
@@ -230,7 +229,7 @@ class ObjectDetector:
             logger.error(f"Error detecting objects in {image_path}: {e}")
             return None
 
-    def analyze_file(self, file_record: FileRecord) -> Optional[list[str]]:
+    def analyze_file(self, file_record: FileRecord) -> list[str] | None:
         """Analyze a file and store detected objects.
 
         Args:

@@ -5,17 +5,15 @@ scene classification and semantic search encoding.
 """
 
 import json
-import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Event
-from typing import Callable, Optional
 
 import numpy as np
 
 from ..db.database import Database
 from ..db.models import FileRecord, SceneAnalysis
-from ..utils.config import get_config
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -81,7 +79,7 @@ class SceneResult:
     categories: dict[str, float]  # category -> confidence
     top_category: str
     top_confidence: float
-    embedding: Optional[np.ndarray] = None
+    embedding: np.ndarray | None = None
 
 
 @dataclass
@@ -125,7 +123,7 @@ class SceneClassifier:
         model_name: str = DEFAULT_MODEL,
         pretrained: str = DEFAULT_PRETRAINED,
         use_gpu: bool = True,
-        categories: Optional[list[str]] = None,
+        categories: list[str] | None = None,
     ):
         """Initialize scene classifier.
 
@@ -149,15 +147,15 @@ class SceneClassifier:
         self._model_loaded = False
 
         # Cached text embeddings for categories
-        self._category_embeddings: Optional[torch.Tensor] = None
+        self._category_embeddings: torch.Tensor | None = None
 
         # Progress tracking
         self.progress = SceneAnalysisProgress()
         self._cancel_event = Event()
-        self._progress_callback: Optional[Callable[[SceneAnalysisProgress], None]] = None
+        self._progress_callback: Callable[[SceneAnalysisProgress], None] | None = None
 
     def set_progress_callback(
-        self, callback: Optional[Callable[[SceneAnalysisProgress], None]]
+        self, callback: Callable[[SceneAnalysisProgress], None] | None
     ) -> None:
         """Set callback for progress updates."""
         self._progress_callback = callback
@@ -277,7 +275,7 @@ class SceneClassifier:
     # Image Analysis
     # ==========================================================================
 
-    def encode_image(self, image_path: str) -> Optional[np.ndarray]:
+    def encode_image(self, image_path: str) -> np.ndarray | None:
         """Encode an image to CLIP embedding.
 
         Args:
@@ -286,9 +284,8 @@ class SceneClassifier:
         Returns:
             Normalized embedding vector or None
         """
-        if not self._model_loaded:
-            if not self.load_model():
-                return None
+        if not self._model_loaded and not self.load_model():
+            return None
 
         try:
             # Load and preprocess image
@@ -310,7 +307,7 @@ class SceneClassifier:
         self,
         image_path: str,
         top_k: int = 5,
-    ) -> Optional[SceneResult]:
+    ) -> SceneResult | None:
         """Classify an image into scene categories.
 
         Args:
@@ -320,9 +317,8 @@ class SceneClassifier:
         Returns:
             SceneResult or None on error
         """
-        if not self._model_loaded:
-            if not self.load_model():
-                return None
+        if not self._model_loaded and not self.load_model():
+            return None
 
         try:
             # Encode image
@@ -361,7 +357,7 @@ class SceneClassifier:
             logger.error(f"Error classifying {image_path}: {e}")
             return None
 
-    def analyze_file(self, file_record: FileRecord) -> Optional[SceneAnalysis]:
+    def analyze_file(self, file_record: FileRecord) -> SceneAnalysis | None:
         """Analyze a file and store results.
 
         Args:
@@ -442,7 +438,7 @@ class SceneClassifier:
     # Semantic Search
     # ==========================================================================
 
-    def encode_text(self, text: str) -> Optional[np.ndarray]:
+    def encode_text(self, text: str) -> np.ndarray | None:
         """Encode text query to CLIP embedding.
 
         Args:
@@ -451,9 +447,8 @@ class SceneClassifier:
         Returns:
             Normalized embedding or None
         """
-        if not self._model_loaded:
-            if not self.load_model():
-                return None
+        if not self._model_loaded and not self.load_model():
+            return None
 
         try:
             with torch.no_grad():

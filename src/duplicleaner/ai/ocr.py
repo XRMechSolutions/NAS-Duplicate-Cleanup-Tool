@@ -5,10 +5,10 @@ Text is indexed in ocr_fts for full-text search.
 """
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from threading import Event
-from typing import Callable, Optional
 
 from ..db.database import Database
 from ..db.models import FileRecord, OCRResult
@@ -87,7 +87,7 @@ class OCREngine:
     def __init__(
         self,
         db: Database,
-        languages: Optional[list[str]] = None,
+        languages: list[str] | None = None,
         use_gpu: bool = True,
     ):
         """Initialize OCR engine.
@@ -101,16 +101,16 @@ class OCREngine:
         self.languages = languages or self.DEFAULT_LANGUAGES.copy()
         self.use_gpu = use_gpu
 
-        self._reader: Optional["easyocr.Reader"] = None
+        self._reader: easyocr.Reader | None = None
         self._model_loaded = False
 
         # Progress tracking
         self.progress = OCRProgress()
         self._cancel_event = Event()
-        self._progress_callback: Optional[Callable[[OCRProgress], None]] = None
+        self._progress_callback: Callable[[OCRProgress], None] | None = None
 
     def set_progress_callback(
-        self, callback: Optional[Callable[[OCRProgress], None]]
+        self, callback: Callable[[OCRProgress], None] | None
     ) -> None:
         """Set callback for progress updates."""
         self._progress_callback = callback
@@ -178,7 +178,7 @@ class OCREngine:
         self._model_loaded = False
         logger.info("EasyOCR model unloaded")
 
-    def extract_text(self, image_path: str) -> Optional[OCRAnalysisResult]:
+    def extract_text(self, image_path: str) -> OCRAnalysisResult | None:
         """Extract text from an image.
 
         Args:
@@ -187,9 +187,8 @@ class OCREngine:
         Returns:
             OCRAnalysisResult or None on error
         """
-        if not self._model_loaded:
-            if not self.load_model():
-                return None
+        if not self._model_loaded and not self.load_model():
+            return None
 
         try:
             # Run OCR
@@ -234,7 +233,7 @@ class OCREngine:
             logger.error(f"Error extracting text from {image_path}: {e}")
             return None
 
-    def analyze_file(self, file_record: FileRecord) -> Optional[OCRResult]:
+    def analyze_file(self, file_record: FileRecord) -> OCRResult | None:
         """Analyze a file and store OCR results.
 
         Args:

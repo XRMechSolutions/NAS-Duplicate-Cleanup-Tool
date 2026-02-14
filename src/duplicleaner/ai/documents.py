@@ -7,7 +7,6 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from duplicleaner.db.database import Database
 from duplicleaner.db.models import FileRecord, OCRResult
@@ -54,7 +53,7 @@ class DocumentTextExtractor:
         self.db = db
         self.progress = DocumentProgress()
 
-    def analyze_file(self, file_record: FileRecord) -> Optional[OCRResult]:
+    def analyze_file(self, file_record: FileRecord) -> OCRResult | None:
         if not file_record.id:
             return None
 
@@ -86,7 +85,7 @@ class DocumentTextExtractor:
         self.progress.phase = "complete"
         return extracted
 
-    def extract_text(self, file_path: str) -> Optional[str]:
+    def extract_text(self, file_path: str) -> str | None:
         path = Path(file_path)
         ext = path.suffix.lower()
 
@@ -106,9 +105,9 @@ class DocumentTextExtractor:
 
         return None
 
-    def _read_text_file(self, file_path: str) -> Optional[str]:
+    def _read_text_file(self, file_path: str) -> str | None:
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
                 text = f.read(MAX_TEXT_CHARS + 1)
             if not text:
                 return None
@@ -119,7 +118,7 @@ class DocumentTextExtractor:
             logger.debug("Text read failed for %s: %s", file_path, exc)
             return None
 
-    def _extract_pdf_text(self, file_path: str) -> Optional[str]:
+    def _extract_pdf_text(self, file_path: str) -> str | None:
         if not HAS_PDFMINER:
             logger.warning("pdfminer.six not installed. PDF text extraction disabled.")
             return None
@@ -133,7 +132,7 @@ class DocumentTextExtractor:
             logger.debug("PDF extraction failed for %s: %s", file_path, exc)
             return None
 
-    def _extract_docx_text(self, file_path: str) -> Optional[str]:
+    def _extract_docx_text(self, file_path: str) -> str | None:
         if not HAS_DOCX:
             return self._extract_ooxml_text(file_path, ".docx")
         try:
@@ -147,7 +146,7 @@ class DocumentTextExtractor:
             logger.debug("DOCX extraction failed for %s: %s", file_path, exc)
             return None
 
-    def _extract_ooxml_text(self, file_path: str, ext: str) -> Optional[str]:
+    def _extract_ooxml_text(self, file_path: str, ext: str) -> str | None:
         try:
             with zipfile.ZipFile(file_path) as zf:
                 texts = []

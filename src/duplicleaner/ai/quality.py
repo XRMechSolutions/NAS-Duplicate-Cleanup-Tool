@@ -4,9 +4,9 @@ Uses OpenCV for blur detection, exposure analysis, and overall quality scoring.
 No ML models needed - pure algorithmic approach.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event
-from typing import Callable, Optional
 
 import numpy as np
 
@@ -76,10 +76,10 @@ class QualityScorer:
         # Progress tracking
         self.progress = QualityProgress()
         self._cancel_event = Event()
-        self._progress_callback: Optional[Callable[[QualityProgress], None]] = None
+        self._progress_callback: Callable[[QualityProgress], None] | None = None
 
     def set_progress_callback(
-        self, callback: Optional[Callable[[QualityProgress], None]]
+        self, callback: Callable[[QualityProgress], None] | None
     ) -> None:
         """Set callback for progress updates."""
         self._progress_callback = callback
@@ -115,10 +115,7 @@ class QualityScorer:
         # Normalize to 0-100 scale
         # Higher variance = sharper image
         # Using log scale for better distribution
-        if variance > 0:
-            normalized = min(100.0, np.log10(variance + 1) * 25)
-        else:
-            normalized = 0.0
+        normalized = min(100.0, np.log10(variance + 1) * 25) if variance > 0 else 0.0
 
         is_blurry = variance < self.BLUR_THRESHOLD
 
@@ -213,7 +210,7 @@ class QualityScorer:
 
         return score
 
-    def analyze_image(self, image_path: str) -> Optional[QualityResult]:
+    def analyze_image(self, image_path: str) -> QualityResult | None:
         """Analyze image quality.
 
         Args:
@@ -263,7 +260,7 @@ class QualityScorer:
             logger.error(f"Error analyzing {image_path}: {e}")
             return None
 
-    def analyze_file(self, file_record: FileRecord) -> Optional[QualityResult]:
+    def analyze_file(self, file_record: FileRecord) -> QualityResult | None:
         """Analyze a file and store results.
 
         Args:
@@ -371,7 +368,7 @@ class QualityScorer:
         results.sort(key=lambda x: x[1], reverse=True)
         return results
 
-    def get_best_from_group(self, file_ids: list[int]) -> Optional[int]:
+    def get_best_from_group(self, file_ids: list[int]) -> int | None:
         """Get the best quality image from a group.
 
         Args:
