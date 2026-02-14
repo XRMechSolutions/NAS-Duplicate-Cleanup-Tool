@@ -14,6 +14,13 @@ __author__ = "Clinton Campbell"
 __email__ = "clinton@xrmech.com"
 __license__ = "BSL-1.1"
 
+# Enable HEIC/HEIF support for PIL globally (Apple iPhone photos)
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass  # Optional dependency - gracefully degrade if not installed
+
 try:
     from duplicleaner.app import DupliCleanerApp, run_app
 except Exception:

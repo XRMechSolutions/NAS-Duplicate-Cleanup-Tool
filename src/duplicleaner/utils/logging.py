@@ -4,20 +4,20 @@ Provides configurable logging with file and console handlers.
 Log files are stored in the user's AppData directory.
 """
 
-import logging
+import contextlib
 import faulthandler
-import threading
+import logging
 import os
 import sys
+import threading
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
 
 # Module-level logger cache
 _loggers: dict[str, logging.Logger] = {}
 _initialized = False
-_log_file_path: Optional[Path] = None
+_log_file_path: Path | None = None
 
 
 def get_log_directory() -> Path:
@@ -125,14 +125,13 @@ def _install_exception_hooks() -> None:
     if not _log_file_path:
         return
     try:
-        log_handle = open(_log_file_path, "a", encoding="utf-8")
+        # Keep the handle open for faulthandler output.
+        log_handle = open(_log_file_path, "a", encoding="utf-8")  # noqa: SIM115
     except OSError:
         return
 
-    try:
+    with contextlib.suppress(Exception):
         faulthandler.enable(log_handle, all_threads=True)
-    except Exception:
-        pass
 
     def _log_exception(exc_type, exc_value, exc_traceback) -> None:
         logger = logging.getLogger("duplicleaner")
@@ -165,10 +164,7 @@ def get_logger(name: str) -> logging.Logger:
         setup_logging()
 
     # Create child logger under duplicleaner namespace
-    if name.startswith("duplicleaner"):
-        logger_name = name
-    else:
-        logger_name = f"duplicleaner.{name}"
+    logger_name = name if name.startswith("duplicleaner") else f"duplicleaner.{name}"
 
     logger = logging.getLogger(logger_name)
     _loggers[name] = logger
@@ -194,7 +190,7 @@ class LogContext:
 
     def __init__(self, level: int):
         self.level = level
-        self.previous_level: Optional[int] = None
+        self.previous_level: int | None = None
 
     def __enter__(self) -> "LogContext":
         root_logger = logging.getLogger("duplicleaner")

@@ -9,7 +9,6 @@ leave the device.
 
 import json
 from enum import Enum
-from typing import Optional
 
 from duplicleaner.utils.logging import get_logger
 
@@ -26,6 +25,7 @@ class AIProvider(Enum):
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
     OLLAMA = "ollama"  # Local, no key needed
+    AWS = "aws"  # AWS Rekognition (stored as JSON: access_key, secret_key, region)
 
 
 class KeyStore:
@@ -38,7 +38,7 @@ class KeyStore:
     def __init__(self):
         """Initialize the keystore."""
         self._keyring_available = False
-        self._fallback_path: Optional[str] = None
+        self._fallback_path: str | None = None
 
         try:
             import keyring
@@ -55,8 +55,8 @@ class KeyStore:
 
     def _setup_fallback(self) -> None:
         """Setup fallback file-based storage."""
-        from pathlib import Path
         import os
+        from pathlib import Path
 
         # Store in user's app data with restricted permissions
         if os.name == "nt":
@@ -69,8 +69,8 @@ class KeyStore:
 
     def _get_fallback_keys(self) -> dict[str, str]:
         """Read keys from fallback storage."""
-        from pathlib import Path
         import base64
+        from pathlib import Path
 
         if not self._fallback_path:
             return {}
@@ -81,7 +81,7 @@ class KeyStore:
 
         try:
             # Basic obfuscation (NOT secure encryption)
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 encoded = f.read()
                 decoded = base64.b64decode(encoded).decode("utf-8")
                 return json.loads(decoded)
@@ -91,9 +91,9 @@ class KeyStore:
 
     def _save_fallback_keys(self, keys: dict[str, str]) -> None:
         """Save keys to fallback storage."""
-        from pathlib import Path
         import base64
         import os
+        from pathlib import Path
 
         if not self._fallback_path:
             return
@@ -144,7 +144,7 @@ class KeyStore:
             logger.error(f"Failed to store API key for {provider.value}: {e}")
             return False
 
-    def get_key(self, provider: AIProvider) -> Optional[str]:
+    def get_key(self, provider: AIProvider) -> str | None:
         """Retrieve an API key.
 
         Args:
@@ -252,6 +252,21 @@ class KeyStore:
             if len(key) < 30:
                 return False, "Google AI key appears too short"
 
+        elif provider == AIProvider.AWS:
+            # AWS credentials stored as JSON with access_key, secret_key, region
+            try:
+                creds = json.loads(key)
+                if not isinstance(creds, dict):
+                    return False, "AWS credentials must be a JSON object"
+                if "access_key" not in creds or "secret_key" not in creds:
+                    return False, "AWS credentials must include 'access_key' and 'secret_key'"
+                if not creds["access_key"].startswith("AKIA"):
+                    return False, "AWS access key should start with 'AKIA'"
+                if len(creds["secret_key"]) < 30:
+                    return False, "AWS secret key appears too short"
+            except json.JSONDecodeError:
+                return False, "AWS credentials must be valid JSON"
+
         return True, "Key format looks valid"
 
     def is_secure_storage_available(self) -> bool:
@@ -264,7 +279,7 @@ class KeyStore:
 
 
 # Singleton instance
-_keystore: Optional[KeyStore] = None
+_keystore: KeyStore | None = None
 
 
 def get_keystore() -> KeyStore:

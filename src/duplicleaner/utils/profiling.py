@@ -11,11 +11,11 @@ import os
 import pstats
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional
 
 from duplicleaner.utils.logging import get_log_directory
 
@@ -37,7 +37,7 @@ def _env_truthy(name: str) -> bool:
     return value in {"1", "true", "yes", "y", "on"}
 
 
-def configure_profiling(enabled: Optional[bool] = None, min_ms: Optional[float] = None) -> None:
+def configure_profiling(enabled: bool | None = None, min_ms: float | None = None) -> None:
     """Configure profiling behavior.
 
     Args:
@@ -79,7 +79,7 @@ def get_min_ms() -> float:
 
 
 @contextmanager
-def profile_block(name: str, min_ms: Optional[float] = None) -> Iterator[None]:
+def profile_block(name: str, min_ms: float | None = None) -> Iterator[None]:
     """Context manager to time a block and log elapsed milliseconds."""
     if not _enabled:
         yield
@@ -101,7 +101,7 @@ def _default_profile_path() -> Path:
     return log_dir / f"profile_{timestamp}.prof"
 
 
-def start_cpu_profiler(output_path: Optional[str | Path] = None) -> CpuProfileSession:
+def start_cpu_profiler(output_path: str | Path | None = None) -> CpuProfileSession:
     """Start cProfile profiling and return the session."""
     if output_path is None:
         path = _default_profile_path()
@@ -118,10 +118,10 @@ def start_cpu_profiler(output_path: Optional[str | Path] = None) -> CpuProfileSe
 
 
 def stop_cpu_profiler(
-    session: Optional[CpuProfileSession],
+    session: CpuProfileSession | None,
     sort: str = "cumtime",
     top: int = 60,
-) -> Optional[Path]:
+) -> Path | None:
     """Stop cProfile session, write .prof and a text summary."""
     if session is None:
         return None

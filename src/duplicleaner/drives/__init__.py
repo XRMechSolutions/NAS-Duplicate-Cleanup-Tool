@@ -5,20 +5,20 @@ and redundancy checking.
 """
 
 from duplicleaner.drives.manager import (
+    DriveInfo,
     DriveManager,
     DriveStatus,
-    DriveInfo,
     SpaceInfo,
+    get_unc_parts,
     is_unc_path,
     normalize_path,
-    get_unc_parts,
 )
 from duplicleaner.drives.redundancy import (
+    AtRiskGroup,
+    BackupPlanItem,
+    HashGroup,
     RedundancyChecker,
     RedundancyReport,
-    AtRiskGroup,
-    HashGroup,
-    BackupPlanItem,
 )
 
 __all__ = [

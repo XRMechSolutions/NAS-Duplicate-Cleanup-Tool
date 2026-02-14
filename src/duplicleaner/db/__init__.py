@@ -2,16 +2,19 @@
 
 from duplicleaner.db.database import Database, get_database
 from duplicleaner.db.models import (
+    ActionLogEntry,
     Drive,
-    FileRecord,
-    FileMetadata,
     DuplicateGroup,
     DuplicateMember,
     Face,
-    Person,
-    SceneAnalysis,
+    FamilyGroup,
+    FamilyGroupMember,
+    FileMetadata,
+    FileRecord,
     OCRResult,
-    ActionLogEntry,
+    Person,
+    PersonRelationship,
+    SceneAnalysis,
 )
 
 __all__ = [
@@ -23,7 +26,10 @@ __all__ = [
     "DuplicateGroup",
     "DuplicateMember",
     "Face",
+    "FamilyGroup",
+    "FamilyGroupMember",
     "Person",
+    "PersonRelationship",
     "SceneAnalysis",
     "OCRResult",
     "ActionLogEntry",

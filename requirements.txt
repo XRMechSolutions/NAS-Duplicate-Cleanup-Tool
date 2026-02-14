@@ -6,15 +6,17 @@ dearpygui>=1.11.0
 
 # Image Processing
 pillow>=10.0.0
+pillow-heif>=0.15.0  # HEIC/HEIF support for Apple photos
 imagehash>=4.3.0
 numpy>=1.24.0
 
 # Fast Hashing
 xxhash>=3.4.0
 
-# Metadata Extraction
+# Metadata Extraction & Writing
 exifread>=3.0.0
 python-dateutil>=2.8.0
+piexif>=1.1.3  # EXIF metadata writing (JPEG only, fallback for exiftool)
 
 # Geocoding
 geopy>=2.4.0
@@ -25,10 +27,19 @@ send2trash>=1.8.0
 # Version Tracking
 gitpython>=3.1.0
 
-# Document text extraction (optional)
-pdfminer.six>=20231228
-python-docx>=1.1.0
+# Document text extraction
+pymupdf>=1.23.0        # PDF text extraction (faster than pdfminer)
+python-docx>=1.1.0     # .docx text extraction
+openpyxl>=3.1.0        # .xlsx reading
+python-pptx>=0.6.0     # .pptx extraction
+python-magic>=0.4.27   # MIME type detection
+python-magic-bin>=0.4.14  # Windows binaries for python-magic
 
+# Video Processing
+opencv-python-headless>=4.8.0  # Frame extraction for video analysis
+# ffmpeg-python>=0.2.0         # Optional, for advanced video dedup
 
-# Video Processing (optional, for video deduplication)
-# ffmpeg-python>=0.2.0
+# Audio/Video Summarization (optional, requires more setup)
+# openai-whisper>=20230314  # Audio transcription (reference Whisper)
+# faster-whisper>=1.0.0     # Faster local transcription (recommended)
+# torch>=2.0.0              # Required for openai-whisper
