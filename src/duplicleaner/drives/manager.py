@@ -7,13 +7,10 @@ Supports local drives, external drives, and network shares (UNC paths).
 import ctypes
 import os
 import threading
-import time
-import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
-from typing import Callable, Optional
 
 from duplicleaner.db.database import Database, get_database
 from duplicleaner.db.models import Drive
@@ -39,10 +36,10 @@ class DriveInfo:
     drive: Drive
     status: DriveStatus
     is_network: bool
-    server: Optional[str] = None
-    share: Optional[str] = None
-    volume_label: Optional[str] = None
-    filesystem: Optional[str] = None
+    server: str | None = None
+    share: str | None = None
+    volume_label: str | None = None
+    filesystem: str | None = None
 
 
 @dataclass
@@ -92,8 +89,8 @@ class DriveManager:
 
     def __init__(
         self,
-        db: Optional[Database] = None,
-        status_callback: Optional[Callable[[str, DriveStatus], None]] = None,
+        db: Database | None = None,
+        status_callback: Callable[[str, DriveStatus], None] | None = None,
     ):
         """Initialize the drive manager.
 
@@ -109,14 +106,14 @@ class DriveManager:
         self._lock = threading.Lock()
 
         # Background monitoring
-        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_thread: threading.Thread | None = None
         self._stop_monitor = threading.Event()
 
     def add_drive(
         self,
         path: str,
         label: str,
-        scan_now: bool = False,
+        _scan_now: bool = False,
     ) -> Drive:
         """Register a new drive or network share.
 
@@ -194,7 +191,46 @@ class DriveManager:
         else:
             logger.warning(f"Drive not found: {drive_id}")
 
-    def get_drive(self, drive_id: str) -> Optional[Drive]:
+    def remap_drive_path(self, drive_id: str, new_path: str) -> int:
+        """Remap a drive's root path to a new location.
+
+        Updates the drive path and all associated file paths in the database.
+        Use this when files have been moved to a new location (e.g., from
+        a local drive to a NAS) and the stored paths are no longer valid.
+
+        Args:
+            drive_id: Drive ID to remap
+            new_path: New root path for the drive
+
+        Returns:
+            Number of file records updated
+
+        Raises:
+            ValueError: If drive not found, path invalid, or path not a directory
+        """
+        drive = self.db.get_drive(drive_id)
+        if not drive:
+            raise ValueError(f"Drive not found: {drive_id}")
+
+        new_path = normalize_path(new_path)
+
+        if not os.path.exists(new_path):
+            raise ValueError(f"Path does not exist: {new_path}")
+
+        if not os.path.isdir(new_path):
+            raise ValueError(f"Path is not a directory: {new_path}")
+
+        old_path = drive.path
+        count = self.db.remap_drive_path(drive_id, old_path, new_path)
+
+        self._status_cache[drive_id] = DriveStatus.CONNECTED
+        logger.info(
+            f"Remapped drive '{drive.label}': {old_path} -> {new_path} "
+            f"({count} files updated)"
+        )
+        return count
+
+    def get_drive(self, drive_id: str) -> Drive | None:
         """Get a drive by ID.
 
         Args:
@@ -213,7 +249,7 @@ class DriveManager:
         """
         return self.db.get_all_drives()
 
-    def get_drive_info(self, drive_id: str) -> Optional[DriveInfo]:
+    def get_drive_info(self, drive_id: str) -> DriveInfo | None:
         """Get extended information about a drive.
 
         Args:
@@ -291,7 +327,7 @@ class DriveManager:
             if old_status != status and self.status_callback:
                 self.status_callback(drive_id, status)
 
-    def get_space_info(self, path: str) -> Optional[SpaceInfo]:
+    def get_space_info(self, path: str) -> SpaceInfo | None:
         """Get disk space information for a path.
 
         Args:
@@ -424,7 +460,7 @@ class DriveManager:
             return f"net_{hash(normalized.lower()) & 0xFFFFFFFF:08x}"
 
         # For local drives, try to get volume serial number
-        serial: Optional[int] = None
+        serial: int | None = None
         if os.name == 'nt':
             serial = self._get_volume_serial(normalized)
 
@@ -441,12 +477,11 @@ class DriveManager:
     def _is_root_path(self, path: str) -> bool:
         """Return True if the path is a root drive path."""
         normalized = normalize_path(path)
-        if os.name == 'nt':
-            if len(normalized) >= 2 and normalized[1] == ":":
-                return normalized.rstrip("\\") == normalized[:2]
+        if os.name == 'nt' and len(normalized) >= 2 and normalized[1] == ":":
+            return normalized.rstrip("\\") == normalized[:2]
         return normalized == normalized.rstrip("\\/")
 
-    def _get_volume_serial(self, path: str) -> Optional[int]:
+    def _get_volume_serial(self, path: str) -> int | None:
         """Get the volume serial number for a Windows drive.
 
         Args:
@@ -460,10 +495,7 @@ class DriveManager:
 
         try:
             # Get root path
-            if len(path) >= 2 and path[1] == ':':
-                root = path[:3]
-            else:
-                root = path
+            root = path[:3] if len(path) >= 2 and path[1] == ':' else path
 
             serial = ctypes.c_uint32()
             result = ctypes.windll.kernel32.GetVolumeInformationW(
@@ -481,7 +513,7 @@ class DriveManager:
 
         return None
 
-    def _get_volume_info(self, path: str) -> Optional[tuple[str, str]]:
+    def _get_volume_info(self, path: str) -> tuple[str, str] | None:
         """Get volume label and filesystem type for a Windows drive.
 
         Args:
@@ -495,10 +527,7 @@ class DriveManager:
 
         try:
             # Get root path
-            if len(path) >= 2 and path[1] == ':':
-                root = path[:3]
-            else:
-                root = path
+            root = path[:3] if len(path) >= 2 and path[1] == ':' else path
 
             volume_name = ctypes.create_unicode_buffer(256)
             filesystem = ctypes.create_unicode_buffer(256)
@@ -574,7 +603,7 @@ def get_unc_parts(path: str) -> tuple[str, str]:
     return server, share
 
 
-def resolve_drive_letter_to_unc(drive_letter: str) -> Optional[str]:
+def resolve_drive_letter_to_unc(drive_letter: str) -> str | None:
     """Resolve a mapped drive letter to its UNC path.
 
     Args:

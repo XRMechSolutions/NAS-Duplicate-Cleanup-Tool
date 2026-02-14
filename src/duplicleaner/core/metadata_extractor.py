@@ -9,7 +9,6 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from duplicleaner.db.database import Database
 from duplicleaner.db.models import FileMetadata, FileRecord
@@ -20,7 +19,7 @@ logger = get_logger(__name__)
 
 try:
     from PIL import Image
-    from PIL.ExifTags import TAGS, GPSTAGS
+    from PIL.ExifTags import GPSTAGS, TAGS
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -32,8 +31,8 @@ except ImportError:
     HAS_EXIFREAD = False
 
 try:
+    from geopy.exc import GeocoderServiceError, GeocoderTimedOut
     from geopy.geocoders import Nominatim
-    from geopy.exc import GeocoderTimedOut, GeocoderServiceError
     HAS_GEOPY = True
 except ImportError:
     HAS_GEOPY = False
@@ -63,7 +62,7 @@ class MetadataProgress:
 class MetadataExtractor:
     """Extracts file metadata for images."""
 
-    def __init__(self, db: Database, enable_location_lookup: Optional[bool] = None) -> None:
+    def __init__(self, db: Database, enable_location_lookup: bool | None = None) -> None:
         self.db = db
         self.config = get_config()
         self.progress = MetadataProgress()
@@ -80,7 +79,7 @@ class MetadataExtractor:
             except Exception as exc:
                 logger.warning("Failed to initialize geocoder: %s", exc)
 
-    def analyze_file(self, file_record: FileRecord) -> Optional[FileMetadata]:
+    def analyze_file(self, file_record: FileRecord) -> FileMetadata | None:
         """Extract metadata for a single image file and store it."""
         if not file_record.id:
             return None
@@ -108,7 +107,7 @@ class MetadataExtractor:
         self.progress.phase = "complete"
         return extracted
 
-    def _extract_metadata(self, file_path: str, file_id: int) -> Optional[FileMetadata]:
+    def _extract_metadata(self, file_path: str, file_id: int) -> FileMetadata | None:
         """Extract EXIF and basic metadata from an image."""
         exif_data: dict[str, str] = {}
         width = height = None
@@ -194,13 +193,13 @@ class MetadataExtractor:
             raw_exif=json.dumps(exif_data) if exif_data else None,
         )
 
-    def _safe_str(self, value: object) -> Optional[str]:
+    def _safe_str(self, value: object) -> str | None:
         if value is None:
             return None
         text = str(value).strip()
         return text or None
 
-    def _parse_exif_date(self, date_str: Optional[str]) -> Optional[datetime]:
+    def _parse_exif_date(self, date_str: str | None) -> datetime | None:
         if not date_str:
             return None
         date_str = date_str.strip()
@@ -224,7 +223,7 @@ class MetadataExtractor:
                 return None
         return None
 
-    def _parse_orientation(self, value: object) -> Optional[int]:
+    def _parse_orientation(self, value: object) -> int | None:
         if value is None:
             return None
         try:
@@ -232,7 +231,7 @@ class MetadataExtractor:
         except Exception:
             return None
 
-    def _extract_gps_from_exifread(self, tags: dict) -> Optional[tuple[float, float]]:
+    def _extract_gps_from_exifread(self, tags: dict) -> tuple[float, float] | None:
         try:
             lat = tags.get("GPS GPSLatitude")
             lat_ref = tags.get("GPS GPSLatitudeRef")
@@ -252,7 +251,7 @@ class MetadataExtractor:
         except Exception:
             return None
 
-    def _extract_gps_from_pil(self, exif: dict) -> Optional[tuple[float, float]]:
+    def _extract_gps_from_pil(self, exif: dict) -> tuple[float, float] | None:
         try:
             gps_info = exif.get(self._tag_id("GPSInfo"))
             if not gps_info:
@@ -294,13 +293,13 @@ class MetadataExtractor:
         s = _to_float(coord[2])
         return d + (m / 60.0) + (s / 3600.0)
 
-    def _tag_id(self, name: str) -> Optional[int]:
+    def _tag_id(self, name: str) -> int | None:
         for tag_id, tag_name in TAGS.items():
             if tag_name == name:
                 return tag_id
         return None
 
-    def _lookup_location(self, lat: float, lon: float) -> Optional[str]:
+    def _lookup_location(self, lat: float, lon: float) -> str | None:
         if not self._geocoder:
             return None
         cache_key = (round(lat, 3), round(lon, 3))

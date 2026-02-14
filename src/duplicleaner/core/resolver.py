@@ -5,16 +5,14 @@ and which to remove. Supports automatic selection based on various
 criteria and manual override.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Optional
 
 from duplicleaner.db.database import Database, get_database
 from duplicleaner.db.models import (
     FileRecord,
-    DuplicateGroup,
-    DuplicateMember,
     GroupStatus,
 )
 from duplicleaner.utils.logging import get_logger
@@ -30,11 +28,31 @@ class ResolutionStrategy(Enum):
     KEEP_LARGEST = "keep_largest"
     KEEP_SMALLEST = "keep_smallest"
     KEEP_BEST_QUALITY = "keep_best_quality"
+    KEEP_BEST_FORMAT = "keep_best_format"
     KEEP_ON_DRIVE = "keep_on_drive"
     KEEP_SHORTEST_PATH = "keep_shortest_path"
     KEEP_LONGEST_PATH = "keep_longest_path"
     KEEP_FIRST = "keep_first"
     MANUAL = "manual"
+
+
+# Format preference hierarchies (higher index = better format)
+IMAGE_FORMAT_RANK = {
+    '.bmp': 1, '.gif': 2, '.webp': 3, '.jpg': 4, '.jpeg': 4,
+    '.heic': 5, '.heif': 5, '.png': 6, '.tiff': 7, '.tif': 7,
+    '.dng': 8, '.cr2': 8, '.nef': 8, '.arw': 8, '.raw': 8,
+}
+VIDEO_FORMAT_RANK = {
+    '.3gp': 1, '.flv': 2, '.wmv': 3, '.avi': 4, '.webm': 5,
+    '.m4v': 6, '.mpg': 6, '.mpeg': 6, '.mp4': 7, '.mov': 8, '.mkv': 9,
+}
+DOCUMENT_FORMAT_RANK = {
+    '.txt': 1, '.rtf': 2, '.odt': 3, '.doc': 4, '.docx': 5, '.pdf': 6,
+}
+AUDIO_FORMAT_RANK = {
+    '.wma': 1, '.aac': 2, '.ogg': 3, '.mp3': 4, '.m4a': 5,
+    '.wav': 6, '.flac': 7, '.alac': 8,
+}
 
 
 @dataclass
@@ -66,7 +84,7 @@ class ResolutionPreview:
 class Resolver:
     """Resolves duplicate groups by selecting keepers."""
 
-    def __init__(self, db: Optional[Database] = None):
+    def __init__(self, db: Database | None = None):
         """Initialize the resolver.
 
         Args:
@@ -84,8 +102,8 @@ class Resolver:
         self,
         group_id: int,
         strategy: ResolutionStrategy,
-        preferred_drive_id: Optional[str] = None,
-    ) -> Optional[Resolution]:
+        preferred_drive_id: str | None = None,
+    ) -> Resolution | None:
         """Resolve a single duplicate group.
 
         Args:
@@ -149,10 +167,10 @@ class Resolver:
     def _select_keeper(
         self,
         all_files: list[FileRecord],
-        removable_files: list[FileRecord],
+        _removable_files: list[FileRecord],
         strategy: ResolutionStrategy,
-        preferred_drive_id: Optional[str] = None,
-    ) -> tuple[Optional[FileRecord], str]:
+        preferred_drive_id: str | None = None,
+    ) -> tuple[FileRecord | None, str]:
         """Select the file to keep based on strategy.
 
         Args:
@@ -196,17 +214,30 @@ class Resolver:
             # Find file on preferred drive
             on_drive = [f for f in all_files if f.drive_id == preferred_drive_id]
             if on_drive:
-                return on_drive[0], f"On preferred drive"
+                return on_drive[0], "On preferred drive"
             else:
                 # Fall back to largest if not on preferred drive
                 keeper = max(all_files, key=lambda f: f.size)
-                return keeper, f"Not on preferred drive, keeping largest"
+                return keeper, "Not on preferred drive, keeping largest"
+
+        elif strategy == ResolutionStrategy.KEEP_BEST_FORMAT:
+            return self._select_best_format(all_files)
 
         elif strategy == ResolutionStrategy.KEEP_BEST_QUALITY:
-            # This would use AI quality scores from scene_analysis
-            # For now, use file size as proxy (larger = higher quality)
+            # Use AI quality scores from scene_analysis
+            best_file = None
+            best_score = -1.0
+            for f in all_files:
+                analysis = self.db.get_scene_analysis(f.id)
+                if analysis and analysis.quality_score is not None:
+                    if analysis.quality_score > best_score:
+                        best_score = analysis.quality_score
+                        best_file = f
+            if best_file:
+                return best_file, f"Best quality (score: {best_score:.1f})"
+            # Fall back to largest file if no quality scores available
             keeper = max(all_files, key=lambda f: f.size)
-            return keeper, f"Best quality (largest file as proxy)"
+            return keeper, "Best quality (no scores, using largest file)"
 
         elif strategy == ResolutionStrategy.KEEP_FIRST:
             return all_files[0], "First file in list"
@@ -214,11 +245,87 @@ class Resolver:
         else:  # MANUAL or unknown
             return None, "Manual selection required"
 
+    @staticmethod
+    def get_format_rank(file_type: str | None) -> int:
+        """Get the format preference rank for a file extension.
+
+        Higher rank = better/preferred format. Returns 0 for unknown formats.
+        """
+        if not file_type:
+            return 0
+        ext = file_type.lower()
+        for rank_map in (IMAGE_FORMAT_RANK, VIDEO_FORMAT_RANK,
+                         DOCUMENT_FORMAT_RANK, AUDIO_FORMAT_RANK):
+            if ext in rank_map:
+                return rank_map[ext]
+        return 0
+
+    @staticmethod
+    def get_format_label(file_type: str | None) -> str:
+        """Get a human-readable format quality label."""
+        if not file_type:
+            return ""
+        ext = file_type.lower()
+        if ext in IMAGE_FORMAT_RANK:
+            rank = IMAGE_FORMAT_RANK[ext]
+            if rank >= 8:
+                return "RAW"
+            elif rank >= 6:
+                return "Lossless"
+            elif rank >= 4:
+                return "Lossy"
+            else:
+                return "Low"
+        if ext in VIDEO_FORMAT_RANK:
+            rank = VIDEO_FORMAT_RANK[ext]
+            if rank >= 7:
+                return "High"
+            elif rank >= 4:
+                return "Medium"
+            else:
+                return "Low"
+        if ext in AUDIO_FORMAT_RANK:
+            rank = AUDIO_FORMAT_RANK[ext]
+            if rank >= 6:
+                return "Lossless"
+            elif rank >= 4:
+                return "High"
+            else:
+                return "Lossy"
+        return ""
+
+    def _select_best_format(
+        self,
+        files: list[FileRecord],
+    ) -> tuple[FileRecord | None, str]:
+        """Select the file with the best format.
+
+        Uses format hierarchy, then resolution, then file size as tiebreakers.
+        """
+        def format_score(f: FileRecord) -> tuple[int, int, int]:
+            rank = self.get_format_rank(f.file_type)
+            # Tiebreaker 1: image dimensions (resolution)
+            metadata = self.db.get_file_metadata(f.id)
+            resolution = 0
+            if metadata and metadata.width and metadata.height:
+                resolution = metadata.width * metadata.height
+            # Tiebreaker 2: file size (larger = less compressed = better)
+            return (rank, resolution, f.size)
+
+        best = max(files, key=format_score)
+        rank = self.get_format_rank(best.file_type)
+        label = self.get_format_label(best.file_type)
+        ext = (best.file_type or "").upper().lstrip('.')
+        reason = f"Best format: {ext}"
+        if label:
+            reason += f" ({label})"
+        return best, reason
+
     def preview_resolution(
         self,
         strategy: ResolutionStrategy,
-        group_ids: Optional[list[int]] = None,
-        preferred_drive_id: Optional[str] = None,
+        group_ids: list[int] | None = None,
+        preferred_drive_id: str | None = None,
     ) -> ResolutionPreview:
         """Preview what would happen with a resolution strategy.
 
@@ -288,9 +395,9 @@ class Resolver:
     def apply_all_resolutions(
         self,
         strategy: ResolutionStrategy,
-        group_ids: Optional[list[int]] = None,
-        preferred_drive_id: Optional[str] = None,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
+        group_ids: list[int] | None = None,
+        preferred_drive_id: str | None = None,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> tuple[int, int]:
         """Apply resolution strategy to multiple groups.
 
@@ -393,7 +500,7 @@ class Resolver:
     def get_recommendation(
         self,
         group_id: int,
-    ) -> Optional[tuple[FileRecord, list[str]]]:
+    ) -> tuple[FileRecord, list[str]] | None:
         """Get AI-powered recommendation for a duplicate group.
 
         Considers multiple factors to suggest the best file to keep.
@@ -456,6 +563,15 @@ class Resolver:
                 score += analysis.quality_score / 10.0
                 reasons.append(f"Quality score: {analysis.quality_score:.1f}")
 
+            # Format preference
+            fmt_rank = self.get_format_rank(file.file_type)
+            max_rank = max(self.get_format_rank(f.file_type) for f in files)
+            if fmt_rank > 0 and fmt_rank == max_rank:
+                label = self.get_format_label(file.file_type)
+                if label:
+                    score += 1.5
+                    reasons.append(f"Preferred format ({label})")
+
             scores[file.id] = (score, reasons)
 
         # Find best file
@@ -500,6 +616,7 @@ def get_strategy_description(strategy: ResolutionStrategy) -> str:
         ResolutionStrategy.KEEP_LARGEST: "Keep the largest file (highest quality)",
         ResolutionStrategy.KEEP_SMALLEST: "Keep the smallest file (save most space)",
         ResolutionStrategy.KEEP_BEST_QUALITY: "Keep the best quality file (AI-scored)",
+        ResolutionStrategy.KEEP_BEST_FORMAT: "Keep the best format (RAW > PNG > JPEG, etc.)",
         ResolutionStrategy.KEEP_ON_DRIVE: "Keep the copy on your preferred drive",
         ResolutionStrategy.KEEP_SHORTEST_PATH: "Keep the file with the simplest path",
         ResolutionStrategy.KEEP_LONGEST_PATH: "Keep the file with the most specific path",

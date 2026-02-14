@@ -8,10 +8,10 @@ Computes file hashes for duplicate detection using a two-phase approach:
 import hashlib
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Generator, Optional
 
 import xxhash
 
@@ -51,7 +51,7 @@ class HashProgress:
     bytes_total: int = 0
     current_file: str = ""
     current_file_progress: float = 0.0  # 0.0 to 1.0 for large files
-    start_time: Optional[datetime] = None
+    start_time: datetime | None = None
     elapsed_seconds: float = 0.0
     files_per_second: float = 0.0
     bytes_per_second: float = 0.0
@@ -77,10 +77,10 @@ class Hasher:
 
     def __init__(
         self,
-        db: Optional[Database] = None,
+        db: Database | None = None,
         quick_hash_size: int = QUICK_HASH_CHUNK_SIZE,
         chunk_size: int = FULL_HASH_CHUNK_SIZE,
-        progress_callback: Optional[Callable[[HashProgress], None]] = None,
+        progress_callback: Callable[[HashProgress], None] | None = None,
     ):
         """Initialize the hasher.
 
@@ -113,7 +113,7 @@ class Hasher:
         """Get current progress."""
         return self._progress
 
-    def compute_quick_hash(self, file_path: str) -> Optional[str]:
+    def compute_quick_hash(self, file_path: str) -> str | None:
         """Compute quick hash (xxHash) of file's first and last chunks.
 
         Args:
@@ -147,15 +147,15 @@ class Hasher:
 
             return hasher.hexdigest()
 
-        except (OSError, IOError) as e:
+        except OSError as e:
             logger.warning(f"Error computing quick hash for {file_path}: {e}")
             return None
 
     def compute_full_hash(
         self,
         file_path: str,
-        progress_callback: Optional[Callable[[float], None]] = None,
-    ) -> Optional[str]:
+        progress_callback: Callable[[float], None] | None = None,
+    ) -> str | None:
         """Compute full SHA-256 hash of file.
 
         Args:
@@ -191,13 +191,13 @@ class Hasher:
 
             return hasher.hexdigest()
 
-        except (OSError, IOError) as e:
+        except OSError as e:
             logger.warning(f"Error computing full hash for {file_path}: {e}")
             return None
 
     def hash_files(
         self,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
         force_rehash: bool = False,
     ) -> HashResult:
         """Hash files that need hashing (potential duplicates by size).
@@ -285,7 +285,7 @@ class Hasher:
 
                 # Phase 2: Compute full hashes for potential duplicates
                 with profile_block("hash_files.full_hash"):
-                    for quick_hash, files in potential_duplicates.items():
+                    for _quick_hash, files in potential_duplicates.items():
                         if self._cancel_event.is_set():
                             break
 
@@ -362,7 +362,7 @@ class Hasher:
         self,
         file_path: str,
         compute_full: bool = True,
-    ) -> tuple[Optional[str], Optional[str]]:
+    ) -> tuple[str | None, str | None]:
         """Hash a single file.
 
         Args:
@@ -421,7 +421,7 @@ class Hasher:
             self.progress_callback(self._progress)
 
 
-def compute_file_hash(file_path: str, algorithm: str = "sha256") -> Optional[str]:
+def compute_file_hash(file_path: str, algorithm: str = "sha256") -> str | None:
     """Convenience function to compute a file hash.
 
     Args:
@@ -432,10 +432,7 @@ def compute_file_hash(file_path: str, algorithm: str = "sha256") -> Optional[str
         Hex string of hash, or None on error
     """
     try:
-        if algorithm == "xxhash":
-            hasher = xxhash.xxh64()
-        else:
-            hasher = hashlib.new(algorithm)
+        hasher = xxhash.xxh64() if algorithm == "xxhash" else hashlib.new(algorithm)
 
         with open(file_path, "rb") as f:
             for chunk in iter(lambda: f.read(FULL_HASH_CHUNK_SIZE), b""):
@@ -443,7 +440,7 @@ def compute_file_hash(file_path: str, algorithm: str = "sha256") -> Optional[str
 
         return hasher.hexdigest()
 
-    except (OSError, IOError, ValueError) as e:
+    except (OSError, ValueError) as e:
         logger.warning(f"Error computing {algorithm} hash for {file_path}: {e}")
         return None
 

@@ -6,18 +6,15 @@ Supports perceptual hashing for images to detect visually similar files.
 
 import threading
 from collections import defaultdict
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Optional
 
 from duplicleaner.db.database import Database, get_database
 from duplicleaner.db.models import (
     FileRecord,
-    DuplicateGroup,
-    DuplicateMember,
     MatchType,
-    GroupStatus,
 )
 from duplicleaner.utils.config import get_config
 from duplicleaner.utils.logging import get_logger
@@ -54,7 +51,7 @@ class CompareProgress:
     exact_groups_found: int = 0
     near_groups_found: int = 0
     current_file: str = ""
-    start_time: Optional[datetime] = None
+    start_time: datetime | None = None
     elapsed_seconds: float = 0.0
     state: CompareState = CompareState.IDLE
     errors: int = 0
@@ -75,9 +72,9 @@ class CompareResult:
 class PerceptualHash:
     """Container for multiple perceptual hash types."""
 
-    phash: Optional[str] = None  # Perceptual hash
-    dhash: Optional[str] = None  # Difference hash
-    ahash: Optional[str] = None  # Average hash
+    phash: str | None = None  # Perceptual hash
+    dhash: str | None = None  # Difference hash
+    ahash: str | None = None  # Average hash
 
     def to_string(self) -> str:
         """Combine hashes into a single string for storage."""
@@ -113,8 +110,8 @@ class Comparator:
 
     def __init__(
         self,
-        db: Optional[Database] = None,
-        progress_callback: Optional[Callable[[CompareProgress], None]] = None,
+        db: Database | None = None,
+        progress_callback: Callable[[CompareProgress], None] | None = None,
     ):
         """Initialize the comparator.
 
@@ -143,7 +140,7 @@ class Comparator:
         """Get current progress."""
         return self._progress
 
-    def find_exact_duplicates(self, drive_id: Optional[str] = None) -> int:
+    def find_exact_duplicates(self, drive_id: str | None = None) -> int:
         """Find exact duplicates based on content hash.
 
         Args:
@@ -216,8 +213,8 @@ class Comparator:
 
     def find_near_duplicates(
         self,
-        drive_id: Optional[str] = None,
-        threshold: Optional[float] = None,
+        drive_id: str | None = None,
+        threshold: float | None = None,
     ) -> int:
         """Find near-duplicate images using perceptual hashing.
 
@@ -295,7 +292,7 @@ class Comparator:
         logger.info(f"Created {groups_created} near-duplicate groups")
         return groups_created
 
-    def compute_perceptual_hash(self, file_path: str) -> Optional[PerceptualHash]:
+    def compute_perceptual_hash(self, file_path: str) -> PerceptualHash | None:
         """Compute perceptual hashes for an image file.
 
         Args:
@@ -376,7 +373,360 @@ class Comparator:
 
         return 0.0
 
-    def find_all_duplicates(self, drive_id: Optional[str] = None) -> CompareResult:
+    def extract_video_frame_hashes(self, file_path: str) -> list[dict] | None:
+        """Extract keyframes from a video and compute perceptual hashes.
+
+        Args:
+            file_path: Path to video file
+
+        Returns:
+            List of frame hash dicts or None on error
+        """
+        if not IMAGEHASH_AVAILABLE:
+            return None
+
+        try:
+            import cv2
+        except ImportError:
+            logger.debug("OpenCV not available for video frame extraction")
+            return None
+
+        max_frames = self.config.duplicates.video_keyframe_count
+
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            logger.debug(f"Could not open video: {file_path}")
+            return None
+
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            if fps <= 0 or total_frames <= 0:
+                return None
+
+            duration_sec = total_frames / fps
+
+            # Calculate evenly-spaced timestamps
+            if duration_sec <= 0:
+                return None
+
+            interval = duration_sec / (max_frames + 1)
+            timestamps = [interval * (i + 1) for i in range(max_frames)]
+            # Clamp to video duration
+            timestamps = [t for t in timestamps if t < duration_sec]
+            if not timestamps:
+                timestamps = [0.0]
+
+            results = []
+            for idx, ts in enumerate(timestamps):
+                frame_number = int(ts * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                # Convert BGR -> RGB -> PIL
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(rgb)
+                if img.mode not in ('RGB', 'L'):
+                    img = img.convert('RGB')
+
+                phash_val = str(imagehash.phash(img))
+                dhash_val = str(imagehash.dhash(img))
+
+                results.append({
+                    "frame_index": idx,
+                    "timestamp_sec": ts,
+                    "phash": phash_val,
+                    "dhash": dhash_val,
+                })
+
+            return results if results else None
+
+        except Exception as e:
+            logger.debug(f"Error extracting video frames from {file_path}: {e}")
+            self._progress.errors += 1
+            return None
+        finally:
+            cap.release()
+
+    def compare_video_frame_hashes(
+        self,
+        frames_a: list[dict],
+        frames_b: list[dict],
+    ) -> float:
+        """Compare two videos by their frame perceptual hashes.
+
+        For each frame in the shorter video, find the best-matching frame in the
+        longer video. Returns the average best-match similarity.
+
+        Args:
+            frames_a: Frame hashes for video A
+            frames_b: Frame hashes for video B
+
+        Returns:
+            Similarity score (0.0 to 1.0)
+        """
+        if not IMAGEHASH_AVAILABLE or not frames_a or not frames_b:
+            return 0.0
+
+        # Use the shorter set as the query set
+        if len(frames_a) > len(frames_b):
+            frames_a, frames_b = frames_b, frames_a
+
+        best_matches = []
+        for fa in frames_a:
+            best_sim = 0.0
+            ha_p = imagehash.hex_to_hash(fa["phash"]) if fa.get("phash") else None
+            ha_d = imagehash.hex_to_hash(fa["dhash"]) if fa.get("dhash") else None
+
+            for fb in frames_b:
+                sims = []
+                if ha_p and fb.get("phash"):
+                    hb_p = imagehash.hex_to_hash(fb["phash"])
+                    sims.append(1 - ((ha_p - hb_p) / 64))
+                if ha_d and fb.get("dhash"):
+                    hb_d = imagehash.hex_to_hash(fb["dhash"])
+                    sims.append(1 - ((ha_d - hb_d) / 64))
+
+                if sims:
+                    avg = sum(sims) / len(sims)
+                    if avg > best_sim:
+                        best_sim = avg
+
+            best_matches.append(best_sim)
+
+        return sum(best_matches) / len(best_matches) if best_matches else 0.0
+
+    def find_video_near_duplicates(
+        self,
+        drive_id: str | None = None,
+        threshold: float | None = None,
+    ) -> int:
+        """Find near-duplicate videos using keyframe perceptual hashing.
+
+        Args:
+            drive_id: Optional drive ID to limit search
+            threshold: Similarity threshold (0.0-1.0)
+
+        Returns:
+            Number of video duplicate groups created
+        """
+        if not IMAGEHASH_AVAILABLE:
+            logger.warning("imagehash not available, skipping video near-duplicate detection")
+            return 0
+
+        if not self.config.duplicates.video_near_duplicate:
+            logger.info("Video near-duplicate detection disabled in config")
+            return 0
+
+        if threshold is None:
+            threshold = self.config.duplicates.video_similarity_threshold
+
+        logger.info(f"Finding near-duplicate videos (threshold: {threshold})")
+
+        video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv',
+                          '.webm', '.m4v', '.mpg', '.mpeg', '.3gp'}
+
+        # Get video files
+        with self.db.connection() as conn:
+            query = """
+                SELECT * FROM files
+                WHERE is_deleted = FALSE
+                  AND file_type IN ({})
+            """.format(','.join('?' * len(video_extensions)))
+            params = list(video_extensions)
+            if drive_id:
+                query += " AND drive_id = ?"
+                params.append(drive_id)
+            rows = conn.execute(query, params).fetchall()
+            video_files = [FileRecord(**dict(row)) for row in rows]
+
+        if len(video_files) < 2:
+            logger.info("Less than 2 video files, skipping video comparison")
+            return 0
+
+        logger.info(f"Found {len(video_files)} videos to compare")
+
+        # Get already-processed file IDs
+        processed_ids = set(self.db.get_files_with_video_frames(drive_id))
+
+        # Extract and store frame hashes for unprocessed videos
+        for vf in video_files:
+            self._pause_event.wait()
+            if self._cancel_event.is_set():
+                break
+
+            self._progress.current_file = vf.path
+            self._update_progress()
+
+            if vf.id not in processed_ids:
+                frame_hashes = self.extract_video_frame_hashes(vf.path)
+                if frame_hashes:
+                    self.db.store_video_frame_hashes(vf.id, frame_hashes)
+                    processed_ids.add(vf.id)
+
+        if self._cancel_event.is_set():
+            return 0
+
+        # Load all frame hashes for comparison
+        video_hashes: dict[int, list[dict]] = {}
+        for vf in video_files:
+            if vf.id in processed_ids:
+                frames = self.db.get_video_frame_hashes(vf.id)
+                if frames:
+                    video_hashes[vf.id] = frames
+
+        if len(video_hashes) < 2:
+            return 0
+
+        # Compare all video pairs
+        video_ids = list(video_hashes.keys())
+        similar_pairs: list[tuple[int, int, float]] = []
+
+        total_comparisons = len(video_ids) * (len(video_ids) - 1) // 2
+        logger.info(f"Comparing {total_comparisons} video pairs")
+
+        for i, id1 in enumerate(video_ids):
+            if self._cancel_event.is_set():
+                break
+
+            for id2 in video_ids[i + 1:]:
+                similarity = self.compare_video_frame_hashes(
+                    video_hashes[id1], video_hashes[id2]
+                )
+                if similarity >= threshold:
+                    similar_pairs.append((id1, id2, similarity))
+
+        logger.info(f"Found {len(similar_pairs)} similar video pairs")
+
+        # Cluster and create groups
+        groups = self._union_find_cluster(similar_pairs)
+        groups_created = 0
+        for group_file_ids in groups.values():
+            if len(group_file_ids) > 1:
+                avg_similarity = self._calculate_group_similarity(group_file_ids, similar_pairs)
+                existing = self._find_existing_group(list(group_file_ids))
+                if not existing:
+                    self.db.create_duplicate_group(
+                        match_type=MatchType.NEAR,
+                        similarity=avg_similarity,
+                        file_ids=list(group_file_ids),
+                    )
+                    groups_created += 1
+                    self._progress.near_groups_found += 1
+
+        logger.info(f"Created {groups_created} video near-duplicate groups")
+        return groups_created
+
+    def find_document_near_duplicates(
+        self,
+        drive_id: str | None = None,
+        threshold: float = 0.95,
+    ) -> int:
+        """Find near-duplicate documents by comparing extracted text.
+
+        Matches documents across formats (e.g., .docx and .pdf of same content).
+
+        Args:
+            drive_id: Optional drive ID to limit search
+            threshold: Text similarity threshold (0.0-1.0)
+
+        Returns:
+            Number of document duplicate groups created
+        """
+        document_extensions = {'.pdf', '.doc', '.docx', '.xls', '.xlsx',
+                              '.ppt', '.pptx', '.txt', '.rtf', '.odt'}
+
+        # Get document files that have OCR/text extracted
+        with self.db.connection() as conn:
+            query = """
+                SELECT f.id, f.path, f.filename, f.file_type, o.extracted_text
+                FROM files f
+                JOIN ocr_results o ON o.file_id = f.id
+                WHERE f.is_deleted = FALSE
+                  AND f.file_type IN ({})
+                  AND o.extracted_text IS NOT NULL
+                  AND LENGTH(o.extracted_text) > 50
+            """.format(','.join('?' * len(document_extensions)))
+            params = list(document_extensions)
+            if drive_id:
+                query += " AND f.drive_id = ?"
+                params.append(drive_id)
+            rows = conn.execute(query, params).fetchall()
+
+        if len(rows) < 2:
+            logger.info("Less than 2 documents with text, skipping document comparison")
+            return 0
+
+        logger.info(f"Comparing {len(rows)} documents by text content")
+
+        # Build text fingerprints (normalized, first 5000 chars for efficiency)
+        doc_texts: dict[int, str] = {}
+        for row in rows:
+            text = row["extracted_text"].strip().lower()
+            # Normalize whitespace
+            text = " ".join(text.split())
+            doc_texts[row["id"]] = text[:5000]
+
+        # Compare document pairs by text similarity
+        doc_ids = list(doc_texts.keys())
+        similar_pairs: list[tuple[int, int, float]] = []
+
+        for i, id1 in enumerate(doc_ids):
+            if self._cancel_event.is_set():
+                break
+            text1 = doc_texts[id1]
+            for id2 in doc_ids[i + 1:]:
+                text2 = doc_texts[id2]
+                similarity = self._text_similarity(text1, text2)
+                if similarity >= threshold:
+                    similar_pairs.append((id1, id2, similarity))
+
+        logger.info(f"Found {len(similar_pairs)} similar document pairs")
+
+        # Cluster and create groups
+        groups = self._union_find_cluster(similar_pairs)
+        groups_created = 0
+        for group_file_ids in groups.values():
+            if len(group_file_ids) > 1:
+                avg_similarity = self._calculate_group_similarity(group_file_ids, similar_pairs)
+                existing = self._find_existing_group(list(group_file_ids))
+                if not existing:
+                    self.db.create_duplicate_group(
+                        match_type=MatchType.NEAR,
+                        similarity=avg_similarity,
+                        file_ids=list(group_file_ids),
+                    )
+                    groups_created += 1
+                    self._progress.near_groups_found += 1
+
+        logger.info(f"Created {groups_created} document near-duplicate groups")
+        return groups_created
+
+    @staticmethod
+    def _text_similarity(text1: str, text2: str) -> float:
+        """Compute similarity between two text strings using character bigrams.
+
+        Uses Jaccard similarity on character bigrams for speed.
+        """
+        if not text1 or not text2:
+            return 0.0
+        if text1 == text2:
+            return 1.0
+
+        # Use character bigrams for fuzzy matching
+        def bigrams(s: str) -> set[str]:
+            return {s[i:i+2] for i in range(len(s) - 1)} if len(s) > 1 else {s}
+
+        bg1 = bigrams(text1)
+        bg2 = bigrams(text2)
+        intersection = len(bg1 & bg2)
+        union = len(bg1 | bg2)
+        return intersection / union if union > 0 else 0.0
+
+    def find_all_duplicates(self, drive_id: str | None = None) -> CompareResult:
         """Find both exact and near duplicates.
 
         Args:
@@ -396,13 +746,19 @@ class Comparator:
 
         try:
             # Find exact duplicates first
-            exact_groups = self.find_exact_duplicates(drive_id)
+            self.find_exact_duplicates(drive_id)
 
             if not self._cancel_event.is_set():
-                # Find near duplicates
-                near_groups = self.find_near_duplicates(drive_id)
-            else:
-                near_groups = 0
+                # Find near duplicates (images)
+                self.find_near_duplicates(drive_id)
+
+            if not self._cancel_event.is_set():
+                # Find near duplicates (videos)
+                self.find_video_near_duplicates(drive_id)
+
+            if not self._cancel_event.is_set():
+                # Find near duplicates (documents by text content)
+                self.find_document_near_duplicates(drive_id)
 
             # Calculate statistics
             stats = self._calculate_stats()
@@ -430,7 +786,7 @@ class Comparator:
             duration_seconds=self._progress.elapsed_seconds,
         )
 
-    def _get_image_files(self, drive_id: Optional[str] = None) -> list[FileRecord]:
+    def _get_image_files(self, drive_id: str | None = None) -> list[FileRecord]:
         """Get all image files from the database.
 
         Args:
@@ -599,7 +955,7 @@ class Comparator:
 
         return 0.9  # Default if no pairs found
 
-    def _find_existing_group(self, file_ids: list[int]) -> Optional[int]:
+    def _find_existing_group(self, file_ids: list[int]) -> int | None:
         """Check if a duplicate group already exists for these files.
 
         Args:
@@ -676,7 +1032,7 @@ class Comparator:
             self.progress_callback(self._progress)
 
 
-def compute_image_hash(file_path: str, hash_type: str = "phash") -> Optional[str]:
+def compute_image_hash(file_path: str, hash_type: str = "phash") -> str | None:
     """Convenience function to compute a single image hash.
 
     Args:

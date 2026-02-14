@@ -5,10 +5,10 @@ Provides Git-backed history for tracked folders and files.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional
 
 from duplicleaner.utils.logging import get_logger
 
@@ -18,7 +18,7 @@ logger = get_logger(__name__)
 GIT_AVAILABLE = False
 
 try:
-    from git import Repo, GitCommandError, InvalidGitRepositoryError, NoSuchPathError
+    from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
     GIT_AVAILABLE = True
 except ImportError:
     logger.warning("GitPython not available. Version tracking disabled.")
@@ -44,9 +44,9 @@ class VersionEntry:
     author: str
     message: str
     file_path: str
-    size_bytes: Optional[int] = None
-    insertions: Optional[int] = None
-    deletions: Optional[int] = None
+    size_bytes: int | None = None
+    insertions: int | None = None
+    deletions: int | None = None
 
 
 @dataclass
@@ -65,8 +65,8 @@ class VersionTracker:
     def __init__(
         self,
         root_path: str | Path,
-        include_patterns: Optional[list[str]] = None,
-        exclude_patterns: Optional[list[str]] = None,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
         include_subfolders: bool = True,
         max_file_size_mb: float = 50.0,
     ) -> None:
@@ -85,13 +85,13 @@ class VersionTracker:
         self.include_subfolders = include_subfolders
         self.max_file_size_bytes = int(max_file_size_mb * 1024 * 1024)
 
-        self._repo: Optional["Repo"] = None
+        self._repo: Repo | None = None
 
     def is_available(self) -> bool:
         """Check if GitPython is available."""
         return GIT_AVAILABLE
 
-    def _get_repo(self) -> Optional["Repo"]:
+    def _get_repo(self) -> Repo | None:
         if not self.is_available():
             return None
 
@@ -155,15 +155,10 @@ class VersionTracker:
         except OSError:
             return False
 
-        if self.include_patterns:
-            if not any(path.match(pattern) for pattern in self.include_patterns):
-                return False
+        if self.include_patterns and not any(path.match(pattern) for pattern in self.include_patterns):
+            return False
 
-        if self.exclude_patterns:
-            if any(path.match(pattern) for pattern in self.exclude_patterns):
-                return False
-
-        return True
+        return not (self.exclude_patterns and any(path.match(pattern) for pattern in self.exclude_patterns))
 
     def initial_commit(self, message: str = "Initial version tracking") -> bool:
         """Create initial commit for tracked files."""
@@ -316,7 +311,7 @@ class VersionTracker:
         try:
             commits = list(repo.iter_commits(max_count=limit))
             for commit in commits:
-                for file_path in commit.stats.files.keys():
+                for file_path in commit.stats.files:
                     changes.append(
                         ChangeEntry(
                             commit_hash=commit.hexsha,
@@ -359,7 +354,7 @@ class VersionTracker:
         self,
         file_path: str | Path,
         commit_hash: str,
-        message: Optional[str] = None,
+        message: str | None = None,
         allow_dirty: bool = False,
     ) -> bool:
         """Restore a file to a specific version and commit the restore.
@@ -429,7 +424,7 @@ class VersionTracker:
             gitignore = self.root_path / ".gitignore"
             existing: set[str] = set()
             if gitignore.exists():
-                with open(gitignore, "r", encoding="utf-8") as handle:
+                with open(gitignore, encoding="utf-8") as handle:
                     existing = {line.strip() for line in handle if line.strip()}
 
             lines: list[str] = []

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
 
-from duplicleaner.ai.objects import ObjectDetector
 from duplicleaner.ai.documents import DocumentTextExtractor
+from duplicleaner.ai.objects import ObjectDetector
 from duplicleaner.ai.ocr import OCREngine
 from duplicleaner.ai.scenes import SceneClassifier
 from duplicleaner.ai.summaries import SummaryEngine
@@ -28,13 +29,14 @@ class AnalysisOptions:
     include_objects: bool = True
     include_ocr: bool = True
     include_summaries: bool = False
+    include_audio: bool = False
     include_images: bool = True
     include_documents: bool = True
     include_data_files: bool = False
     document_extensions: list[str] = field(default_factory=list)
     data_extensions: list[str] = field(default_factory=list)
     reanalyze_existing: bool = False
-    drive_id: Optional[str] = None
+    drive_id: str | None = None
     batch_limit: int = 200
 
 
@@ -46,6 +48,7 @@ class AnalysisStats:
     objects: int = 0
     ocr: int = 0
     summaries: int = 0
+    audio: int = 0
 
 
 class AnalysisRunner:
@@ -54,8 +57,8 @@ class AnalysisRunner:
     def __init__(
         self,
         db: Database,
-        status_callback: Optional[Callable[[str], None]] = None,
-        cancel_event: Optional[threading.Event] = None,
+        status_callback: Callable[[str], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.db = db
         self.config = get_config()
@@ -85,10 +88,8 @@ class AnalysisRunner:
 
     def _notify(self, message: str) -> None:
         if self.status_callback:
-            try:
+            with contextlib.suppress(Exception):
                 self.status_callback(message)
-            except Exception:
-                pass
 
     def _emit_preflight(self, options: AnalysisOptions) -> None:
         """Log how many files are eligible for analysis."""
@@ -121,12 +122,16 @@ class AnalysisRunner:
             if doc_exts or data_exts:
                 missing = self._count_missing_ocr(doc_exts + data_exts, options.drive_id)
                 self._notify(f"Preflight missing OCR (docs/data): {missing}")
+        audio_exts = self._audio_extensions() if options.include_audio else []
+        total_audio = self._count_files_by_extensions(audio_exts, options.drive_id)
+        if total_audio > 0:
+            self._notify(f"Preflight audio files: {total_audio}")
         if options.include_summaries:
-            summary_exts = image_exts + doc_exts + data_exts
+            summary_exts = image_exts + doc_exts + data_exts + audio_exts
             missing = self._count_missing_summaries(summary_exts, options.drive_id)
             self._notify(f"Preflight missing summaries: {missing}")
 
-    def _count_files_by_extensions(self, extensions: list[str], drive_id: Optional[str]) -> int:
+    def _count_files_by_extensions(self, extensions: list[str], drive_id: str | None) -> int:
         if not extensions:
             return 0
         placeholders = ", ".join("?" for _ in extensions)
@@ -142,7 +147,7 @@ class AnalysisRunner:
         with self.db.connection() as conn:
             return int(conn.execute(query, params).fetchone()[0])
 
-    def _count_missing_metadata(self, extensions: list[str], drive_id: Optional[str]) -> int:
+    def _count_missing_metadata(self, extensions: list[str], drive_id: str | None) -> int:
         placeholders = ", ".join("?" for _ in extensions)
         query = f"""
             SELECT COUNT(*) FROM files f
@@ -158,7 +163,7 @@ class AnalysisRunner:
         with self.db.connection() as conn:
             return int(conn.execute(query, params).fetchone()[0])
 
-    def _count_missing_scene_analysis(self, extensions: list[str], drive_id: Optional[str]) -> int:
+    def _count_missing_scene_analysis(self, extensions: list[str], drive_id: str | None) -> int:
         placeholders = ", ".join("?" for _ in extensions)
         query = f"""
             SELECT COUNT(*) FROM files f
@@ -174,7 +179,7 @@ class AnalysisRunner:
         with self.db.connection() as conn:
             return int(conn.execute(query, params).fetchone()[0])
 
-    def _count_missing_scene_objects(self, extensions: list[str], drive_id: Optional[str]) -> int:
+    def _count_missing_scene_objects(self, extensions: list[str], drive_id: str | None) -> int:
         placeholders = ", ".join("?" for _ in extensions)
         query = f"""
             SELECT COUNT(*) FROM files f
@@ -190,7 +195,7 @@ class AnalysisRunner:
         with self.db.connection() as conn:
             return int(conn.execute(query, params).fetchone()[0])
 
-    def _count_missing_ocr(self, extensions: list[str], drive_id: Optional[str]) -> int:
+    def _count_missing_ocr(self, extensions: list[str], drive_id: str | None) -> int:
         placeholders = ", ".join("?" for _ in extensions)
         query = f"""
             SELECT COUNT(*) FROM files f
@@ -206,7 +211,7 @@ class AnalysisRunner:
         with self.db.connection() as conn:
             return int(conn.execute(query, params).fetchone()[0])
 
-    def _count_missing_summaries(self, extensions: list[str], drive_id: Optional[str]) -> int:
+    def _count_missing_summaries(self, extensions: list[str], drive_id: str | None) -> int:
         placeholders = ", ".join("?" for _ in extensions)
         query = f"""
             SELECT COUNT(*) FROM files f
@@ -463,6 +468,8 @@ class AnalysisRunner:
             extensions.extend(options.document_extensions)
         if options.include_data_files and options.data_extensions:
             extensions.extend(options.data_extensions)
+        if options.include_audio:
+            extensions.extend(self._audio_extensions())
 
         if options.reanalyze_existing:
             last_id = 0
@@ -506,3 +513,6 @@ class AnalysisRunner:
 
     def _image_extensions(self) -> list[str]:
         return [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
+
+    def _audio_extensions(self) -> list[str]:
+        return [".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".wma", ".opus"]

@@ -5,14 +5,13 @@ Generates at-risk reports and backup suggestions across drives.
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-import fnmatch
 
 from duplicleaner.db.database import Database, get_database
-from duplicleaner.db.models import FileRecord, Drive
-from duplicleaner.drives.manager import DriveManager, normalize_path, DriveStatus
+from duplicleaner.db.models import Drive, FileRecord
+from duplicleaner.drives.manager import DriveManager, DriveStatus, normalize_path
 from duplicleaner.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -80,8 +79,8 @@ class RedundancyChecker:
 
     def __init__(
         self,
-        db: Optional[Database] = None,
-        drive_manager: Optional[DriveManager] = None,
+        db: Database | None = None,
+        drive_manager: DriveManager | None = None,
     ) -> None:
         self.db = db or get_database()
         self.drive_manager = drive_manager or DriveManager(self.db)
@@ -214,7 +213,7 @@ class RedundancyChecker:
         self,
         source_path: str,
         target_drive_ids: list[str],
-        exclude_patterns: Optional[list[str]] = None,
+        exclude_patterns: list[str] | None = None,
         skip_if_hash_on_target: bool = True,
     ) -> list[BackupPlanItem]:
         """Build a backup plan for a source path and target drives."""
@@ -425,22 +424,20 @@ class RedundancyChecker:
         except Exception:
             return fallback_name
 
-    def _resolve_drive_for_path(self, path: str) -> Optional[Drive]:
+    def _resolve_drive_for_path(self, path: str) -> Drive | None:
         drives = self.db.get_all_drives()
         normalized = normalize_path(path)
-        best: Optional[Drive] = None
+        best: Drive | None = None
         for drive in drives:
-            if normalize_path(drive.path) and normalized.startswith(normalize_path(drive.path)):
-                if best is None or len(drive.path) > len(best.path):
-                    best = drive
+            if normalize_path(drive.path) and normalized.startswith(normalize_path(drive.path)) and (
+                best is None or len(drive.path) > len(best.path)
+            ):
+                best = drive
         return best
 
     def _is_excluded(self, path: str, patterns: list[str]) -> bool:
         normalized = path.replace("\\", "/")
-        for pattern in patterns:
-            if fnmatch.fnmatch(normalized, pattern.replace("\\", "/")):
-                return True
-        return False
+        return any(fnmatch.fnmatch(normalized, pattern.replace("\\", "/")) for pattern in patterns)
 
     def _marker_to_like(self, source_root: str, marker: str) -> str:
         """Convert a marker into a LIKE pattern for DB path matching."""

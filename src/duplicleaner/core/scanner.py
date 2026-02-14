@@ -5,19 +5,19 @@ results in the database. Supports UNC paths, pause/resume, and
 progress callbacks.
 """
 
+import contextlib
 import mimetypes
 import os
 import stat
 import threading
 import time
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from pathlib import Path, PureWindowsPath
-from typing import Callable, Generator, Optional, Set
 
 from duplicleaner.db.database import Database, get_database
-from duplicleaner.db.models import FileRecord, Drive
+from duplicleaner.db.models import Drive, FileRecord
 from duplicleaner.utils.config import get_config
 from duplicleaner.utils.logging import get_logger
 from duplicleaner.utils.profiling import profile_block
@@ -56,7 +56,7 @@ class ScanProgress:
     files_removed: int = 0
     errors: int = 0
     current_path: str = ""
-    start_time: Optional[datetime] = None
+    start_time: datetime | None = None
     elapsed_seconds: float = 0.0
     files_per_second: float = 0.0
     state: ScanState = ScanState.IDLE
@@ -134,9 +134,9 @@ class Scanner:
 
     def __init__(
         self,
-        db: Optional[Database] = None,
+        db: Database | None = None,
         batch_size: int = 1000,
-        progress_callback: Optional[Callable[[ScanProgress], None]] = None,
+        progress_callback: Callable[[ScanProgress], None] | None = None,
     ):
         """Initialize the scanner.
 
@@ -161,16 +161,16 @@ class Scanner:
         self._file_batch: list[FileRecord] = []
 
         # Track seen files for removal detection
-        self._seen_file_ids: Set[int] = set()
+        self._seen_file_ids: set[int] = set()
 
         # Resume scan state
-        self._scan_drive_id: Optional[str] = None
-        self._scan_mode: Optional[ScanMode] = None
-        self._scan_root: Optional[str] = None
-        self._resume_path: Optional[str] = None
+        self._scan_drive_id: str | None = None
+        self._scan_mode: ScanMode | None = None
+        self._scan_root: str | None = None
+        self._resume_path: str | None = None
         self._resume_active = False
         self._resume_reached = False
-        self._scan_started_at: Optional[datetime] = None
+        self._scan_started_at: datetime | None = None
         self._last_state_save = 0.0
         self._state_save_interval = 5.0
 
@@ -192,7 +192,7 @@ class Scanner:
         self,
         drive: Drive,
         mode: ScanMode = ScanMode.QUICK,
-        resume_state: Optional[dict] = None,
+        resume_state: dict | None = None,
     ) -> ScanResult:
         """Scan a drive and store results in the database.
 
@@ -205,10 +205,8 @@ class Scanner:
             ScanResult with statistics
         """
         if resume_state and resume_state.get("mode"):
-            try:
+            with contextlib.suppress(ValueError):
                 mode = ScanMode(resume_state["mode"])
-            except ValueError:
-                pass
 
         logger.info(f"Starting {mode.value} scan of {drive.label} ({drive.path})")
 
@@ -376,7 +374,7 @@ class Scanner:
 
         try:
             yield from self._scan_directory(scan_path, root_path, drive, mode)
-        except PermissionError as e:
+        except PermissionError:
             logger.warning(f"Permission denied for root path: {root_path}")
             self._record_error(root_path, "permission")
 
@@ -419,9 +417,10 @@ class Scanner:
                         # Get clean display path
                         entry_display_path = os.path.join(display_path, name)
 
-                        if self._resume_active and not self._resume_reached:
-                            if self._should_skip_before_resume(entry_display_path, entry):
-                                continue
+                        if self._resume_active and not self._resume_reached and self._should_skip_before_resume(
+                            entry_display_path, entry
+                        ):
+                            continue
 
                         if entry.is_dir(follow_symlinks=self.config.scan.follow_symlinks):
                             # Skip hidden directories if configured
@@ -471,7 +470,7 @@ class Scanner:
         path: str,
         drive: Drive,
         mode: ScanMode,
-    ) -> Optional[FileRecord]:
+    ) -> FileRecord | None:
         """Process a single file entry.
 
         Args:
@@ -573,9 +572,8 @@ class Scanner:
             if pattern.startswith("*"):
                 if name.endswith(pattern[1:]):
                     return True
-            elif pattern.endswith("*"):
-                if name.startswith(pattern[:-1]):
-                    return True
+            elif pattern.endswith("*") and name.startswith(pattern[:-1]):
+                return True
 
         return False
 
@@ -587,11 +585,13 @@ class Scanner:
         resume_path = self._normalize_path(self._resume_path)
         entry_path = self._normalize_path(entry_path)
 
-        if self._path_under(resume_path, entry_path):
-            if entry.is_file(follow_symlinks=self.config.scan.follow_symlinks):
-                if self._paths_equal(entry_path, resume_path):
-                    self._resume_reached = True
-                    return True
+        if (
+            self._path_under(resume_path, entry_path)
+            and entry.is_file(follow_symlinks=self.config.scan.follow_symlinks)
+            and self._paths_equal(entry_path, resume_path)
+        ):
+            self._resume_reached = True
+            return True
             return False
 
         comparison = self._compare_paths(entry_path, resume_path)
@@ -663,7 +663,7 @@ class Scanner:
 
         return path
 
-    def _apply_resume_state(self, resume_state: Optional[dict]) -> None:
+    def _apply_resume_state(self, resume_state: dict | None) -> None:
         """Apply persisted scan state to current progress."""
         if not resume_state:
             return
@@ -814,6 +814,137 @@ class Scanner:
         if self.progress_callback:
             self.progress_callback(self._progress)
 
+    def add_single_file(self, drive: Drive, file_path: str) -> int | None:
+        """Add a single file to the database (for incremental/watch scanning).
+
+        Args:
+            drive: Drive the file belongs to
+            file_path: Absolute path to the file
+
+        Returns:
+            File ID if added, None if skipped
+        """
+        if not os.path.isfile(file_path):
+            return None
+
+        try:
+            st = os.stat(file_path)
+            filename = os.path.basename(file_path)
+            file_type = os.path.splitext(filename)[1].lower() or None
+            mime_type, _ = mimetypes.guess_type(filename)
+
+            try:
+                created = datetime.fromtimestamp(st.st_ctime)
+            except (OSError, ValueError):
+                created = None
+            try:
+                modified = datetime.fromtimestamp(st.st_mtime)
+            except (OSError, ValueError):
+                modified = None
+
+            record = FileRecord(
+                drive_id=drive.id,
+                path=file_path,
+                filename=filename,
+                size=st.st_size,
+                created=created,
+                modified=modified,
+                file_type=file_type,
+                mime_type=mime_type,
+                scan_date=datetime.now(),
+            )
+            return self.db.add_file(record)
+        except (OSError, ValueError) as e:
+            logger.warning("Error adding file %s: %s", file_path, e)
+            return None
+
+    def detect_corrupt_images(
+        self,
+        drive_id: str | None = None,
+        progress_callback: Callable[[int, int, str], None] | None = None,
+    ) -> int:
+        """Scan image files for corruption and record results in the database.
+
+        Args:
+            drive_id: Optional drive to limit scanning
+            progress_callback: Called with (processed, total, current_file)
+
+        Returns:
+            Number of corrupt files found
+        """
+        from duplicleaner.utils.jpeg_recovery import JPEGRecovery
+
+        image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp',
+                     '.tiff', '.tif', '.webp', '.heic', '.heif'}
+
+        with self.db.connection() as conn:
+            query = """
+                SELECT id, path, file_type, size FROM files
+                WHERE is_deleted = FALSE
+                  AND file_type IN ({})
+            """.format(','.join('?' * len(image_exts)))
+            params = list(image_exts)
+            if drive_id:
+                query += " AND drive_id = ?"
+                params.append(drive_id)
+            rows = conn.execute(query, params).fetchall()
+
+        total = len(rows)
+        corrupt_count = 0
+        checker = JPEGRecovery()
+
+        for i, row in enumerate(rows):
+            file_id = row["id"]
+            path = row["path"]
+            file_type = row["file_type"] or ""
+
+            if progress_callback:
+                progress_callback(i + 1, total, path)
+
+            if not os.path.exists(path):
+                continue
+
+            # Check for corruption
+            is_corrupt = False
+            corruption_type = "unknown"
+            severity = "medium"
+
+            if file_type.lower() in {'.jpg', '.jpeg'}:
+                is_corrupt, ctype = checker.is_corrupt_jpeg(path)
+                if ctype:
+                    corruption_type = ctype
+            else:
+                # For non-JPEG images, try PIL open+verify
+                try:
+                    from PIL import Image
+                    with Image.open(path) as img:
+                        img.verify()
+                except Exception as e:
+                    is_corrupt = True
+                    err = str(e).lower()
+                    if "truncated" in err:
+                        corruption_type = "truncated"
+                    elif "cannot identify" in err:
+                        corruption_type = "unreadable"
+                    else:
+                        corruption_type = "unknown"
+
+            if is_corrupt:
+                # Determine severity based on file size
+                file_size = row["size"]
+                if file_size < 1024:
+                    severity = "high"  # Very small, likely empty/header-only
+                elif file_size < 10240:
+                    severity = "high"  # Suspiciously small for an image
+                else:
+                    severity = "medium"
+
+                self.db.add_corrupt_file(file_id, corruption_type, severity)
+                corrupt_count += 1
+
+        logger.info(f"Corruption scan complete: {corrupt_count} corrupt files found out of {total}")
+        return corrupt_count
+
 
 def is_unc_path(path: str) -> bool:
     """Check if a path is a UNC network path.
@@ -843,3 +974,222 @@ def get_unc_server_share(path: str) -> tuple[str, str]:
     share = parts[1] if len(parts) > 1 else ""
 
     return server, share
+
+
+@dataclass
+class RecoveryResult:
+    """Result of a file recovery attempt."""
+
+    file_id: int
+    success: bool
+    strategy_used: str = ""
+    recovered_path: str | None = None
+    error: str | None = None
+    pixel_recovery_pct: float | None = None
+
+
+class RecoveryManager:
+    """Orchestrates JPEG recovery using multiple strategies in order of aggressiveness."""
+
+    # Recovery strategies in order from least to most aggressive
+    STRATEGIES = [
+        "pil_tolerant",       # jpeg_recovery.py
+        "binary_repair",      # jpeg_binary_repair.py
+        "smart_multi_soi",    # jpeg_smart_recovery.py
+        "aggressive_offset",  # jpeg_aggressive_recovery.py
+        "deep_tolerant",      # jpeg_deep_recovery.py
+        "hybrid",             # jpeg_hybrid_recovery.py
+    ]
+
+    def __init__(
+        self,
+        db: Database | None = None,
+        recovery_dir: str | None = None,
+    ):
+        self.db = db or get_database()
+        if recovery_dir:
+            self._recovery_dir = recovery_dir
+        else:
+            from duplicleaner.utils.config import get_app_data_dir
+            self._recovery_dir = str(get_app_data_dir() / "recovered")
+        os.makedirs(self._recovery_dir, exist_ok=True)
+
+    def recover_file(self, file_id: int, file_path: str) -> RecoveryResult:
+        """Attempt to recover a corrupt file using progressive strategies.
+
+        Tries each strategy in order, stopping at the first success.
+
+        Args:
+            file_id: Database file ID
+            file_path: Path to the corrupt file
+
+        Returns:
+            RecoveryResult
+        """
+        if not os.path.exists(file_path):
+            return RecoveryResult(file_id=file_id, success=False, error="File not found")
+
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        output_path = os.path.join(self._recovery_dir, f"{stem}_recovered.jpg")
+
+        # Strategy 1: PIL tolerant mode
+        result = self._try_pil_tolerant(file_path, output_path)
+        if result:
+            self.db.add_recovery_attempt(file_id, "pil_tolerant", True, recovered_path=result)
+            return RecoveryResult(file_id=file_id, success=True, strategy_used="pil_tolerant", recovered_path=result)
+
+        # Strategy 2: Binary repair
+        result = self._try_binary_repair(file_path, output_path)
+        if result:
+            self.db.add_recovery_attempt(file_id, "binary_repair", True, recovered_path=result)
+            return RecoveryResult(file_id=file_id, success=True, strategy_used="binary_repair", recovered_path=result)
+
+        # Strategy 3: Smart multi-SOI
+        result = self._try_smart_recovery(file_path, output_path)
+        if result:
+            self.db.add_recovery_attempt(file_id, "smart_multi_soi", True, recovered_path=result)
+            return RecoveryResult(file_id=file_id, success=True, strategy_used="smart_multi_soi", recovered_path=result)
+
+        # Strategy 4: Aggressive offset scanning
+        result = self._try_aggressive_recovery(file_path, output_path)
+        if result:
+            self.db.add_recovery_attempt(file_id, "aggressive_offset", True, recovered_path=result)
+            return RecoveryResult(file_id=file_id, success=True, strategy_used="aggressive_offset", recovered_path=result)
+
+        # Strategy 5: Deep error-tolerant
+        result = self._try_deep_recovery(file_path, output_path)
+        if result:
+            self.db.add_recovery_attempt(file_id, "deep_tolerant", True, recovered_path=result)
+            return RecoveryResult(file_id=file_id, success=True, strategy_used="deep_tolerant", recovered_path=result)
+
+        # Strategy 6: Hybrid (combine strategies)
+        result = self._try_hybrid_recovery(file_path, output_path)
+        if result:
+            self.db.add_recovery_attempt(file_id, "hybrid", True, recovered_path=result)
+            return RecoveryResult(file_id=file_id, success=True, strategy_used="hybrid", recovered_path=result)
+
+        # All strategies failed
+        self.db.add_recovery_attempt(file_id, "all_failed", False)
+        return RecoveryResult(file_id=file_id, success=False, error="All recovery strategies failed")
+
+    def _try_pil_tolerant(self, file_path: str, output_path: str) -> str | None:
+        """Strategy 1: PIL tolerant mode re-encoding."""
+        try:
+            from duplicleaner.utils.jpeg_recovery import JPEGRecovery
+            recovery = JPEGRecovery(recovery_dir=self._recovery_dir)
+            result = recovery.recover_jpeg(file_path, force=True)
+            if result.success and result.recovered_path:
+                return result.recovered_path
+        except Exception as e:
+            logger.debug(f"PIL tolerant recovery failed: {e}")
+        return None
+
+    def _try_binary_repair(self, file_path: str, output_path: str) -> str | None:
+        """Strategy 2: Binary-level JPEG marker reconstruction."""
+        try:
+            from duplicleaner.utils.jpeg_binary_repair import JPEGBinaryRepair
+            repair = JPEGBinaryRepair()
+            result_path = repair.repair(file_path, output_path)
+            if result_path and os.path.exists(result_path):
+                # Verify result is a valid image
+                from PIL import Image
+                with Image.open(result_path) as img:
+                    img.verify()
+                return result_path
+        except Exception as e:
+            logger.debug(f"Binary repair failed: {e}")
+        return None
+
+    def _try_smart_recovery(self, file_path: str, output_path: str) -> str | None:
+        """Strategy 3: Multi-SOI marker extraction."""
+        try:
+            from duplicleaner.utils.jpeg_smart_recovery import JPEGSmartRecovery
+            recovery = JPEGSmartRecovery()
+            results = recovery.extract_images(file_path, self._recovery_dir)
+            if results:
+                # Return the largest successfully extracted image
+                best = max(results, key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0)
+                return best
+        except Exception as e:
+            logger.debug(f"Smart recovery failed: {e}")
+        return None
+
+    def _try_aggressive_recovery(self, file_path: str, output_path: str) -> str | None:
+        """Strategy 4: EXIF dimensions + offset scanning."""
+        try:
+            from duplicleaner.utils.jpeg_aggressive_recovery import JPEGAggressiveRecovery
+            recovery = JPEGAggressiveRecovery()
+            result_path = recovery.recover(file_path, output_path)
+            if result_path and os.path.exists(result_path):
+                from PIL import Image
+                with Image.open(result_path) as img:
+                    img.verify()
+                return result_path
+        except Exception as e:
+            logger.debug(f"Aggressive recovery failed: {e}")
+        return None
+
+    def _try_deep_recovery(self, file_path: str, output_path: str) -> str | None:
+        """Strategy 5: Error-tolerant decoding with EOI padding."""
+        try:
+            from duplicleaner.utils.jpeg_deep_recovery import JPEGDeepRecovery
+            recovery = JPEGDeepRecovery()
+            result_path = recovery.recover(file_path, output_path)
+            if result_path and os.path.exists(result_path):
+                from PIL import Image
+                with Image.open(result_path) as img:
+                    img.verify()
+                return result_path
+        except Exception as e:
+            logger.debug(f"Deep recovery failed: {e}")
+        return None
+
+    def _try_hybrid_recovery(self, file_path: str, output_path: str) -> str | None:
+        """Strategy 6: Combine multiple strategies."""
+        try:
+            from duplicleaner.utils.jpeg_hybrid_recovery import JPEGHybridRecovery
+            recovery = JPEGHybridRecovery()
+            result_path = recovery.recover_hybrid(file_path, output_path)
+            if result_path and os.path.exists(result_path):
+                return result_path
+        except Exception as e:
+            logger.debug(f"Hybrid recovery failed: {e}")
+        return None
+
+    def recover_batch(
+        self,
+        corrupt_files: list[dict],
+        progress_callback: Callable[[int, int, str, bool], None] | None = None,
+    ) -> tuple[int, int]:
+        """Recover a batch of corrupt files.
+
+        Args:
+            corrupt_files: List of dicts from db.get_corrupt_files()
+            progress_callback: Called with (processed, total, filename, success)
+
+        Returns:
+            Tuple of (success_count, fail_count)
+        """
+        total = len(corrupt_files)
+        success_count = 0
+        fail_count = 0
+
+        for i, cf in enumerate(corrupt_files):
+            file_id = cf["file_id"]
+            path = cf["path"]
+            filename = cf.get("filename", os.path.basename(path))
+
+            result = self.recover_file(file_id, path)
+
+            if result.success:
+                success_count += 1
+                # Mark as no longer corrupt
+                self.db.remove_corrupt_file(file_id)
+            else:
+                fail_count += 1
+
+            if progress_callback:
+                progress_callback(i + 1, total, filename, result.success)
+
+        logger.info(f"Batch recovery: {success_count} recovered, {fail_count} failed out of {total}")
+        return success_count, fail_count

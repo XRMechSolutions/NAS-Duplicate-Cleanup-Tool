@@ -4,9 +4,10 @@ Runs face detection on images while scans are in progress,
 and can drain any remaining files after a scan completes.
 """
 
+import contextlib
 import threading
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from duplicleaner.ai.faces import FaceAnalyzer
 from duplicleaner.db.database import Database
@@ -21,10 +22,10 @@ class FaceAnalysisWorker:
     def __init__(
         self,
         db: Database,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
         batch_size: int = 50,
         poll_interval: float = 2.0,
-        status_callback: Optional[Callable[[str], None]] = None,
+        status_callback: Callable[[str], None] | None = None,
     ):
         self.db = db
         self.drive_id = drive_id
@@ -32,7 +33,7 @@ class FaceAnalysisWorker:
         self.poll_interval = poll_interval
         self.status_callback = status_callback
 
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._drain_requested = threading.Event()
 
@@ -62,10 +63,8 @@ class FaceAnalysisWorker:
 
     def _notify(self, message: str) -> None:
         if self.status_callback:
-            try:
+            with contextlib.suppress(Exception):
                 self.status_callback(message)
-            except Exception:
-                pass
 
     def _run(self) -> None:
         analyzer = FaceAnalyzer(self.db)

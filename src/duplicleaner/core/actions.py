@@ -4,18 +4,18 @@ Handles quarantine, trash, delete, copy, move, and link operations
 with full audit logging and undo support.
 """
 
+import contextlib
 import hashlib
 import json
 import os
 import shutil
 import stat
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
 from threading import Event
-from typing import Callable, Optional
 
 from ..db.database import Database
 from ..db.models import ActionLogEntry, ActionType
@@ -41,10 +41,10 @@ class PendingAction:
 
     action_type: ActionType
     source_path: str
-    dest_path: Optional[str] = None
-    file_size: Optional[int] = None
-    file_hash: Optional[str] = None
-    metadata: Optional[dict] = None
+    dest_path: str | None = None
+    file_size: int | None = None
+    file_hash: str | None = None
+    metadata: dict | None = None
 
 
 @dataclass
@@ -53,8 +53,8 @@ class ActionResult:
 
     action: PendingAction
     status: ActionStatus
-    error_message: Optional[str] = None
-    log_entry_id: Optional[int] = None
+    error_message: str | None = None
+    log_entry_id: int | None = None
     elapsed_seconds: float = 0.0
 
 
@@ -71,7 +71,7 @@ class OperationProgress:
     failed: int = 0
     skipped: int = 0
     phase: str = "preparing"
-    started_at: Optional[datetime] = None
+    started_at: datetime | None = None
     is_cancelled: bool = False
     is_paused: bool = False
 
@@ -114,7 +114,7 @@ class ActionEngine:
     def __init__(
         self,
         db: Database,
-        quarantine_folder: Optional[str] = None,
+        quarantine_folder: str | None = None,
         verify_copies: bool = True,
         dry_run: bool = False,
     ):
@@ -143,10 +143,10 @@ class ActionEngine:
         self._pause_event.set()  # Not paused by default
 
         # Callbacks
-        self._progress_callback: Optional[Callable[[OperationProgress], None]] = None
+        self._progress_callback: Callable[[OperationProgress], None] | None = None
 
     def set_progress_callback(
-        self, callback: Optional[Callable[[OperationProgress], None]]
+        self, callback: Callable[[OperationProgress], None] | None
     ) -> None:
         """Set callback for progress updates."""
         self._progress_callback = callback
@@ -162,12 +162,9 @@ class ActionEngine:
     def _is_protected_path(self, path: str) -> bool:
         """Check if path is in a protected system folder."""
         path_lower = path.lower()
-        for protected in self.PROTECTED_PATHS:
-            if path_lower.startswith(protected.lower()):
-                return True
-        return False
+        return any(path_lower.startswith(protected.lower()) for protected in self.PROTECTED_PATHS)
 
-    def _compute_file_hash(self, path: str) -> Optional[str]:
+    def _compute_file_hash(self, path: str) -> str | None:
         """Compute SHA-256 hash of a file."""
         try:
             sha256 = hashlib.sha256()
@@ -226,12 +223,12 @@ class ActionEngine:
         self,
         action_type: ActionType,
         source_path: str,
-        dest_path: Optional[str] = None,
-        file_hash: Optional[str] = None,
-        file_size: Optional[int] = None,
+        dest_path: str | None = None,
+        file_hash: str | None = None,
+        file_size: int | None = None,
         reversible: bool = True,
-        metadata: Optional[dict] = None,
-    ) -> Optional[int]:
+        metadata: dict | None = None,
+    ) -> int | None:
         """Log an action to the database."""
         try:
             entry = ActionLogEntry(
@@ -253,7 +250,7 @@ class ActionEngine:
     def quarantine(
         self,
         source_path: str,
-        file_hash: Optional[str] = None,
+        file_hash: str | None = None,
     ) -> ActionResult:
         """Move a file to quarantine folder.
 
@@ -1072,10 +1069,8 @@ class ActionEngine:
             if os.path.exists(action.source_path):
                 # Get file size if not set
                 if action.file_size is None:
-                    try:
+                    with contextlib.suppress(Exception):
                         action.file_size = os.path.getsize(action.source_path)
-                    except Exception:
-                        pass
                 valid_actions.append(action)
             else:
                 results.append(ActionResult(
@@ -1420,7 +1415,7 @@ class ActionEngine:
 
     def empty_quarantine(
         self,
-        before_date: Optional[str] = None,
+        before_date: str | None = None,
         confirm: bool = False,
     ) -> int:
         """Empty quarantine folder.
@@ -1452,14 +1447,14 @@ class ActionEngine:
             # Delete folder
             if not self.dry_run:
                 try:
-                    for root, _, files in os.walk(date_path):
+                    for _root, _, files in os.walk(date_path):
                         deleted_count += len(files)
                     shutil.rmtree(date_path)
                     logger.info(f"Emptied quarantine folder: {date_path}")
                 except Exception as e:
                     logger.error(f"Failed to delete quarantine folder {date_path}: {e}")
             else:
-                for root, _, files in os.walk(date_path):
+                for _root, _, files in os.walk(date_path):
                     deleted_count += len(files)
                 logger.info(f"[DRY RUN] Would empty quarantine folder: {date_path}")
 

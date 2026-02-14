@@ -8,9 +8,9 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, time as dt_time
+from datetime import datetime
+from datetime import time as dt_time
 from pathlib import Path
-from typing import Optional
 
 from duplicleaner.core.versioning import VersionTracker
 from duplicleaner.utils.config import VersioningSettings
@@ -25,8 +25,8 @@ class TrackedRepoState:
     tracker: VersionTracker
     last_snapshot: dict[str, tuple[float, int]] = field(default_factory=dict)
     pending_paths: set[str] = field(default_factory=set)
-    last_change_ts: Optional[float] = None
-    last_daily_commit_date: Optional[str] = None
+    last_change_ts: float | None = None
+    last_daily_commit_date: str | None = None
 
 
 class VersioningService:
@@ -43,7 +43,7 @@ class VersioningService:
         self.debounce_seconds = max(5, debounce_seconds)
 
         self._repos: dict[str, TrackedRepoState] = {}
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
 
     def start(self) -> None:
@@ -215,7 +215,7 @@ class VersioningService:
             if old[path] != meta:
                 changed.add(path)
 
-        for path in old.keys():
+        for path in old:
             if path not in new:
                 changed.add(path)
 
