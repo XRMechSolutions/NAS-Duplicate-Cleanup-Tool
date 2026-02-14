@@ -4,29 +4,31 @@ Transforms unorganized photo dumps into clean, browsable folder structures.
 Organizes by date, location, and events based on EXIF metadata.
 """
 
+import contextlib
 import json
+import mimetypes
 import os
 import re
 import shutil
+import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
 
-from duplicleaner.db.database import Database, get_database
-from duplicleaner.db.models import FileRecord, FileMetadata, ActionLogEntry, ActionType
-from duplicleaner.utils.logging import get_logger
 from duplicleaner.ai.objects import ObjectDetector
 from duplicleaner.ai.ocr import OCREngine
-import tempfile
+from duplicleaner.db.database import Database, get_database
+from duplicleaner.db.models import ActionLogEntry, ActionType, Drive, FileMetadata, FileRecord
+from duplicleaner.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 # Try to import optional dependencies
 try:
     from PIL import Image
-    from PIL.ExifTags import TAGS, GPSTAGS
+    from PIL.ExifTags import TAGS
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -39,8 +41,8 @@ except ImportError:
     HAS_EXIFREAD = False
 
 try:
+    from geopy.exc import GeocoderServiceError, GeocoderTimedOut
     from geopy.geocoders import Nominatim
-    from geopy.exc import GeocoderTimedOut, GeocoderServiceError
     HAS_GEOPY = True
 except ImportError:
     HAS_GEOPY = False
@@ -73,6 +75,7 @@ class BurstHandling(Enum):
     """How to handle burst photos."""
 
     KEEP_ALL = "keep_all"
+    KEEP_BEST = "keep_best"
     SUBFOLDER = "subfolder"
     FLAG = "flag"
 
@@ -120,6 +123,7 @@ class OrganizeSettings:
     screenshot_handling: ScreenshotHandling = ScreenshotHandling.SEPARATE
     burst_handling: BurstHandling = BurstHandling.KEEP_ALL
     live_photo_handling: LivePhotoHandling = LivePhotoHandling.KEEP_TOGETHER
+    live_photo_cross_directory: bool = False  # Match Live Photos across directories
 
     # Operations
     move_files: bool = True  # False = copy
@@ -144,16 +148,16 @@ class OrganizeResult:
     dest_path: str
     success: bool
     action: str  # "move", "copy", "skip", "error"
-    error: Optional[str] = None
-    date_source: Optional[str] = None  # "exif", "file", "undated"
-    location: Optional[str] = None
-    event_name: Optional[str] = None
-    burst_group: Optional[int] = None  # Burst group ID if part of a burst
+    error: str | None = None
+    date_source: str | None = None  # "exif", "file", "undated"
+    location: str | None = None
+    event_name: str | None = None
+    burst_group: int | None = None  # Burst group ID if part of a burst
     is_live_photo: bool = False  # True if this is part of a Live Photo pair
     # AI Fields
     ai_tags: list[str] = field(default_factory=list)
     is_document: bool = False
-    thumbnail_path: Optional[str] = None
+    thumbnail_path: str | None = None
 
 
 
@@ -218,10 +222,10 @@ class Organizer:
 
     def __init__(
         self,
-        db: Optional[Database] = None,
-        settings: Optional[OrganizeSettings] = None,
-        object_detector: Optional[ObjectDetector] = None,
-        ocr_engine: Optional[OCREngine] = None,
+        db: Database | None = None,
+        settings: OrganizeSettings | None = None,
+        object_detector: ObjectDetector | None = None,
+        ocr_engine: OCREngine | None = None,
     ):
         """Initialize the organizer.
 
@@ -249,10 +253,10 @@ class Organizer:
             self._geocoder = Nominatim(user_agent="duplicleaner")
 
         # Callbacks
-        self._progress_callback: Optional[Callable[[OrganizeProgress], None]] = None
+        self._progress_callback: Callable[[OrganizeProgress], None] | None = None
         self._cancel_requested = False
 
-    def _generate_thumbnail(self, image_path: str, size=(128, 128)) -> Optional[str]:
+    def _generate_thumbnail(self, image_path: str, size=(128, 128)) -> str | None:
         """Generate a thumbnail for an image and save it to the cache."""
         if not HAS_PIL:
             return None
@@ -276,6 +280,29 @@ class Organizer:
             logger.debug(f"Thumbnail generation failed for {image_path}: {e}")
             return None
 
+    def _extract_video_frame_image(self, video_path: str) -> str | None:
+        """Extract a single frame from a video and save to a temp file."""
+        try:
+            import cv2
+        except ImportError:
+            logger.debug("opencv-python-headless not installed; skipping video frame extraction")
+            return None
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+
+        try:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                return None
+            fd, temp_path = tempfile.mkstemp(prefix="duplicleaner_vid_", suffix=".jpg")
+            os.close(fd)
+            cv2.imwrite(temp_path, frame)
+            return temp_path
+        finally:
+            cap.release()
+
     def set_progress_callback(
         self,
         callback: Callable[[OrganizeProgress], None]
@@ -297,7 +324,7 @@ class Organizer:
         if self._progress_callback:
             self._progress_callback(self.progress)
 
-    def extract_date(self, file_path: str) -> tuple[Optional[datetime], str]:
+    def extract_date(self, file_path: str) -> tuple[datetime | None, str]:
         """Extract the best date for a file.
 
         Priority: EXIF DateTimeOriginal > DateTimeDigitized > File dates
@@ -329,7 +356,7 @@ class Organizer:
 
         return None, "unknown"
 
-    def _extract_exif_date(self, file_path: str) -> Optional[datetime]:
+    def _extract_exif_date(self, file_path: str) -> datetime | None:
         """Extract date from EXIF data.
 
         Args:
@@ -369,7 +396,7 @@ class Organizer:
 
         return None
 
-    def _parse_exif_date(self, date_str: str) -> Optional[datetime]:
+    def _parse_exif_date(self, date_str: str) -> datetime | None:
         """Parse EXIF date string.
 
         Args:
@@ -401,7 +428,7 @@ class Organizer:
 
         return None
 
-    def extract_gps(self, file_path: str) -> Optional[tuple[float, float]]:
+    def extract_gps(self, file_path: str) -> tuple[float, float] | None:
         """Extract GPS coordinates from image EXIF.
 
         Args:
@@ -459,7 +486,7 @@ class Organizer:
         self,
         lat: float,
         lon: float
-    ) -> Optional[str]:
+    ) -> str | None:
         """Get location name from GPS coordinates.
 
         Args:
@@ -512,7 +539,7 @@ class Organizer:
 
         return None
 
-    def is_screenshot(self, file_path: str, metadata: Optional[FileMetadata] = None) -> bool:
+    def is_screenshot(self, file_path: str, metadata: FileMetadata | None = None) -> bool:
         """Detect if a file is a screenshot.
 
         Args:
@@ -546,6 +573,19 @@ class Organizer:
                             return True
             except Exception:
                 pass
+
+        # Check CLIP scene classification from database (ML-enhanced detection)
+        try:
+            file_record = self.db.get_file_by_path_any(file_path)
+            if file_record:
+                analysis = self.db.get_scene_analysis(file_record.id)
+                if analysis and analysis.categories:
+                    import json
+                    cats = json.loads(analysis.categories) if isinstance(analysis.categories, str) else analysis.categories
+                    if isinstance(cats, dict) and cats.get("screenshot", 0) >= 0.6:
+                        return True
+        except Exception:
+            pass
 
         return False
 
@@ -585,6 +625,41 @@ class Organizer:
             bursts.append(current_burst)
 
         return bursts
+
+    def _select_best_burst_photo(self, burst_files: list[str]) -> str | None:
+        """Select the best photo from a burst group using quality scoring.
+
+        Falls back to file size if quality scores are unavailable.
+
+        Args:
+            burst_files: List of file paths in the burst
+
+        Returns:
+            Path of the best photo, or None
+        """
+        if not burst_files:
+            return None
+
+        # Try quality scores from database
+        best_path = None
+        best_score = -1.0
+
+        for path in burst_files:
+            file_record = self.db.get_file_by_path_any(path)
+            if not file_record:
+                continue
+            analysis = self.db.get_scene_analysis(file_record.id)
+            if analysis and analysis.quality_score is not None:
+                if analysis.quality_score > best_score:
+                    best_score = analysis.quality_score
+                    best_path = path
+
+        if best_path:
+            return best_path
+
+        # Fallback: largest file (likely sharpest/least compressed)
+        best_path = max(burst_files, key=lambda p: Path(p).stat().st_size if Path(p).exists() else 0)
+        return best_path
 
     def detect_events(
         self,
@@ -634,42 +709,90 @@ class Organizer:
 
     def detect_live_photos(
         self,
-        files: list[str]
+        files: list[str],
+        cross_directory: bool = False,
     ) -> list[tuple[str, str]]:
         """Detect Live Photo pairs (matching image + video files).
 
         iPhone Live Photos consist of a HEIC/JPG image with a matching MOV video.
         They share the same base filename and are created within milliseconds.
+        Samsung/Google Motion Photos embed video data inside the JPEG.
 
         Args:
             files: List of file paths
+            cross_directory: If True, match across directories (slower)
 
         Returns:
             List of (image_path, video_path) tuples for each Live Photo pair
         """
-        # Group files by base name (without extension)
-        by_stem: dict[str, list[str]] = {}
-        for path in files:
-            p = Path(path)
-            stem = p.stem.lower()
-            if stem not in by_stem:
-                by_stem[stem] = []
-            by_stem[stem].append(path)
-
-        live_photos = []
         image_exts = {'.jpg', '.jpeg', '.heic', '.heif', '.png'}
         video_exts = {'.mov', '.mp4'}
 
-        for stem, paths in by_stem.items():
+        # --- Phase 1: Apple ContentIdentifier matching ---
+        # Maps content_id -> (image_paths, video_paths)
+        content_id_images: dict[str, list[str]] = {}
+        content_id_videos: dict[str, list[str]] = {}
+        content_id_matched: set[str] = set()  # paths already matched by ContentIdentifier
+
+        for path in files:
+            ext = Path(path).suffix.lower()
+            if ext not in image_exts and ext not in video_exts:
+                continue
+            cid = self._extract_content_identifier(path)
+            if cid:
+                if ext in image_exts:
+                    content_id_images.setdefault(cid, []).append(path)
+                elif ext in video_exts:
+                    content_id_videos.setdefault(cid, []).append(path)
+
+        live_photos: list[tuple[str, str]] = []
+
+        # Match by ContentIdentifier (most reliable, works across directories)
+        for cid, img_paths in content_id_images.items():
+            vid_paths = content_id_videos.get(cid, [])
+            if vid_paths:
+                for img in img_paths:
+                    live_photos.append((img, vid_paths[0]))
+                    content_id_matched.add(img)
+                    content_id_matched.add(vid_paths[0])
+
+        # --- Phase 2: Filename stem matching (fallback) ---
+        # Group files by base name (without extension)
+        by_stem: dict[str, list[str]] = {}
+        for path in files:
+            if path in content_id_matched:
+                continue
+            p = Path(path)
+            stem = p.stem.lower()
+            key = stem if cross_directory else f"{p.parent}||{stem}"
+            by_stem.setdefault(key, []).append(path)
+
+        for _key, paths in by_stem.items():
             if len(paths) < 2:
                 continue
 
-            # Find image and video pairs
             images = [p for p in paths if Path(p).suffix.lower() in image_exts]
             videos = [p for p in paths if Path(p).suffix.lower() in video_exts]
 
-            if images and videos:
-                # Check if they're in the same folder and likely taken together
+            if not images or not videos:
+                continue
+
+            if cross_directory:
+                # Cross-directory: match by stem + timestamp proximity (5 sec)
+                for img in images:
+                    img_mtime = Path(img).stat().st_mtime if Path(img).exists() else 0
+                    best_vid = None
+                    best_delta = float('inf')
+                    for vid in videos:
+                        vid_mtime = Path(vid).stat().st_mtime if Path(vid).exists() else 0
+                        delta = abs(img_mtime - vid_mtime)
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_vid = vid
+                    if best_vid and best_delta <= 5.0:
+                        live_photos.append((img, best_vid))
+            else:
+                # Same-directory: original behavior
                 for img in images:
                     img_path = Path(img)
                     for vid in videos:
@@ -680,11 +803,210 @@ class Organizer:
 
         return live_photos
 
+    def _extract_content_identifier(self, file_path: str) -> str | None:
+        """Extract Apple ContentIdentifier from a photo or video.
+
+        Photos store it in XMP metadata (apple-fi:ContentIdentifier).
+        Videos store it in QuickTime metadata (com.apple.quicktime.content.identifier).
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            ContentIdentifier UUID string, or None
+        """
+        ext = Path(file_path).suffix.lower()
+
+        # For images: try XMP metadata
+        if ext in {'.jpg', '.jpeg', '.heic', '.heif', '.png'}:
+            return self._extract_content_id_from_image(file_path)
+
+        # For videos: try QuickTime atom
+        if ext in {'.mov', '.mp4'}:
+            return self._extract_content_id_from_video(file_path)
+
+        return None
+
+    def _extract_content_id_from_image(self, file_path: str) -> str | None:
+        """Extract ContentIdentifier from image XMP data."""
+        try:
+            # Read first 64KB where XMP is typically stored
+            with open(file_path, 'rb') as f:
+                data = f.read(65536)
+
+            # Search for apple-fi:ContentIdentifier in XMP
+            # XMP format: <apple-fi:ContentIdentifier>UUID</apple-fi:ContentIdentifier>
+            marker = b'ContentIdentifier'
+            idx = data.find(marker)
+            if idx == -1:
+                return None
+
+            # Find the value after the tag
+            start = data.find(b'>', idx) + 1
+            if start <= 0:
+                return None
+            end = data.find(b'<', start)
+            if end == -1:
+                return None
+
+            value = data[start:end].decode('ascii', errors='ignore').strip()
+            # ContentIdentifier is typically a UUID (36 chars with dashes)
+            if len(value) >= 32 and len(value) <= 40:
+                return value
+
+        except Exception as e:
+            logger.debug(f"ContentIdentifier extraction failed for {file_path}: {e}")
+
+        return None
+
+    def _extract_content_id_from_video(self, file_path: str) -> str | None:
+        """Extract ContentIdentifier from QuickTime metadata."""
+        try:
+            # Read first 256KB of video for metadata atoms
+            with open(file_path, 'rb') as f:
+                data = f.read(262144)
+
+            # Search for com.apple.quicktime.content.identifier
+            marker = b'com.apple.quicktime.content.identifier'
+            idx = data.find(marker)
+            if idx == -1:
+                # Also check shorter variant
+                marker = b'ContentIdentifier'
+                idx = data.find(marker)
+                if idx == -1:
+                    return None
+
+            # The value follows the key in QuickTime metadata
+            search_start = idx + len(marker)
+            # Look for UUID pattern in the next 100 bytes
+            chunk = data[search_start:search_start + 100]
+            # UUID pattern: 8-4-4-4-12 hex chars with dashes
+            import re
+            match = re.search(rb'([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})', chunk)
+            if match:
+                return match.group(1).decode('ascii')
+
+        except Exception as e:
+            logger.debug(f"ContentIdentifier extraction from video failed for {file_path}: {e}")
+
+        return None
+
+    @staticmethod
+    def detect_motion_photo(file_path: str) -> int | None:
+        """Detect if a JPEG contains an embedded Motion Photo (Samsung/Google).
+
+        Samsung Motion Photos append video data after the JPEG EOI marker (0xFFD9).
+        Google Motion Photos use XMP metadata to indicate the video offset.
+
+        Args:
+            file_path: Path to the JPEG file
+
+        Returns:
+            Byte offset where the video data starts, or None if not a Motion Photo
+        """
+        ext = Path(file_path).suffix.lower()
+        if ext not in {'.jpg', '.jpeg'}:
+            return None
+
+        try:
+            with open(file_path, 'rb') as f:
+                # Check XMP for Motion Photo markers
+                header = f.read(65536)
+
+                # Google Motion Photo: look for GCamera:MotionPhoto in XMP
+                video_offset = None
+                if b'GCamera:MotionPhoto' in header or b'MotionPhoto_Data' in header:
+                    # Try to find the video offset from XMP
+                    # GCamera:MicroVideoOffset gives bytes from end of file
+                    import re
+                    match = re.search(rb'MicroVideoOffset["\s>]+(\d+)', header)
+                    if match:
+                        offset_from_end = int(match.group(1))
+                        file_size = Path(file_path).stat().st_size
+                        video_offset = file_size - offset_from_end
+                    else:
+                        # Samsung style: look for MotionPhoto_Data length
+                        match = re.search(rb'MotionPhoto_Data["\s>]+(\d+)', header)
+                        if match:
+                            # offset_from_end for Samsung
+                            offset_from_end = int(match.group(1))
+                            file_size = Path(file_path).stat().st_size
+                            video_offset = file_size - offset_from_end
+
+                if video_offset and video_offset > 0:
+                    return video_offset
+
+                # Fallback: scan for video signature after JPEG EOI (0xFFD9)
+                f.seek(0)
+                data = f.read()
+
+                # Find JPEG EOI marker (search from byte 2 onwards to skip SOI)
+                eoi_pos = data.find(b'\xff\xd9', 2)
+                if eoi_pos == -1:
+                    return None
+
+                # Check if there's significant data after EOI (video)
+                remaining = len(data) - (eoi_pos + 2)
+                if remaining < 1024:  # Too small to be a video
+                    return None
+
+                # Check for common video signatures after EOI
+                after_eoi = data[eoi_pos + 2:eoi_pos + 32]
+                # ftyp box (MP4/MOV) or Matroska header
+                if b'ftyp' in after_eoi or b'mdat' in after_eoi:
+                    return eoi_pos + 2
+
+                # Samsung sometimes has padding bytes before the video
+                # Scan a bit further for ftyp
+                search_region = data[eoi_pos + 2:eoi_pos + 256]
+                ftyp_idx = search_region.find(b'ftyp')
+                if ftyp_idx >= 4:
+                    # ftyp is typically at offset+4 in an MP4 box
+                    return eoi_pos + 2 + ftyp_idx - 4
+
+        except Exception as e:
+            logger.debug(f"Motion Photo detection failed for {file_path}: {e}")
+
+        return None
+
+    @staticmethod
+    def extract_motion_photo_video(file_path: str, output_path: str | None = None) -> str | None:
+        """Extract the embedded video from a Motion Photo.
+
+        Args:
+            file_path: Path to the Motion Photo JPEG
+            output_path: Optional output path. Defaults to same name with .mp4 extension.
+
+        Returns:
+            Path to the extracted video file, or None on failure
+        """
+        video_offset = Organizer.detect_motion_photo(file_path)
+        if video_offset is None:
+            return None
+
+        if output_path is None:
+            output_path = str(Path(file_path).with_suffix('.mp4'))
+
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(video_offset)
+                video_data = f.read()
+
+            with open(output_path, 'wb') as f:
+                f.write(video_data)
+
+            logger.info(f"Extracted Motion Photo video: {output_path} ({len(video_data)} bytes)")
+            return output_path
+
+        except Exception as e:
+            logger.error(f"Failed to extract Motion Photo video from {file_path}: {e}")
+            return None
+
     def generate_folder_path(
         self,
         date: datetime,
-        location: Optional[str] = None,
-        event_name: Optional[str] = None
+        location: str | None = None,
+        event_name: str | None = None
     ) -> str:
         """Generate the destination folder path based on settings.
 
@@ -723,7 +1045,7 @@ class Organizer:
         self,
         original_path: str,
         date: datetime,
-        location: Optional[str] = None,
+        location: str | None = None,
         sequence: int = 1
     ) -> str:
         """Generate new filename based on settings.
@@ -770,7 +1092,7 @@ class Organizer:
         self,
         source_dir: str,
         dest_dir: str,
-        file_types: Optional[list[str]] = None
+        file_types: list[str] | None = None
     ) -> OrganizePreview:
         """Preview organization without making changes.
 
@@ -832,6 +1154,7 @@ class Organizer:
 
         # Detect bursts
         burst_map: dict[str, int] = {}  # file_path -> burst_group_id
+        burst_best: set[str] = set()  # paths of best photos in each burst
         if self.settings.burst_handling != BurstHandling.KEEP_ALL:
             dated_files = [(p, d) for p, d, s in files_with_dates if d != datetime.min]
             bursts = self.detect_bursts(dated_files)
@@ -840,16 +1163,24 @@ class Organizer:
                 for path in burst_files:
                     burst_map[path] = group_id
 
+                # Quality-based best selection for KEEP_BEST
+                if self.settings.burst_handling == BurstHandling.KEEP_BEST:
+                    best_path = self._select_best_burst_photo(burst_files)
+                    if best_path:
+                        burst_best.add(best_path)
+
         # Detect live photos
         live_photo_videos: set[str] = set()  # video paths that are part of Live Photos
         live_photo_images: set[str] = set()  # image paths that are part of Live Photos
-        if self.settings.live_photo_handling != LivePhotoHandling.KEEP_TOGETHER:
-            all_paths = [p for p, d, s in files_with_dates]
-            live_photos = self.detect_live_photos(all_paths)
-            preview.live_photos_detected = len(live_photos)
-            for img_path, vid_path in live_photos:
-                live_photo_images.add(img_path)
-                live_photo_videos.add(vid_path)
+        all_paths = [p for p, d, s in files_with_dates]
+        live_photos = self.detect_live_photos(
+            all_paths,
+            cross_directory=self.settings.live_photo_cross_directory,
+        )
+        preview.live_photos_detected = len(live_photos)
+        for img_path, vid_path in live_photos:
+            live_photo_images.add(img_path)
+            live_photo_videos.add(vid_path)
 
         # Process each file
         folder_sequences: dict[str, int] = {}
@@ -862,19 +1193,62 @@ class Organizer:
             thumbnail_path = None
 
             is_image = Path(file_path).suffix.lower() in self.IMAGE_FILE_TYPES
+            is_video = Path(file_path).suffix.lower() in self.VIDEO_FILE_TYPES
+
             if is_image:
                 if self.settings.generate_thumbnails:
                     thumbnail_path = self._generate_thumbnail(file_path)
 
-                if self.settings.run_object_detection and self._object_detector:
+                # First, try to classify as a document
+                if self.settings.run_document_classification and self._ocr_engine:
+                    ocr_result = self._ocr_engine.extract_text(file_path)
+                    logger.info(f"File: {file_path}, OCR Result: {ocr_result}, Full Text Length: {len(ocr_result.full_text) if ocr_result else 'N/A'}")
+                    if ocr_result and len(ocr_result.full_text) > 100:  # Heuristic for being a document
+                        is_document = True
+                        logger.debug(f"File: {file_path} classified as document. is_document: {is_document}")
+
+                # Auto-OCR for screenshots (even if document classification is off)
+                if not is_document and self.is_screenshot(file_path):
+                    if self._ocr_engine is None:
+                        try:
+                            self._ocr_engine = OCREngine(self.db)
+                            self._ocr_engine.load_model()
+                        except Exception:
+                            pass
+                    if self._ocr_engine:
+                        try:
+                            file_record = self.db.get_file_by_path_any(file_path)
+                            if file_record:
+                                self._ocr_engine.analyze_file(file_record)
+                        except Exception as e:
+                            logger.debug(f"Screenshot OCR failed for {file_path}: {e}")
+
+                # If it's not a document (or document classification was not enabled), then run object detection
+                if not is_document and self.settings.run_object_detection and self._object_detector:
                     obj_result = self._object_detector.detect_objects(file_path)
                     if obj_result:
                         ai_tags = obj_result.unique_labels
+                        logger.debug(f"File: {file_path} object detection tags: {ai_tags}")
 
-                if self.settings.run_document_classification and self._ocr_engine:
-                    ocr_result = self._ocr_engine.extract_text(file_path)
-                    if ocr_result and len(ocr_result.full_text) > 100: # Heuristic for being a document
-                        is_document = True
+            if is_video:
+                frame_path = None
+                try:
+                    frame_path = self._extract_video_frame_image(file_path)
+                    if frame_path:
+                        if self.settings.generate_thumbnails:
+                            thumbnail_path = self._generate_thumbnail(frame_path)
+                        if self.settings.run_object_detection and self._object_detector:
+                            obj_result = self._object_detector.detect_objects(frame_path)
+                            if obj_result:
+                                ai_tags = obj_result.unique_labels
+                finally:
+                    if (
+                        frame_path
+                        and os.path.exists(frame_path)
+                        and Path(frame_path).name.startswith("duplicleaner_vid_")
+                    ):
+                        with contextlib.suppress(OSError):
+                            os.remove(frame_path)
 
             # Handle undated files
             if date == datetime.min:
@@ -905,21 +1279,24 @@ class Organizer:
                 folder = self.generate_folder_path(date, location, event_name)
 
             # Check for screenshots
-            if self.settings.screenshot_handling == ScreenshotHandling.SEPARATE:
-                if self.is_screenshot(file_path):
-                    folder = "Screenshots/" + folder
+            if self.settings.screenshot_handling == ScreenshotHandling.SEPARATE and self.is_screenshot(file_path):
+                folder = "Screenshots/" + folder
 
             # Handle burst photos
             burst_group = burst_map.get(file_path)
             if burst_group is not None:
-                if self.settings.burst_handling == BurstHandling.SUBFOLDER:
+                if self.settings.burst_handling == BurstHandling.KEEP_BEST:
+                    if file_path not in burst_best:
+                        # Skip non-best burst photos
+                        preview.files_skipped = getattr(preview, 'files_skipped', 0) + 1
+                        continue
+                elif self.settings.burst_handling == BurstHandling.SUBFOLDER:
                     folder = f"{folder}/Burst_{burst_group:03d}"
 
             # Handle Live Photo videos
             is_live_photo = file_path in live_photo_videos or file_path in live_photo_images
-            if file_path in live_photo_videos:
-                if self.settings.live_photo_handling == LivePhotoHandling.VIDEO_SUBFOLDER:
-                    folder = f"{folder}/LivePhoto_Videos"
+            if file_path in live_photo_videos and self.settings.live_photo_handling == LivePhotoHandling.VIDEO_SUBFOLDER:
+                folder = f"{folder}/LivePhoto_Videos"
 
             # Generate sequence number
             if folder not in folder_sequences:
@@ -966,8 +1343,8 @@ class Organizer:
         self,
         source_dir: str,
         dest_dir: str,
-        file_types: Optional[list[str]] = None,
-        preview: Optional[OrganizePreview] = None
+        file_types: list[str] | None = None,
+        preview: OrganizePreview | None = None
     ) -> list[OrganizeResult]:
         """Execute the organization.
 
@@ -991,7 +1368,8 @@ class Organizer:
         self._update_progress()
 
         results = []
-        dest_path = Path(dest_dir)
+        Path(dest_dir)
+        drives = self.db.get_all_drives()
 
         for i, change in enumerate(preview.changes):
             if self._cancel_requested:
@@ -1061,6 +1439,24 @@ class Organizer:
 
                 # After successful move/copy, save AI data to the database
                 new_file_record = self.db.get_file_by_path_any(str(dest_file))
+                if not new_file_record:
+                    drive_id = self._infer_drive_id_for_path(str(dest_file), drives)
+                    if drive_id:
+                        stat_info = dest_file.stat()
+                        mime_type, _ = mimetypes.guess_type(dest_file.name)
+                        record = FileRecord(
+                            drive_id=drive_id,
+                            path=str(dest_file),
+                            filename=dest_file.name,
+                            size=stat_info.st_size,
+                            created=datetime.fromtimestamp(stat_info.st_ctime),
+                            modified=datetime.fromtimestamp(stat_info.st_mtime),
+                            file_type=dest_file.suffix.lower() or None,
+                            mime_type=mime_type,
+                            scan_date=datetime.now(),
+                        )
+                        file_id = self.db.add_file(record)
+                        new_file_record = self.db.get_file(file_id)
                 if new_file_record and new_file_record.id:
                     file_id = new_file_record.id
                     # Save scene analysis (tags)
@@ -1078,9 +1474,8 @@ class Organizer:
                         from duplicleaner.db.models import OCRResult
                         ocr_result = OCRResult(
                             file_id=file_id,
-                            is_document=True,
                             extracted_text="",  # We only have the flag for now
-                            analyzed_at=datetime.now()
+                            created_at=datetime.now()
                         )
                         self.db.add_ocr_result(ocr_result)
 
@@ -1143,8 +1538,23 @@ class Organizer:
 
         return results
 
+    @staticmethod
+    def _infer_drive_id_for_path(path: str, drives: list[Drive]) -> str | None:
+        """Infer drive ID by longest matching drive path prefix."""
+        if not drives:
+            return None
+        normalized = os.path.normcase(os.path.normpath(path))
+        best_id = None
+        best_len = -1
+        for drive in drives:
+            drive_path = os.path.normcase(os.path.normpath(drive.path))
+            if normalized.startswith(drive_path) and len(drive_path) > best_len:
+                best_id = drive.id
+                best_len = len(drive_path)
+        return best_id
 
-def get_exif_date(file_path: str) -> Optional[datetime]:
+
+def get_exif_date(file_path: str) -> datetime | None:
     """Convenience function to extract EXIF date from a file.
 
     Args:
