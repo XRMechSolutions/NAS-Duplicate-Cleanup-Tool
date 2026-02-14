@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import datetime
 import mimetypes
 import os
 import sys
+from datetime import datetime
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -15,14 +15,13 @@ LOG_DIR = ROOT / ".test_artifacts" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("DUPLICLEANER_LOG_DIR", str(LOG_DIR))
 
-import duplicleaner.db.database as database_module
-import duplicleaner.utils.config as config_module
+import pytest  # noqa: E402
 
-import pytest
-
-from duplicleaner.db.database import Database
-from duplicleaner.db.models import Drive, FileRecord
-from tests.fixtures.fs_builder import FixturePaths, build_test_tree
+import duplicleaner.db.database as database_module  # noqa: E402
+import duplicleaner.utils.config as config_module  # noqa: E402
+from duplicleaner.db.database import Database  # noqa: E402
+from duplicleaner.db.models import Drive, FileRecord  # noqa: E402
+from tests.fixtures.fs_builder import FixturePaths, build_test_tree  # noqa: E402
 
 
 @pytest.fixture

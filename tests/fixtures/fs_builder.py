@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import os
 import random
 import shutil
 import stat
-from typing import Dict, List
+from dataclasses import dataclass
+from pathlib import Path
 
 from PIL import Image
 
@@ -14,8 +13,8 @@ from PIL import Image
 @dataclass(frozen=True)
 class FixturePaths:
     root: Path
-    files: Dict[str, Path]
-    groups: Dict[str, List[Path]]
+    files: dict[str, Path]
+    groups: dict[str, list[Path]]
 
 
 def build_test_tree(
@@ -42,8 +41,8 @@ def build_test_tree(
     rng = random.Random(seed)
     root.mkdir(parents=True, exist_ok=True)
 
-    files: Dict[str, Path] = {}
-    groups: Dict[str, List[Path]] = {}
+    files: dict[str, Path] = {}
+    groups: dict[str, list[Path]] = {}
 
     # Base directories
     a_dir = root / "alpha"

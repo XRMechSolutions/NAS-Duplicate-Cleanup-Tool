@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from duplicleaner.ai.quality import QualityScorer, CV2_AVAILABLE
-from duplicleaner.ai.ocr import OCREngine, EASYOCR_AVAILABLE
+from duplicleaner.ai.ocr import EASYOCR_AVAILABLE, OCREngine
+from duplicleaner.ai.quality import CV2_AVAILABLE, QualityScorer
 
 
 def test_quality_availability_flag(test_db) -> None:

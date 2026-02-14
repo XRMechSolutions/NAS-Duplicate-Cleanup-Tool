@@ -1,23 +1,20 @@
 """Tests for the redundancy module."""
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
-
-from duplicleaner.drives.redundancy import (
-    RedundancyChecker,
-    RedundancyReport,
-    AtRiskGroup,
-    HashGroup,
-    BackupPlanItem,
-    ExclusionCandidate,
-    ProjectDetection,
-)
 from duplicleaner.db.models import Drive, FileRecord
 from duplicleaner.drives.manager import DriveManager, DriveStatus
+from duplicleaner.drives.redundancy import (
+    AtRiskGroup,
+    BackupPlanItem,
+    ExclusionCandidate,
+    HashGroup,
+    ProjectDetection,
+    RedundancyChecker,
+    RedundancyReport,
+)
 
 
 class TestHashGroup:

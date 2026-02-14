@@ -3,8 +3,8 @@
 Run with: python -m duplicleaner
 """
 
-import sys
 import argparse
+import sys
 
 from duplicleaner import __version__
 
@@ -95,6 +95,23 @@ def parse_args() -> argparse.Namespace:
     search_parser.add_argument("query", help="Search query")
     search_parser.add_argument("--limit", type=int, default=20, help="Max results")
 
+    # Summarize subcommand
+    summarize_parser = subparsers.add_parser("summarize", help="Generate AI summaries for files in a directory")
+    summarize_parser.add_argument("--directory", required=True, help="Directory path to summarize")
+    summarize_parser.add_argument("--provider", choices=["local", "lmstudio", "openai", "anthropic", "google"], help="LLM provider to use")
+    summarize_parser.add_argument("--model", help="Model name to use (overrides config default)")
+    summarize_parser.add_argument("--limit", type=int, default=500, help="Maximum number of files to process")
+    summarize_parser.add_argument("--file-types", help="Comma-separated list of file extensions (e.g., .jpg,.pdf)")
+    summarize_parser.add_argument("--batch", action="store_true", help="Use intelligent batch processing (groups by file type)")
+
+    # Recover subcommand
+    recover_parser = subparsers.add_parser("recover", help="Recover corrupt JPEG files")
+    recover_parser.add_argument("--directory", required=True, help="Directory containing corrupt JPEGs")
+    recover_parser.add_argument("--output", help="Output directory for recovered files (default: <directory>/recovered)")
+    recover_parser.add_argument("--recursive", action="store_true", help="Scan subdirectories recursively")
+    recover_parser.add_argument("--no-preserve", action="store_true", help="Replace originals with recovered versions")
+    recover_parser.add_argument("--quality", type=int, default=95, help="JPEG quality for recovered files (1-100)")
+
     return parser.parse_args()
 
 
@@ -111,6 +128,7 @@ def main() -> int:
 
     # Set up logging
     import logging
+
     from duplicleaner.utils.logging import setup_logging
 
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -145,7 +163,7 @@ def run_cli_command(args: argparse.Namespace) -> int:
 
     if args.command == "organize":
         logger.info(f"Organizing photos from {args.source}")
-        from duplicleaner.core.organizer import Organizer, OrganizeSettings, DateFormat
+        from duplicleaner.core.organizer import DateFormat, Organizer, OrganizeSettings
 
         settings = OrganizeSettings()
         settings.include_location = bool(args.by_location)
@@ -177,9 +195,9 @@ def run_cli_command(args: argparse.Namespace) -> int:
 
     elif args.command == "analyze":
         logger.info("Running AI analysis")
+        from duplicleaner.core.analysis_runner import AnalysisOptions, AnalysisRunner
         from duplicleaner.db.database import get_database
         from duplicleaner.utils.config import get_config
-        from duplicleaner.core.analysis_runner import AnalysisRunner, AnalysisOptions
 
         config = get_config()
         db = get_database()
@@ -234,10 +252,11 @@ def run_cli_command(args: argparse.Namespace) -> int:
     elif args.command == "faces":
         if args.faces_command == "train":
             logger.info(f"Training face recognition from {args.input}")
+            from pathlib import Path
+
+            from duplicleaner.ai.faces import FaceAnalyzer
             from duplicleaner.db.database import get_database
             from duplicleaner.db.models import Person
-            from duplicleaner.ai.faces import FaceAnalyzer
-            from pathlib import Path
 
             db = get_database()
             analyzer = FaceAnalyzer(db)
@@ -285,8 +304,8 @@ def run_cli_command(args: argparse.Namespace) -> int:
 
     elif args.command == "search":
         logger.info(f"Searching for: {args.query}")
-        from duplicleaner.db.database import get_database
         from duplicleaner.ai.scenes import SceneClassifier
+        from duplicleaner.db.database import get_database
 
         db = get_database()
         results = []
@@ -309,8 +328,8 @@ def run_cli_command(args: argparse.Namespace) -> int:
 
     elif args.command == "hash":
         logger.info("Hashing files")
-        from duplicleaner.db.database import get_database
         from duplicleaner.core.hasher import Hasher
+        from duplicleaner.db.database import get_database
 
         db = get_database()
         hasher = Hasher(db)
@@ -319,6 +338,181 @@ def run_cli_command(args: argparse.Namespace) -> int:
             f"Hashing complete: hashed {result.files_hashed}, skipped {result.files_skipped}, "
             f"quick dupes {result.duplicate_candidates}, exact dupes {result.exact_duplicates}, errors {result.errors}"
         )
+        return 0
+
+    elif args.command == "summarize":
+        logger.info(f"Generating summaries for files in: {args.directory}")
+        import os
+
+        from duplicleaner.db.database import get_database
+        from duplicleaner.utils.config import get_config
+
+        if not os.path.exists(args.directory):
+            print(f"Error: Directory not found: {args.directory}")
+            return 1
+
+        db = get_database()
+        config = get_config()
+
+        original_provider = config.ai.summary_provider
+        if args.provider:
+            config.ai.summary_provider = args.provider
+
+        if args.model:
+            if args.provider == "lmstudio":
+                config.ai.summary_model_lmstudio = args.model
+            elif args.provider == "openai":
+                config.ai.summary_model_openai = args.model
+            elif args.provider == "anthropic":
+                config.ai.summary_model_anthropic = args.model
+            elif args.provider == "local":
+                config.ai.summary_model_local = args.model
+
+        file_types_set = None
+        if args.file_types:
+            file_types_list = [ext.strip() if ext.startswith(".") else f".{ext.strip()}"
+                              for ext in args.file_types.split(",")]
+            file_types_set = set(file_types_list)
+
+        # Use batch processing mode if --batch flag is set
+        if args.batch:
+            from duplicleaner.ai.content_summarizer import ContentSummarizer
+
+            summarizer = ContentSummarizer(db)
+
+            print(f"Starting intelligent batch summarization for: {args.directory}")
+            print(f"Provider: {config.ai.summary_provider}")
+            if args.model:
+                print(f"Model: {args.model}")
+            print("-" * 60)
+
+            progress = summarizer.summarize_directory_batch(
+                directory=args.directory,
+                file_types=file_types_set,
+                limit=args.limit,
+            )
+
+            print(f"\n{'='*60}")
+            print("Batch Summarization Complete!")
+            print(f"{'='*60}")
+            print("\nFile Type Breakdown:")
+            print(f"  Text files:      {progress.text_files}")
+            print(f"  Image files:     {progress.image_files}")
+            print(f"  Visual docs:     {progress.visual_doc_files}")
+            print(f"  Video files:     {progress.video_files}")
+            print(f"  Audio files:     {progress.audio_files}")
+            print(f"  Skipped files:   {progress.skipped_files}")
+            print("\nResults:")
+            print(f"  Successful:      {progress.successful}")
+            print(f"  Failed:          {progress.failed}")
+            print(f"  Total processed: {progress.processed_files}")
+
+        else:
+            # Original single-file-at-a-time mode
+            from duplicleaner.ai.summaries import SummaryEngine
+
+            files = db.get_files_needing_summary_in_directory(
+                args.directory,
+                limit=args.limit,
+                file_types=list(file_types_set) if file_types_set else None
+            )
+
+            if not files:
+                print(f"No files found in {args.directory} that need summaries.")
+                return 0
+
+            print(f"Found {len(files)} files to summarize using {config.ai.summary_provider} provider")
+            if args.model:
+                print(f"Using model: {args.model}")
+
+            engine = SummaryEngine(db)
+            if not engine.is_available():
+                print(f"Error: Summary provider '{config.ai.summary_provider}' is not available.")
+                print("Make sure the provider is running (LMStudio/Ollama) or API keys are configured.")
+                return 1
+
+            generated = 0
+            failed = 0
+            for i, file_record in enumerate(files, 1):
+                print(f"[{i}/{len(files)}] Processing: {os.path.basename(file_record.path)}", end="")
+                try:
+                    summary = engine.analyze_file(file_record)
+                    if summary:
+                        generated += 1
+                        print(" - Success")
+                    else:
+                        failed += 1
+                        print(" - Failed")
+                except Exception as exc:
+                    failed += 1
+                    print(f" - Error: {exc}")
+
+            print("\nSummary generation complete!")
+            print(f"  Generated: {generated}")
+            print(f"  Failed: {failed}")
+            print(f"  Total: {len(files)}")
+
+        if args.provider:
+            config.ai.summary_provider = original_provider
+
+        return 0
+
+    elif args.command == "recover":
+        logger.info(f"Recovering corrupt JPEGs in: {args.directory}")
+        import os
+
+        from duplicleaner.utils.jpeg_recovery import JPEGRecovery
+
+        if not os.path.exists(args.directory):
+            print(f"Error: Directory not found: {args.directory}")
+            return 1
+
+        # Determine output directory
+        output_dir = args.output if args.output else os.path.join(args.directory, "recovered")
+
+        # Create recovery instance
+        recovery = JPEGRecovery(
+            recovery_dir=output_dir,
+            preserve_originals=not args.no_preserve,
+            quality=args.quality,
+        )
+
+        print(f"Scanning: {args.directory}")
+        print(f"Output: {output_dir}")
+        print(f"Recursive: {args.recursive}")
+        print(f"Preserve originals: {not args.no_preserve}")
+        print(f"Quality: {args.quality}")
+        print("-" * 60)
+
+        # Run recovery
+        stats = recovery.recover_directory(
+            directory=args.directory,
+            recursive=args.recursive,
+        )
+
+        if 'error' in stats:
+            print(f"Error: {stats['error']}")
+            return 1
+
+        print("\nRecovery Complete!")
+        print(f"  Total files scanned: {stats['total_files']}")
+        print(f"  Corrupt files found: {stats['corrupt_found']}")
+        print(f"  Successfully recovered: {stats['recovered']}")
+        print(f"  Failed to recover: {stats['failed']}")
+        print(f"  Clean files (no action): {stats['not_corrupt']}")
+
+        if stats['recovered'] > 0:
+            print(f"\nRecovered files saved to: {output_dir}")
+            print("\nYou can now run face analysis on the recovered files:")
+            print("  python -m duplicleaner analyze --faces")
+
+        if stats['failed'] > 0:
+            print(f"\nWarning: {stats['failed']} files could not be recovered.")
+            print("These may be too severely corrupted. Consider:")
+            print("  1. Using commercial recovery tools (Stellar Photo Repair)")
+            print("  2. Checking original backups")
+            print("  3. Contacting data recovery services")
+
         return 0
 
     else:

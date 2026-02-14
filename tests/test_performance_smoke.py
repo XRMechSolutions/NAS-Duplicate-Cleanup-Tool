@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import pytest
 import time
+
+import pytest
 
 from duplicleaner.core.scanner import ScanMode, Scanner
 from duplicleaner.db.models import Drive

@@ -2,23 +2,22 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
+from duplicleaner.db.models import Drive
 from duplicleaner.drives.manager import (
+    DriveInfo,
     DriveManager,
     DriveStatus,
-    DriveInfo,
     SpaceInfo,
+    _format_bytes,
+    get_unc_parts,
     is_unc_path,
     normalize_path,
-    get_unc_parts,
-    _format_bytes,
 )
-from duplicleaner.db.models import Drive
 
 
 class TestSpaceInfo:

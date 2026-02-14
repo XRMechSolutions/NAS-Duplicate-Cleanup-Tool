@@ -8,9 +8,7 @@ from pathlib import Path
 from duplicleaner.core.organizer import Organizer
 from duplicleaner.core.resolver import ResolutionStrategy, Resolver
 from duplicleaner.db.models import MatchType
-
 from tests.conftest import make_file_record
-
 
 SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
 

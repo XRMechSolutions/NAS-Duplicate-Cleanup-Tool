@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,9 +18,9 @@ class MockSearchItem:
     file_id: int
     file_path: str
     source: str
-    similarity: Optional[float] = None
-    categories: Optional[dict[str, float]] = None
-    file: Optional[FileRecord] = None
+    similarity: float | None = None
+    categories: dict[str, float] | None = None
+    file: FileRecord | None = None
 
 
 class TestSearchItemDataclass:
@@ -114,7 +112,7 @@ class TestSearchPanelHelpers:
 
     def test_format_categories(self):
         """Test category formatting."""
-        def format_categories(categories: Optional[dict[str, float]]) -> str:
+        def format_categories(categories: dict[str, float] | None) -> str:
             if not categories:
                 return ""
             pairs = sorted(categories.items(), key=lambda x: x[1], reverse=True)
@@ -283,8 +281,8 @@ class TestSearchFilters:
         """Test date range filtering."""
         def passes_date_filter(
             file_record: FileRecord,
-            date_from: Optional[datetime],
-            date_to: Optional[datetime],
+            date_from: datetime | None,
+            date_to: datetime | None,
         ) -> bool:
             if not date_from and not date_to:
                 return True
@@ -293,9 +291,7 @@ class TestSearchFilters:
                 return False
             if date_from and file_date < date_from:
                 return False
-            if date_to and file_date > date_to:
-                return False
-            return True
+            return not (date_to and file_date > date_to)
 
         file1 = FileRecord(
             id=1, drive_id="D1", path="/a.jpg", filename="a.jpg",

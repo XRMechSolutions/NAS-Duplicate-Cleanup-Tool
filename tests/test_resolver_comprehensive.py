@@ -5,28 +5,19 @@ edge cases, and scenarios that could cause data loss if handled incorrectly.
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
-import os
-
-import pytest
 
 from duplicleaner.core.resolver import (
-    Resolver,
-    Resolution,
-    ResolutionPreview,
     ResolutionStrategy,
+    Resolver,
     get_strategy_description,
 )
 from duplicleaner.db.models import (
-    FileRecord,
-    DuplicateGroup,
-    DuplicateMember,
-    MatchType,
     GroupStatus,
-    FileMetadata,
+    MatchType,
 )
-
 from tests.conftest import make_file_record
 
 
@@ -47,10 +38,7 @@ def _create_duplicate_group(test_db, test_drive, files_data: list[dict], tmp_pat
     file_ids = []
     for data in files_data:
         subdir = data.get('subdir', '')
-        if subdir:
-            path = tmp_path / subdir / data['name']
-        else:
-            path = tmp_path / data['name']
+        path = tmp_path / subdir / data['name'] if subdir else tmp_path / data['name']
 
         _make_file(path, data['size'], data['mtime'])
         record = make_file_record(path, test_drive.id)

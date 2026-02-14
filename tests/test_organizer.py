@@ -7,8 +7,8 @@ from duplicleaner.core.organizer import (
     BurstHandling,
     DateFormat,
     LivePhotoHandling,
-    OrganizeSettings,
     Organizer,
+    OrganizeSettings,
 )
 
 
@@ -128,7 +128,6 @@ def test_detect_live_photos_different_folders(tmp_path: Path) -> None:
 
 def test_preview_with_burst_subfolder(tmp_path: Path) -> None:
     """Test that burst photos are organized into subfolders when enabled."""
-    import struct
 
     # Create source directory with burst-like photos
     source = tmp_path / "source"
@@ -150,10 +149,9 @@ def test_preview_with_burst_subfolder(tmp_path: Path) -> None:
     organizer = Organizer(settings=settings)
 
     # Mock extract_date to return burst-like timestamps
-    original_extract = organizer.extract_date
     call_count = [0]
 
-    def mock_extract(path):
+    def mock_extract(_path):
         idx = call_count[0]
         call_count[0] += 1
         # First 3 files are within 2 seconds (burst), 4th is separate
@@ -194,7 +192,7 @@ def test_preview_with_live_photo_video_subfolder(tmp_path: Path) -> None:
     organizer = Organizer(settings=settings)
 
     # Mock extract_date
-    organizer.extract_date = lambda path: (datetime(2024, 1, 15), "file")
+    organizer.extract_date = lambda _path: (datetime(2024, 1, 15), "file")
 
     preview = organizer.preview(str(source), str(dest))
 

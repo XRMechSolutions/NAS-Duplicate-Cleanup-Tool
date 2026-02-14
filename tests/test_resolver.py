@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
-import os
 
 from duplicleaner.core.resolver import ResolutionStrategy, Resolver
 from duplicleaner.db.models import MatchType
-
 from tests.conftest import make_file_record
 
 

@@ -7,23 +7,22 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
-import sqlite3
+
 import pytest
 
+from duplicleaner.core.resolver import Resolver
 from duplicleaner.db.database import Database
 from duplicleaner.db.models import (
-    Drive,
-    FileRecord,
-    FileMetadata,
-    DuplicateGroup,
-    MatchType,
-    GroupStatus,
     ActionLogEntry,
     ActionType,
+    Drive,
     Face,
+    FileMetadata,
+    FileRecord,
+    GroupStatus,
+    MatchType,
     Person,
 )
-from duplicleaner.core.resolver import Resolver
 
 
 class TestDatabaseFileOperations:
@@ -146,8 +145,8 @@ class TestDatabaseFileOperations:
         deleted_count = test_db.mark_files_deleted_before_scan(test_drive.id, scan_start)
 
         assert deleted_count == 1
-        assert test_db.get_file(old_id).is_deleted == True
-        assert test_db.get_file(recent_id).is_deleted == False
+        assert test_db.get_file(old_id).is_deleted
+        assert not test_db.get_file(recent_id).is_deleted
 
     def test_deleted_files_excluded_from_queries(self, test_db) -> None:
         """Ensure deleted files are properly excluded from normal queries."""
@@ -272,7 +271,7 @@ class TestDatabaseDuplicateGroups:
             )
             file_ids.append(test_db.add_file(record))
 
-        pending_group = test_db.create_duplicate_group(
+        test_db.create_duplicate_group(
             match_type=MatchType.EXACT,
             similarity=1.0,
             file_ids=file_ids[:2],
@@ -557,6 +556,48 @@ class TestDatabaseActionLog:
         logs = test_db.get_action_log(limit=10)
         assert len(logs) >= 1
         assert logs[0].action_type == ActionType.QUARANTINE
+
+    def test_delete_action_log_before_cutoff(self, test_db) -> None:
+        """Test clearing old action log entries respects cutoff and reversed flag."""
+        old_time = datetime.now() - timedelta(days=120)
+        new_time = datetime.now() - timedelta(days=10)
+
+        old_reversed = ActionLogEntry(
+            action_type=ActionType.MOVE,
+            source_path="/old/reversed.txt",
+            dest_path="/dest/reversed.txt",
+            file_size=10,
+            reversed=True,
+            timestamp=old_time,
+        )
+        old_active = ActionLogEntry(
+            action_type=ActionType.MOVE,
+            source_path="/old/active.txt",
+            dest_path="/dest/active.txt",
+            file_size=10,
+            reversed=False,
+            timestamp=old_time,
+        )
+        new_reversed = ActionLogEntry(
+            action_type=ActionType.MOVE,
+            source_path="/new/reversed.txt",
+            dest_path="/dest/new.txt",
+            file_size=10,
+            reversed=True,
+            timestamp=new_time,
+        )
+
+        test_db.log_action(old_reversed)
+        test_db.log_action(old_active)
+        test_db.log_action(new_reversed)
+
+        deleted = test_db.delete_action_log_before(datetime.now() - timedelta(days=90), only_reversed=True)
+        assert deleted == 1
+
+        remaining = test_db.get_action_log(limit=10)
+        remaining_sources = {entry.source_path for entry in remaining}
+        assert "/old/active.txt" in remaining_sources
+        assert "/new/reversed.txt" in remaining_sources
 
 
 class TestDatabaseConcurrency:

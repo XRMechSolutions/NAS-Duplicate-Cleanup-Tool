@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from duplicleaner.core.organizer import ConflictResolution, OrganizeSettings, Organizer
+from duplicleaner.core.organizer import ConflictResolution, Organizer, OrganizeSettings
 
 
 def test_execute_copy_preserves_source(fs_tree, tmp_path: Path, test_db) -> None:

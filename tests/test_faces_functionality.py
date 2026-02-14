@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime
-from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, patch
 
-import pytest
+import numpy as np
 
 from duplicleaner.db.database import Database
-from duplicleaner.db.models import Person, Pet, Face, PetDetection
+from duplicleaner.db.models import Face, FileMetadata, Person, Pet
 
 
 class TestFindMoreFacesForPerson:
@@ -62,7 +61,7 @@ class TestFindMoreFacesForPerson:
         person1 = Person(name="Person 1", photo_count=1)
         person2 = Person(name="Person 2", photo_count=1)
         person1_id = test_db.add_person(person1)
-        person2_id = test_db.add_person(person2)
+        test_db.add_person(person2)
 
         analyzer = FaceAnalyzer(test_db)
 
@@ -125,35 +124,37 @@ class TestThreadSafeAnalyzerInit:
 
     def test_face_analyzer_single_instance(self) -> None:
         """Test that face_analyzer property returns same instance."""
-        with patch("duplicleaner.ui.faces_panel.dpg"):
-            with patch("duplicleaner.ui.faces_panel.get_database") as mock_db:
-                with patch("duplicleaner.ui.faces_panel.get_config") as mock_config:
-                    mock_db.return_value = MagicMock()
-                    mock_config.return_value = MagicMock()
-                    mock_config.return_value.ai = MagicMock()
-                    mock_config.return_value.ai.face_detection_threshold = 0.5
-                    mock_config.return_value.ai.face_match_threshold = 0.8
-                    mock_config.return_value.ai.face_cluster_threshold = 0.6
+        with (
+            patch("duplicleaner.ui.faces_panel.dpg"),
+            patch("duplicleaner.ui.faces_panel.get_database") as mock_db,
+            patch("duplicleaner.ui.faces_panel.get_config") as mock_config,
+        ):
+            mock_db.return_value = MagicMock()
+            mock_config.return_value = MagicMock()
+            mock_config.return_value.ai = MagicMock()
+            mock_config.return_value.ai.face_detection_threshold = 0.5
+            mock_config.return_value.ai.face_match_threshold = 0.8
+            mock_config.return_value.ai.face_cluster_threshold = 0.6
 
-                    from duplicleaner.ui.faces_panel import FacesPanel
+            from duplicleaner.ui.faces_panel import FacesPanel
 
-                    # Create panel (UI building will be mocked)
-                    panel = MagicMock(spec=FacesPanel)
-                    panel._face_analyzer = None
-                    panel._pet_analyzer = None
-                    panel._analyzer_lock = threading.Lock()
-                    panel.db = MagicMock()
+            # Create panel (UI building will be mocked)
+            panel = MagicMock(spec=FacesPanel)
+            panel._face_analyzer = None
+            panel._pet_analyzer = None
+            panel._analyzer_lock = threading.Lock()
+            panel.db = MagicMock()
 
-                    # Call property getter multiple times
-                    with patch.object(FacesPanel, 'face_analyzer', new_callable=PropertyMock) as mock_prop:
-                        analyzer1 = MagicMock()
-                        mock_prop.return_value = analyzer1
+            # Call property getter multiple times
+            with patch.object(FacesPanel, 'face_analyzer', new_callable=PropertyMock) as mock_prop:
+                analyzer1 = MagicMock()
+                mock_prop.return_value = analyzer1
 
-                        result1 = mock_prop()
-                        result2 = mock_prop()
+                result1 = mock_prop()
+                result2 = mock_prop()
 
-                        # Should return same instance
-                        assert result1 is result2
+                # Should return same instance
+                assert result1 is result2
 
     def test_concurrent_access_creates_single_instance(self) -> None:
         """Test that concurrent access creates only one analyzer instance."""
@@ -164,7 +165,7 @@ class TestThreadSafeAnalyzerInit:
         lock = threading.Lock()
 
         class MockFaceAnalyzer:
-            def __init__(self, db):
+            def __init__(self, _db):
                 with lock:
                     instantiation_count["count"] += 1
 
@@ -201,72 +202,76 @@ class TestFacePanelCallbacks:
 
     def test_find_person_photos_uses_person_id(self) -> None:
         """Test that _find_person_photos passes person_id to analyzer."""
-        with patch("duplicleaner.ui.faces_panel.dpg"):
-            with patch("duplicleaner.ui.faces_panel.get_database") as mock_db:
-                with patch("duplicleaner.ui.faces_panel.get_config") as mock_config:
-                    mock_db_instance = MagicMock()
-                    mock_db.return_value = mock_db_instance
+        with (
+            patch("duplicleaner.ui.faces_panel.dpg"),
+            patch("duplicleaner.ui.faces_panel.get_database") as mock_db,
+            patch("duplicleaner.ui.faces_panel.get_config") as mock_config,
+        ):
+            mock_db_instance = MagicMock()
+            mock_db.return_value = mock_db_instance
 
-                    mock_config_instance = MagicMock()
-                    mock_config.return_value = mock_config_instance
-                    mock_config_instance.ai = MagicMock()
+            mock_config_instance = MagicMock()
+            mock_config.return_value = mock_config_instance
+            mock_config_instance.ai = MagicMock()
 
-                    from duplicleaner.ui.faces_panel import FacesPanel
+            from duplicleaner.ui.faces_panel import FacesPanel
 
-                    # Create a partial mock
-                    panel = MagicMock(spec=FacesPanel)
-                    panel.db = mock_db_instance
-                    panel.on_status_update = None
+            # Create a partial mock
+            panel = MagicMock(spec=FacesPanel)
+            panel.db = mock_db_instance
+            panel.on_status_update = None
 
-                    # Mock the face_analyzer property
-                    mock_analyzer = MagicMock()
-                    mock_analyzer.find_more_faces_for_person.return_value = (5, 3)
-                    panel.face_analyzer = mock_analyzer
+            # Mock the face_analyzer property
+            mock_analyzer = MagicMock()
+            mock_analyzer.find_more_faces_for_person.return_value = (5, 3)
+            panel.face_analyzer = mock_analyzer
 
-                    # Mock person lookup
-                    mock_person = MagicMock()
-                    mock_person.name = "Test Person"
-                    mock_db_instance.get_person.return_value = mock_person
+            # Mock person lookup
+            mock_person = MagicMock()
+            mock_person.name = "Test Person"
+            mock_db_instance.get_person.return_value = mock_person
 
-                    # Call the method
-                    FacesPanel._find_person_photos(panel, person_id=42)
+            # Call the method
+            FacesPanel._find_person_photos(panel, person_id=42)
 
-                    # Verify it called find_more_faces_for_person with correct person_id
-                    mock_analyzer.find_more_faces_for_person.assert_called_once()
-                    call_args = mock_analyzer.find_more_faces_for_person.call_args
-                    assert call_args.kwargs.get("person_id") == 42
+            # Verify it called find_more_faces_for_person with correct person_id
+            mock_analyzer.find_more_faces_for_person.assert_called_once()
+            call_args = mock_analyzer.find_more_faces_for_person.call_args
+            assert call_args.kwargs.get("person_id") == 42
 
     def test_find_pet_photos_uses_pet_id(self) -> None:
         """Test that _find_pet_photos passes pet_id to analyzer."""
-        with patch("duplicleaner.ui.faces_panel.dpg"):
-            with patch("duplicleaner.ui.faces_panel.get_database") as mock_db:
-                with patch("duplicleaner.ui.faces_panel.get_config") as mock_config:
-                    mock_db_instance = MagicMock()
-                    mock_db.return_value = mock_db_instance
+        with (
+            patch("duplicleaner.ui.faces_panel.dpg"),
+            patch("duplicleaner.ui.faces_panel.get_database") as mock_db,
+            patch("duplicleaner.ui.faces_panel.get_config") as mock_config,
+        ):
+            mock_db_instance = MagicMock()
+            mock_db.return_value = mock_db_instance
 
-                    mock_config_instance = MagicMock()
-                    mock_config.return_value = mock_config_instance
-                    mock_config_instance.ai = MagicMock()
+            mock_config_instance = MagicMock()
+            mock_config.return_value = mock_config_instance
+            mock_config_instance.ai = MagicMock()
 
-                    from duplicleaner.ui.faces_panel import FacesPanel
+            from duplicleaner.ui.faces_panel import FacesPanel
 
-                    panel = MagicMock(spec=FacesPanel)
-                    panel.db = mock_db_instance
-                    panel.on_status_update = None
+            panel = MagicMock(spec=FacesPanel)
+            panel.db = mock_db_instance
+            panel.on_status_update = None
 
-                    mock_analyzer = MagicMock()
-                    mock_analyzer.find_more_detections_for_pet.return_value = (3, 2)
-                    panel.pet_analyzer = mock_analyzer
+            mock_analyzer = MagicMock()
+            mock_analyzer.find_more_detections_for_pet.return_value = (3, 2)
+            panel.pet_analyzer = mock_analyzer
 
-                    mock_pet = MagicMock()
-                    mock_pet.name = "Fluffy"
-                    mock_db_instance.get_pet.return_value = mock_pet
+            mock_pet = MagicMock()
+            mock_pet.name = "Fluffy"
+            mock_db_instance.get_pet.return_value = mock_pet
 
-                    FacesPanel._find_pet_photos(panel, pet_id=99)
+            FacesPanel._find_pet_photos(panel, pet_id=99)
 
-                    mock_analyzer.find_more_detections_for_pet.assert_called_once()
-                    call_args = mock_analyzer.find_more_detections_for_pet.call_args
-                    assert call_args.kwargs.get("pet_id") == 99
+            mock_analyzer.find_more_detections_for_pet.assert_called_once()
+            call_args = mock_analyzer.find_more_detections_for_pet.call_args
+            assert call_args.kwargs.get("pet_id") == 99
 
 
 class TestFaceAnalyzerIntegration:
@@ -323,7 +328,7 @@ class TestHiddenPersons:
 
     def test_create_hidden_person_from_cluster(self, test_db: Database) -> None:
         """Test creating a hidden person from face IDs."""
-        from duplicleaner.db.models import FileRecord, Drive
+        from duplicleaner.db.models import Drive, FileRecord
 
         # Create drives and files first (for foreign key constraint)
         drive = Drive(id="test_drive", label="Test", path="C:\\test", total_space=100, free_space=50)
@@ -345,7 +350,7 @@ class TestHiddenPersons:
         # Verify person was created with correct attributes
         person = test_db.get_person(person_id)
         assert person is not None
-        assert person.is_hidden == True
+        assert person.is_hidden
         assert person.name.startswith("Unknown #")
 
         # Verify faces were assigned
@@ -394,7 +399,7 @@ class TestHiddenPersons:
 
         # Verify restored (SQLite returns 0/1 for booleans)
         person = test_db.get_person(person_id)
-        assert person.is_hidden == False or person.is_hidden == 0
+        assert not person.is_hidden or person.is_hidden == 0
 
     def test_get_hidden_person_count(self, test_db: Database) -> None:
         """Test counting hidden persons."""
@@ -412,7 +417,7 @@ class TestDeletePerson:
 
     def test_delete_person_unassigns_faces(self, test_db: Database) -> None:
         """Test that deleting a person unassigns their faces."""
-        from duplicleaner.db.models import FileRecord, Drive
+        from duplicleaner.db.models import Drive, FileRecord
 
         # Create drives and files first (for foreign key constraint)
         drive = Drive(id="test_drive", label="Test", path="C:\\test", total_space=100, free_space=50)
@@ -455,7 +460,7 @@ class TestFaceCountMethods:
 
     def test_get_low_confidence_face_count(self, test_db: Database) -> None:
         """Test counting low confidence faces."""
-        from duplicleaner.db.models import FileRecord, Drive
+        from duplicleaner.db.models import Drive, FileRecord
 
         # Create drives and files first (for foreign key constraint)
         drive = Drive(id="test_drive", label="Test", path="C:\\test", total_space=100, free_space=50)
@@ -519,3 +524,289 @@ class TestCrossAgeClusterLinking:
 
         assert auto_assigned == []
         assert suggestions == []
+
+
+# =============================================================================
+# Intelligent Face Assignment Tests (4.1)
+# =============================================================================
+
+
+def _make_embedding(seed: int = 0) -> bytes:
+    """Create a deterministic 512-dim embedding as bytes."""
+    rng = np.random.RandomState(seed)
+    emb = rng.randn(512).astype(np.float32)
+    emb = emb / np.linalg.norm(emb)
+    return emb.tobytes()
+
+
+def _setup_drive_and_files(db: Database, file_count: int = 2) -> list[int]:
+    """Create a test drive and files, return file IDs."""
+    from duplicleaner.db.models import Drive, FileRecord
+
+    drive = Drive(id="test_drive", label="Test", path="C:\\test", total_space=100, free_space=50)
+    db.add_drive(drive)
+
+    file_ids = []
+    for i in range(1, file_count + 1):
+        fr = FileRecord(
+            drive_id="test_drive",
+            path=f"C:\\test\\img{i}.jpg",
+            filename=f"img{i}.jpg",
+            size=100,
+            file_type=".jpg",
+        )
+        fid = db.add_file(fr)
+        file_ids.append(fid)
+    return file_ids
+
+
+class TestIntelligentFaceAssignment:
+    """Test per-photo conflict detection, age plausibility, and pre-birth guards."""
+
+    def test_conflict_detection_same_person_two_faces(self, test_db: Database) -> None:
+        """Two faces in same file both match person X -- only higher-confidence is assigned."""
+        from duplicleaner.ai.faces import AgeStage, FaceAnalyzer, FaceMatch
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        fid = file_ids[0]
+
+        # Create two faces in the SAME file
+        face1 = Face(file_id=fid, bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50,
+                      embedding=_make_embedding(1), confidence=0.9)
+        face2 = Face(file_id=fid, bbox_x=100, bbox_y=0, bbox_w=50, bbox_h=50,
+                      embedding=_make_embedding(2), confidence=0.9)
+        f1_id = test_db.add_face(face1)
+        f2_id = test_db.add_face(face2)
+        face1.id = f1_id
+        face2.id = f2_id
+
+        person = Person(name="Alice", photo_count=0)
+        person_id = test_db.add_person(person)
+
+        analyzer = FaceAnalyzer(test_db)
+
+        # Build candidates: both faces match Alice, face1 higher similarity
+        match_high = FaceMatch(person_id=person_id, person_name="Alice",
+                               similarity=0.92, age_stage=AgeStage.ADULT)
+        match_low = FaceMatch(person_id=person_id, person_name="Alice",
+                              similarity=0.85, age_stage=AgeStage.ADULT)
+
+        candidates = [
+            (face1, match_high, None),
+            (face2, match_low, None),
+        ]
+
+        assignable, demoted = analyzer._resolve_per_photo_conflicts(candidates)
+
+        assert len(assignable) == 1
+        assert assignable[0][0].id == f1_id
+        assert len(demoted) == 1
+        assert demoted[0][0].id == f2_id
+        assert "Higher-confidence match" in demoted[0][2]
+
+    def test_conflict_detection_three_faces(self, test_db: Database) -> None:
+        """Person A matches face 1 (0.9) and face 2 (0.7), face 1 wins."""
+        from duplicleaner.ai.faces import AgeStage, FaceAnalyzer, FaceMatch
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        fid = file_ids[0]
+
+        face1 = Face(file_id=fid, bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50,
+                      embedding=_make_embedding(1), confidence=0.9)
+        face2 = Face(file_id=fid, bbox_x=100, bbox_y=0, bbox_w=50, bbox_h=50,
+                      embedding=_make_embedding(2), confidence=0.9)
+        face3 = Face(file_id=fid, bbox_x=200, bbox_y=0, bbox_w=50, bbox_h=50,
+                      embedding=_make_embedding(3), confidence=0.9)
+        f1_id = test_db.add_face(face1)
+        f2_id = test_db.add_face(face2)
+        f3_id = test_db.add_face(face3)
+        face1.id, face2.id, face3.id = f1_id, f2_id, f3_id
+
+        person_a = Person(name="PersonA", photo_count=0)
+        person_b = Person(name="PersonB", photo_count=0)
+        pa_id = test_db.add_person(person_a)
+        pb_id = test_db.add_person(person_b)
+
+        analyzer = FaceAnalyzer(test_db)
+
+        candidates = [
+            (face1, FaceMatch(pa_id, "PersonA", 0.9, AgeStage.ADULT), None),
+            (face2, FaceMatch(pa_id, "PersonA", 0.7, AgeStage.ADULT), None),
+            (face3, FaceMatch(pb_id, "PersonB", 0.85, AgeStage.ADULT), None),
+        ]
+
+        assignable, demoted = analyzer._resolve_per_photo_conflicts(candidates)
+
+        assigned_ids = {a[0].id for a in assignable}
+        demoted_ids = {d[0].id for d in demoted}
+
+        # face1 (highest for PersonA) and face3 (PersonB) should be assignable
+        assert f1_id in assigned_ids
+        assert f3_id in assigned_ids
+        # face2 (lower PersonA) demoted
+        assert f2_id in demoted_ids
+
+    def test_age_plausibility_rejects_implausible(self, test_db: Database) -> None:
+        """Person born 2015, photo 2018, face age 40 -> demoted."""
+        from duplicleaner.ai.faces import FaceAnalyzer
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        person = Person(name="Emma", birth_year=2015)
+        test_db.add_person(person)
+
+        face = Face(file_id=file_ids[0], estimated_age=40,
+                     bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50)
+        test_db.add_face(face)
+
+        photo_date = datetime(2018, 6, 15)
+        analyzer = FaceAnalyzer(test_db)
+
+        plausible, reason = analyzer._check_age_plausibility(person, face, photo_date)
+
+        assert not plausible
+        assert reason is not None
+        assert "expected age 3" in reason.lower() or "doesn't match" in reason.lower()
+
+    def test_age_plausibility_allows_plausible(self, test_db: Database) -> None:
+        """Person born 2015, photo 2018, face age 4 -> allowed (within tolerance)."""
+        from duplicleaner.ai.faces import FaceAnalyzer
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        person = Person(name="Emma", birth_year=2015)
+        test_db.add_person(person)
+
+        face = Face(file_id=file_ids[0], estimated_age=4,
+                     bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50)
+        test_db.add_face(face)
+
+        photo_date = datetime(2018, 6, 15)
+        analyzer = FaceAnalyzer(test_db)
+
+        plausible, reason = analyzer._check_age_plausibility(person, face, photo_date)
+
+        assert plausible
+        assert reason is None
+
+    def test_age_plausibility_skipped_no_birth_year(self, test_db: Database) -> None:
+        """No birth_year -> normal assignment (can't validate)."""
+        from duplicleaner.ai.faces import FaceAnalyzer
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        person = Person(name="Unknown")  # no birth_year
+        test_db.add_person(person)
+
+        face = Face(file_id=file_ids[0], estimated_age=40,
+                     bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50)
+        test_db.add_face(face)
+
+        photo_date = datetime(2018, 6, 15)
+        analyzer = FaceAnalyzer(test_db)
+
+        plausible, reason = analyzer._check_age_plausibility(person, face, photo_date)
+
+        assert plausible
+        assert reason is None
+
+    def test_age_plausibility_skipped_no_exif_date(self, test_db: Database) -> None:
+        """No EXIF date -> normal assignment (can't validate)."""
+        from duplicleaner.ai.faces import FaceAnalyzer
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        person = Person(name="Emma", birth_year=2015)
+        test_db.add_person(person)
+
+        face = Face(file_id=file_ids[0], estimated_age=40,
+                     bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50)
+        test_db.add_face(face)
+
+        analyzer = FaceAnalyzer(test_db)
+
+        plausible, reason = analyzer._check_age_plausibility(person, face, None)
+
+        assert plausible
+        assert reason is None
+
+    def test_pre_birth_hard_reject(self, test_db: Database) -> None:
+        """Person born 2015, photo 2012 -> rejected with sibling hint."""
+        from duplicleaner.ai.faces import FaceAnalyzer
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        person = Person(name="Emma", birth_year=2015)
+        test_db.add_person(person)
+
+        face = Face(file_id=file_ids[0], estimated_age=5,
+                     bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50)
+        test_db.add_face(face)
+
+        photo_date = datetime(2012, 3, 10)
+        analyzer = FaceAnalyzer(test_db)
+
+        plausible, reason = analyzer._check_age_plausibility(person, face, photo_date)
+
+        assert not plausible
+        assert "predates" in reason.lower()
+        assert "birth" in reason.lower()
+        assert "sibling" in reason.lower()
+
+    def test_suggestion_includes_reason(self, test_db: Database) -> None:
+        """Demoted suggestions include reason string in rematch output."""
+        from duplicleaner.ai.faces import AgeStage, FaceAnalyzer, FaceMatch
+
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        fid = file_ids[0]
+
+        face1 = Face(file_id=fid, bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50,
+                      embedding=_make_embedding(1), confidence=0.9)
+        face2 = Face(file_id=fid, bbox_x=100, bbox_y=0, bbox_w=50, bbox_h=50,
+                      embedding=_make_embedding(2), confidence=0.9)
+        f1_id = test_db.add_face(face1)
+        f2_id = test_db.add_face(face2)
+        face1.id = f1_id
+        face2.id = f2_id
+
+        person = Person(name="Bob", photo_count=0)
+        pid = test_db.add_person(person)
+
+        analyzer = FaceAnalyzer(test_db)
+
+        # One candidate has age_reason (pre-birth), the other is a duplicate person conflict
+        candidates = [
+            (face1, FaceMatch(pid, "Bob", 0.9, AgeStage.ADULT), None),
+            (face2, FaceMatch(pid, "Bob", 0.6, AgeStage.ADULT),
+             "Photo predates Bob's birth (2015)"),
+        ]
+
+        _assignable, demoted = analyzer._resolve_per_photo_conflicts(candidates)
+
+        # face2 is demoted due to age reason (processed before conflict check)
+        assert len(demoted) == 1
+        assert demoted[0][0].id == f2_id
+        assert "predates" in demoted[0][2].lower()
+
+    def test_get_photo_date_for_face(self, test_db: Database) -> None:
+        """Database helper returns EXIF date for a face."""
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        fid = file_ids[0]
+
+        exif_date = datetime(2020, 7, 4, 14, 30, 0)
+        metadata = FileMetadata(file_id=fid, exif_date=exif_date)
+        test_db.add_file_metadata(metadata)
+
+        face = Face(file_id=fid, bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50)
+        face_id = test_db.add_face(face)
+
+        result = test_db.get_photo_date_for_face(face_id)
+        assert result is not None
+        assert result.year == 2020
+        assert result.month == 7
+
+    def test_get_photo_date_for_face_no_metadata(self, test_db: Database) -> None:
+        """Database helper returns None when no metadata exists."""
+        file_ids = _setup_drive_and_files(test_db, file_count=1)
+        fid = file_ids[0]
+
+        face = Face(file_id=fid, bbox_x=0, bbox_y=0, bbox_w=50, bbox_h=50)
+        face_id = test_db.add_face(face)
+
+        result = test_db.get_photo_date_for_face(face_id)
+        assert result is None

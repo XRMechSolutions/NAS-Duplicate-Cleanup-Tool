@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from duplicleaner.db.models import FileRecord, Face, Person
+from duplicleaner.db.models import Face, FileRecord, Person
 
 
 class TestPersonGalleryDataStructures:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from duplicleaner.db.models import MatchType
-
 from tests.conftest import make_file_record
 
 

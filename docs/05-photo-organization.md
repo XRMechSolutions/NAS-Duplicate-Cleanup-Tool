@@ -104,9 +104,9 @@ Automatically group photos taken around the same time into events.
 
 **Example:**
 ```
-You take 50 photos between 2pm and 4pm → one event
+You take 50 photos between 2pm and 4pm -> one event
 You don't take photos for 6 hours
-You take 30 photos between 10pm and 11pm → separate event
+You take 30 photos between 10pm and 11pm -> separate event
 ```
 
 **Event Naming:**
@@ -187,6 +187,15 @@ iPhone Live Photos are a still image + short video clip:
 **Options:**
 - **Keep together** - Photo and video stay in same folder
 - **Video subfolder** - Move video clips to a "LivePhoto_Videos/" subfolder
+
+## AI Analysis (Optional)
+
+If enabled, the organizer can add lightweight AI analysis during preview:
+- **Object detection**: Adds tags for images (e.g., "dog", "car").
+- **Document classification**: Uses OCR to flag images that look like documents.
+- **Videos**: Extracts a single frame to generate a thumbnail and optional tags.
+
+These tags appear in the preview gallery and are stored with the organized files.
 
 ## Preview and Dry Run
 

@@ -19,11 +19,11 @@ from duplicleaner.core.actions import ActionEngine, ActionStatus
 from duplicleaner.db.database import Database
 from duplicleaner.db.models import (
     Drive,
-    FileRecord,
     DuplicateGroup,
     DuplicateMember,
-    MatchType,
+    FileRecord,
     GroupStatus,
+    MatchType,
 )
 
 
@@ -73,7 +73,7 @@ def populated_db(tmp_path: Path, test_db: Database) -> tuple[Database, list[Path
     group_id = test_db.add_duplicate_group(group)
 
     # Add members
-    for i, record in enumerate(records):
+    for i, _record in enumerate(records):
         # Get the file ID from database
         db_file = test_db.get_file_by_path(str([file1, file2, file3][i]))
         member = DuplicateMember(
@@ -110,6 +110,7 @@ class TestActionEngineIntegration:
 
     def test_trash_removes_file(self, tmp_path: Path, test_db: Database, monkeypatch) -> None:
         """Test that send_to_trash works (with fallback to quarantine if send2trash unavailable)."""
+        _ = monkeypatch
         source = tmp_path / "duplicate.jpg"
         source.write_bytes(b"test data")
         quarantine_dir = tmp_path / "quarantine"

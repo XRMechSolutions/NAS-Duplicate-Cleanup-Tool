@@ -15,8 +15,8 @@ def test_scanner_counts_files(fs_tree, test_db, test_drive) -> None:
 
 def test_scanner_ignores_known_patterns(tmp_path: Path, test_db) -> None:
     # Build a tree with one ignored file
-    from tests.fixtures.fs_builder import build_test_tree
     from duplicleaner.db.models import Drive
+    from tests.fixtures.fs_builder import build_test_tree
 
     fs_tree = build_test_tree(tmp_path / "dataset")
     ignored = fs_tree.root / "Thumbs.db"
@@ -56,7 +56,7 @@ def test_scanner_records_permission_error(tmp_path: Path, test_db, monkeypatch) 
 
     scanner = Scanner(db=test_db)
 
-    def fail_scan(*args, **kwargs):
+    def fail_scan(*_args, **_kwargs):
         raise PermissionError("denied")
 
     monkeypatch.setattr(scanner, "_scan_directory", fail_scan)
@@ -67,8 +67,8 @@ def test_scanner_records_permission_error(tmp_path: Path, test_db, monkeypatch) 
     assert scanner.progress.permission_errors >= 1
 
 def test_scanner_long_path_does_not_crash(tmp_path: Path, test_db) -> None:
-    from tests.fixtures.fs_builder import build_test_tree
     from duplicleaner.db.models import Drive
+    from tests.fixtures.fs_builder import build_test_tree
 
     fs_tree = build_test_tree(tmp_path / "dataset", include_long_paths=True)
     drive = Drive(id="D4", label="LongPath", path=str(fs_tree.root))
@@ -81,8 +81,9 @@ def test_scanner_long_path_does_not_crash(tmp_path: Path, test_db) -> None:
 
 
 def test_scanner_records_path_too_long(tmp_path: Path, test_db, monkeypatch) -> None:
-    from duplicleaner.db.models import Drive
     import os
+
+    from duplicleaner.db.models import Drive
 
     root = tmp_path / "long_root"
     root.mkdir(parents=True, exist_ok=True)
@@ -91,7 +92,7 @@ def test_scanner_records_path_too_long(tmp_path: Path, test_db, monkeypatch) -> 
 
     scanner = Scanner(db=test_db)
 
-    def fail_scandir(*args, **kwargs):
+    def fail_scandir(*_args, **_kwargs):
         raise OSError("name is too long")
 
     monkeypatch.setattr(os, "scandir", fail_scandir)

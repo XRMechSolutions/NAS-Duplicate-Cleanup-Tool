@@ -2,17 +2,17 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, time as dt_time
+from datetime import time as dt_time
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from duplicleaner.core.versioning_service import (
-    VersioningService,
-    TrackedRepoState,
-)
 from duplicleaner.core.versioning import VersionTracker
+from duplicleaner.core.versioning_service import (
+    TrackedRepoState,
+    VersioningService,
+)
 from duplicleaner.utils.config import VersioningSettings
 
 
@@ -245,10 +245,12 @@ class TestVersioningServiceCommitModes:
         service = VersioningService(versioning_settings)
 
         # Mock tracker to be available
-        with patch.object(VersionTracker, 'is_available', return_value=True):
-            with patch.object(VersionTracker, 'init_repository', return_value=True):
-                with patch.object(VersionTracker, 'initial_commit', return_value=False):
-                    service._initialize_repos()
+        with (
+            patch.object(VersionTracker, 'is_available', return_value=True),
+            patch.object(VersionTracker, 'init_repository', return_value=True),
+            patch.object(VersionTracker, 'initial_commit', return_value=False),
+        ):
+            service._initialize_repos()
 
         # Create a file
         (tmp_path / "test.txt").write_text("content")
@@ -259,6 +261,7 @@ class TestVersioningServiceCommitModes:
     def test_commit_interval_mode(self, versioning_settings: VersioningSettings, tmp_path: Path) -> None:
         versioning_settings.auto_commit_mode = "interval"
         versioning_settings.auto_commit_interval_minutes = 1
+        _ = tmp_path
         service = VersioningService(versioning_settings)
 
         tracker = MagicMock()
@@ -347,6 +350,7 @@ class TestVersioningServiceDetectAndCommit:
 
     def test_detect_and_commit_after_debounce(self, versioning_settings: VersioningSettings, tmp_path: Path) -> None:
         service = VersioningService(versioning_settings, debounce_seconds=0)
+        _ = tmp_path
 
         tracker = MagicMock()
         tracker.list_tracked_files.return_value = []

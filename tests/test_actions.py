@@ -83,7 +83,7 @@ def test_move_file_failure_reports_error(tmp_path: Path, test_db, monkeypatch) -
 
     engine = ActionEngine(db=test_db)
 
-    def fail_move(*args, **kwargs):
+    def fail_move(*_args, **_kwargs):
         raise OSError("move failed")
 
     monkeypatch.setattr("duplicleaner.core.actions.shutil.move", fail_move)
