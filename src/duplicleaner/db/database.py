@@ -4,38 +4,44 @@ Handles SQLite database connections, schema initialization,
 and provides methods for common database operations.
 """
 
-import sqlite3
 import json
+import os
+import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Optional
 
-from duplicleaner.utils.logging import get_logger
-from duplicleaner.utils.config import get_config
 from duplicleaner.db.models import (
+    ActionLogEntry,
+    ActionType,
+    AISummary,
+    CelebrityMatch,
     Drive,
-    FileRecord,
-    FileMetadata,
     DuplicateGroup,
     DuplicateMember,
     Face,
-    Person,
-    Pet,
-    PetDetection,
-    PetAgeStage,
-    SceneAnalysis,
-    OCRResult,
-    ActionLogEntry,
-    AISummary,
-    Tag,
+    FamilyGroup,
+    FamilyGroupMember,
+    FileMetadata,
+    FileRecord,
     FileTag,
-    MatchType,
     GroupStatus,
-    ActionType,
+    MatchType,
+    OCRResult,
+    Person,
+    PersonRelationship,
+    Pet,
+    PetAgeStage,
+    PetDetection,
+    SceneAnalysis,
+    Tag,
     TagCategory,
     TagSource,
 )
+from duplicleaner.utils.config import get_config, save_config
+from duplicleaner.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -87,7 +93,7 @@ class Database:
             fallback_dir.mkdir(parents=True, exist_ok=True)
             self.db_path = fallback_dir / "duplicleaner.db"
 
-        self._connection: Optional[sqlite3.Connection] = None
+        self._connection: sqlite3.Connection | None = None
         self._init_database()
 
     def _init_database(self) -> None:
@@ -97,7 +103,7 @@ class Database:
         try:
             with self.connection() as conn:
                 if schema_path.exists():
-                    with open(schema_path, "r", encoding="utf-8") as f:
+                    with open(schema_path, encoding="utf-8") as f:
                         conn.executescript(f.read())
                     logger.info(f"Database initialized at {self.db_path}")
                 else:
@@ -113,7 +119,7 @@ class Database:
             self.db_path = fallback_dir / "duplicleaner.db"
             with self.connection() as conn:
                 if schema_path.exists():
-                    with open(schema_path, "r", encoding="utf-8") as f:
+                    with open(schema_path, encoding="utf-8") as f:
                         conn.executescript(f.read())
                     logger.info(f"Database initialized at {self.db_path}")
                 # Run migrations for fallback path too
@@ -128,9 +134,218 @@ class Database:
         try:
             conn.execute("SELECT is_hidden FROM persons LIMIT 1")
         except sqlite3.OperationalError:
-            # Column doesn't exist, add it
             conn.execute("ALTER TABLE persons ADD COLUMN is_hidden BOOLEAN DEFAULT FALSE")
             logger.info("Migration: Added is_hidden column to persons table")
+
+        # Migration: Add page_number column to faces table (for PDF face detection)
+        try:
+            conn.execute("SELECT page_number FROM faces LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE faces ADD COLUMN page_number INTEGER DEFAULT NULL")
+            logger.info("Migration: Added page_number column to faces table")
+
+        # Migration: Create pdf_extractions table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_extractions (
+                source_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                page_number INTEGER NOT NULL,
+                extracted_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (source_file_id, page_number)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pdf_extractions_source ON pdf_extractions(source_file_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pdf_extractions_extracted ON pdf_extractions(extracted_file_id)")
+
+        # Migration: Create video_frames table for video near-duplicate detection
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS video_frames (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                frame_index INTEGER NOT NULL,
+                timestamp_sec REAL NOT NULL,
+                phash TEXT,
+                dhash TEXT,
+                UNIQUE(file_id, frame_index)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_video_frames_file ON video_frames(file_id)")
+
+        # Migration: Create corrupt_files and recovery_attempts tables
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS corrupt_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                corruption_type TEXT NOT NULL,
+                severity TEXT DEFAULT 'medium',
+                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(file_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_corrupt_files_file ON corrupt_files(file_id)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recovery_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                strategy_used TEXT NOT NULL,
+                success BOOLEAN DEFAULT FALSE,
+                pixel_recovery_pct REAL,
+                recovered_path TEXT,
+                attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recovery_attempts_file ON recovery_attempts(file_id)")
+
+        # Migration: Create temporal_links table for age-progression face tracking
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS temporal_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_id_a INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+                face_id_b INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+                person_id INTEGER REFERENCES persons(id) ON DELETE CASCADE,
+                similarity REAL NOT NULL,
+                temporal_distance_days INTEGER,
+                threshold_used REAL,
+                link_type TEXT DEFAULT 'auto',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(face_id_a, face_id_b)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_temporal_links_person ON temporal_links(person_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_temporal_links_face_a ON temporal_links(face_id_a)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_temporal_links_face_b ON temporal_links(face_id_b)")
+
+        # Migration: Create person_relationships table for family tracking
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS person_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_a_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+                person_b_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+                relationship_type TEXT NOT NULL,
+                confidence TEXT DEFAULT 'confirmed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT,
+                UNIQUE(person_a_id, person_b_id, relationship_type)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_person_rel_a ON person_relationships(person_a_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_person_rel_b ON person_relationships(person_b_id)")
+
+        # Migration: Create family_groups and family_group_members tables
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS family_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS family_group_members (
+                family_group_id INTEGER NOT NULL REFERENCES family_groups(id) ON DELETE CASCADE,
+                person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+                role TEXT,
+                PRIMARY KEY (family_group_id, person_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fgm_group ON family_group_members(family_group_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fgm_person ON family_group_members(person_id)")
+
+        # Migration: Add identification_source column to persons table
+        try:
+            conn.execute("SELECT identification_source FROM persons LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE persons ADD COLUMN identification_source TEXT DEFAULT 'manual'")
+            logger.info("Migration: Added identification_source column to persons table")
+
+        # Migration: Create celebrity_matches table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS celebrity_matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+                person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+                provider TEXT NOT NULL,
+                celebrity_name TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                external_id TEXT,
+                external_urls TEXT,
+                known_for TEXT,
+                status TEXT DEFAULT 'pending',
+                reviewed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(face_id, provider)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_celebrity_matches_face ON celebrity_matches(face_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_celebrity_matches_status ON celebrity_matches(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_celebrity_matches_name ON celebrity_matches(celebrity_name)")
+
+        # Migration: Add pets_mentioned column to ai_summaries and rebuild FTS
+        try:
+            conn.execute("SELECT pets_mentioned FROM ai_summaries LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE ai_summaries ADD COLUMN pets_mentioned TEXT")
+            logger.info("Migration: Added pets_mentioned column to ai_summaries table")
+            # Rebuild FTS table with new column
+            try:
+                conn.execute("DROP TABLE IF EXISTS ai_summaries_fts")
+                conn.execute("DROP TRIGGER IF EXISTS ai_summaries_ai")
+                conn.execute("DROP TRIGGER IF EXISTS ai_summaries_ad")
+                conn.execute("DROP TRIGGER IF EXISTS ai_summaries_au")
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS ai_summaries_fts USING fts5(
+                        summary, people_mentioned, pets_mentioned,
+                        activities, document_summary, key_entities,
+                        content='ai_summaries', content_rowid='file_id'
+                    )
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS ai_summaries_ai AFTER INSERT ON ai_summaries BEGIN
+                        INSERT INTO ai_summaries_fts(rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+                        VALUES (new.file_id, new.summary, new.people_mentioned, new.pets_mentioned, new.activities, new.document_summary, new.key_entities);
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS ai_summaries_ad AFTER DELETE ON ai_summaries BEGIN
+                        INSERT INTO ai_summaries_fts(ai_summaries_fts, rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+                        VALUES ('delete', old.file_id, old.summary, old.people_mentioned, old.pets_mentioned, old.activities, old.document_summary, old.key_entities);
+                    END
+                """)
+                conn.execute("""
+                    CREATE TRIGGER IF NOT EXISTS ai_summaries_au AFTER UPDATE ON ai_summaries BEGIN
+                        INSERT INTO ai_summaries_fts(ai_summaries_fts, rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+                        VALUES ('delete', old.file_id, old.summary, old.people_mentioned, old.pets_mentioned, old.activities, old.document_summary, old.key_entities);
+                        INSERT INTO ai_summaries_fts(rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+                        VALUES (new.file_id, new.summary, new.people_mentioned, new.pets_mentioned, new.activities, new.document_summary, new.key_entities);
+                    END
+                """)
+                # Rebuild FTS index from existing data
+                conn.execute("""
+                    INSERT INTO ai_summaries_fts(rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+                    SELECT file_id, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities
+                    FROM ai_summaries
+                """)
+                logger.info("Migration: Rebuilt ai_summaries_fts with pets_mentioned column")
+            except Exception as fts_err:
+                logger.warning("FTS rebuild during migration failed: %s", fts_err)
+
+    def switch_to(self, new_path: str) -> None:
+        """Switch to a different database file.
+        Updates db_path and initializes schema if needed.
+        All components sharing this Database instance will
+        automatically use the new database on their next query.
+        """
+        self.db_path = Path(new_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_database()
+        logger.info(f"Switched database to {self.db_path}")
+
+        # Persist this change in the main config
+        config = get_config()
+        config.active_database = self.db_path.name
+        save_config()
+        logger.info(f"Set active_database to '{config.active_database}' and saved config.")
 
     @contextmanager
     def connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -159,7 +374,7 @@ class Database:
     # Settings
     # ==========================================================================
 
-    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
         """Get a setting value."""
         with self.connection() as conn:
             row = conn.execute(
@@ -186,7 +401,7 @@ class Database:
         import json
         self.set_setting(f"scan_state:{drive_id}", json.dumps(state))
 
-    def get_scan_state(self, drive_id: str) -> Optional[dict]:
+    def get_scan_state(self, drive_id: str) -> dict | None:
         """Get persisted scan state for a drive."""
         import json
         value = self.get_setting(f"scan_state:{drive_id}")
@@ -225,7 +440,7 @@ class Database:
                 )
             )
 
-    def get_drive(self, drive_id: str) -> Optional[Drive]:
+    def get_drive(self, drive_id: str) -> Drive | None:
         """Get a drive by ID."""
         with self.connection() as conn:
             row = conn.execute(
@@ -261,6 +476,33 @@ class Database:
                    file_count = ?, last_scan = ? WHERE id = ?""",
                 (total_space, free_space, file_count, datetime.now(), drive_id)
             )
+
+    def remap_drive_path(self, drive_id: str, old_path: str, new_path: str) -> int:
+        """Remap a drive's root path and update all file paths atomically.
+
+        Updates the drives table and rewrites all file paths that start with
+        old_path to start with new_path instead.
+
+        Args:
+            drive_id: Drive ID to remap
+            old_path: Current root path stored in DB
+            new_path: New root path to replace it with
+
+        Returns:
+            Number of file records updated
+        """
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE drives SET path = ? WHERE id = ?",
+                (new_path, drive_id),
+            )
+            old_len = len(old_path)
+            cursor = conn.execute(
+                "UPDATE files SET path = ? || substr(path, ? + 1) "
+                "WHERE drive_id = ? AND path LIKE ?",
+                (new_path, old_len, drive_id, old_path + "%"),
+            )
+            return cursor.rowcount
 
     # ==========================================================================
     # Files
@@ -304,19 +546,42 @@ class Database:
                    modified, file_type, mime_type, scan_date)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(drive_id, path) DO UPDATE SET
-                   size = ?, modified = ?, scan_date = ?""",
+                   filename = excluded.filename,
+                   size = excluded.size,
+                   modified = excluded.modified,
+                   file_type = excluded.file_type,
+                   mime_type = excluded.mime_type,
+                   scan_date = excluded.scan_date,
+                   is_deleted = FALSE,
+                   quick_hash = CASE
+                       WHEN files.size != excluded.size
+                            OR files.modified IS NOT excluded.modified
+                       THEN NULL
+                       ELSE files.quick_hash
+                   END,
+                   content_hash = CASE
+                       WHEN files.size != excluded.size
+                            OR files.modified IS NOT excluded.modified
+                       THEN NULL
+                       ELSE files.content_hash
+                   END,
+                   perceptual_hash = CASE
+                       WHEN files.size != excluded.size
+                            OR files.modified IS NOT excluded.modified
+                       THEN NULL
+                       ELSE files.perceptual_hash
+                   END""",
                 [
                     (
                         f.drive_id, f.path, f.filename, f.size, f.created,
                         f.modified, f.file_type, f.mime_type,
                         f.scan_date or datetime.now(),
-                        f.size, f.modified, f.scan_date or datetime.now()
                     )
                     for f in files
                 ]
             )
 
-    def get_file(self, file_id: int) -> Optional[FileRecord]:
+    def get_file(self, file_id: int) -> FileRecord | None:
         """Get a file by ID."""
         with self.connection() as conn:
             row = conn.execute(
@@ -327,7 +592,7 @@ class Database:
                 return FileRecord(**dict(row))
             return None
 
-    def get_file_by_path(self, drive_id: str, path: str) -> Optional[FileRecord]:
+    def get_file_by_path(self, drive_id: str, path: str) -> FileRecord | None:
         """Get a file by drive and path."""
         with self.connection() as conn:
             row = conn.execute(
@@ -339,7 +604,7 @@ class Database:
                 return FileRecord(**dict(row))
             return None
 
-    def get_file_by_path_any(self, path: str) -> Optional[FileRecord]:
+    def get_file_by_path_any(self, path: str) -> FileRecord | None:
         """Get a file by path across all drives."""
         with self.connection() as conn:
             row = conn.execute(
@@ -382,7 +647,7 @@ class Database:
     def get_hashes_for_drive(
         self,
         drive_id: str,
-        path_prefix: Optional[str] = None,
+        path_prefix: str | None = None,
     ) -> set[str]:
         """Get distinct content hashes for a drive (optionally filtered by path prefix)."""
         with self.connection() as conn:
@@ -405,7 +670,7 @@ class Database:
     def get_path_stats_like(
         self,
         like_pattern: str,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> tuple[int, int]:
         """Get count and total size for paths matching a LIKE pattern."""
         with self.connection() as conn:
@@ -428,7 +693,7 @@ class Database:
     def get_content_hash_groups(
         self,
         min_drives: int = 1,
-        max_drives: Optional[int] = None,
+        max_drives: int | None = None,
         limit: int = 10000,
     ) -> list[tuple[str, int, int, int]]:
         """Get grouped content hashes with drive counts.
@@ -459,7 +724,7 @@ class Database:
             rows = conn.execute(query, params).fetchall()
             return [(row[0], row[1], row[2], row[3]) for row in rows]
 
-    def get_files_needing_hash(self, drive_id: Optional[str] = None) -> list[FileRecord]:
+    def get_files_needing_hash(self, drive_id: str | None = None) -> list[FileRecord]:
         """Get files that need hashing (grouped by size > 1)."""
         with self.connection() as conn:
             query = """
@@ -494,7 +759,7 @@ class Database:
     def get_files_by_type(
         self,
         extensions: list[str],
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
         limit: int = 100000,
     ) -> list[FileRecord]:
         """Get files by file type extension.
@@ -530,9 +795,9 @@ class Database:
     def update_file_hash(
         self,
         file_id: int,
-        quick_hash: Optional[str] = None,
-        content_hash: Optional[str] = None,
-        perceptual_hash: Optional[str] = None
+        quick_hash: str | None = None,
+        content_hash: str | None = None,
+        perceptual_hash: str | None = None
     ) -> None:
         """Update hash values for a file."""
         updates = []
@@ -556,7 +821,257 @@ class Database:
                     params
                 )
 
-    def update_file_scan_date(self, file_id: int, scan_date: Optional[datetime] = None) -> None:
+    def store_video_frame_hashes(
+        self,
+        file_id: int,
+        frames: list[dict],
+    ) -> None:
+        """Store perceptual hashes for video keyframes.
+
+        Args:
+            file_id: ID of the video file
+            frames: List of dicts with keys: frame_index, timestamp_sec, phash, dhash
+        """
+        with self.connection() as conn:
+            # Clear existing frames for this file
+            conn.execute("DELETE FROM video_frames WHERE file_id = ?", (file_id,))
+            for frame in frames:
+                conn.execute(
+                    """INSERT INTO video_frames (file_id, frame_index, timestamp_sec, phash, dhash)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (file_id, frame["frame_index"], frame["timestamp_sec"],
+                     frame.get("phash"), frame.get("dhash")),
+                )
+
+    def get_video_frame_hashes(self, file_id: int) -> list[dict]:
+        """Get stored frame hashes for a video file.
+
+        Returns:
+            List of dicts with frame_index, timestamp_sec, phash, dhash
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT frame_index, timestamp_sec, phash, dhash
+                   FROM video_frames WHERE file_id = ?
+                   ORDER BY frame_index""",
+                (file_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_files_with_video_frames(self, drive_id: str | None = None) -> list[int]:
+        """Get file IDs that already have video frame hashes stored.
+
+        Args:
+            drive_id: Optional drive filter
+
+        Returns:
+            List of file IDs
+        """
+        with self.connection() as conn:
+            query = """
+                SELECT DISTINCT vf.file_id FROM video_frames vf
+                JOIN files f ON f.id = vf.file_id
+                WHERE f.is_deleted = FALSE
+            """
+            params = []
+            if drive_id:
+                query += " AND f.drive_id = ?"
+                params.append(drive_id)
+            rows = conn.execute(query, params).fetchall()
+            return [row["file_id"] for row in rows]
+
+    # ------------------------------------------------------------------
+    # Corrupt file tracking
+    # ------------------------------------------------------------------
+
+    def add_corrupt_file(self, file_id: int, corruption_type: str, severity: str = "medium") -> None:
+        """Record a file as corrupt.
+
+        Args:
+            file_id: ID of the corrupt file
+            corruption_type: Type of corruption detected
+            severity: Severity level (low, medium, high)
+        """
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO corrupt_files (file_id, corruption_type, severity, detected_at)
+                   VALUES (?, ?, ?, CURRENT_TIMESTAMP)""",
+                (file_id, corruption_type, severity),
+            )
+
+    def remove_corrupt_file(self, file_id: int) -> None:
+        """Remove a file from the corrupt list (e.g., after recovery)."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM corrupt_files WHERE file_id = ?", (file_id,))
+
+    def get_corrupt_files(self, drive_id: str | None = None) -> list[dict]:
+        """Get all corrupt files with file info.
+
+        Args:
+            drive_id: Optional drive filter
+
+        Returns:
+            List of dicts with corrupt file info
+        """
+        with self.connection() as conn:
+            query = """
+                SELECT cf.id, cf.file_id, cf.corruption_type, cf.severity, cf.detected_at,
+                       f.path, f.filename, f.size, f.file_type, f.drive_id
+                FROM corrupt_files cf
+                JOIN files f ON f.id = cf.file_id
+                WHERE f.is_deleted = FALSE
+            """
+            params = []
+            if drive_id:
+                query += " AND f.drive_id = ?"
+                params.append(drive_id)
+            query += " ORDER BY cf.detected_at DESC"
+            return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+    def get_corrupt_file_count(self) -> int:
+        """Get the number of corrupt files."""
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) as cnt FROM corrupt_files cf
+                   JOIN files f ON f.id = cf.file_id
+                   WHERE f.is_deleted = FALSE"""
+            ).fetchone()
+            return row["cnt"] if row else 0
+
+    def add_recovery_attempt(
+        self,
+        file_id: int,
+        strategy_used: str,
+        success: bool,
+        pixel_recovery_pct: float | None = None,
+        recovered_path: str | None = None,
+    ) -> None:
+        """Record a recovery attempt.
+
+        Args:
+            file_id: ID of the file
+            strategy_used: Name of the recovery strategy
+            success: Whether recovery succeeded
+            pixel_recovery_pct: Percentage of pixels recovered
+            recovered_path: Path to recovered file
+        """
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO recovery_attempts
+                   (file_id, strategy_used, success, pixel_recovery_pct, recovered_path, attempted_at)
+                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (file_id, strategy_used, success, pixel_recovery_pct, recovered_path),
+            )
+
+    def get_recovery_attempts(self, file_id: int) -> list[dict]:
+        """Get all recovery attempts for a file."""
+        with self.connection() as conn:
+            return [dict(row) for row in conn.execute(
+                """SELECT * FROM recovery_attempts
+                   WHERE file_id = ?
+                   ORDER BY attempted_at DESC""",
+                (file_id,),
+            ).fetchall()]
+
+    # ─── Temporal Links ─────────────────────────────────────
+
+    def add_temporal_link(
+        self,
+        face_id_a: int,
+        face_id_b: int,
+        person_id: int,
+        similarity: float,
+        temporal_distance_days: int | None = None,
+        threshold_used: float | None = None,
+        link_type: str = "auto",
+    ) -> None:
+        """Add a temporal link between two faces."""
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO temporal_links
+                   (face_id_a, face_id_b, person_id, similarity,
+                    temporal_distance_days, threshold_used, link_type, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (face_id_a, face_id_b, person_id, similarity,
+                 temporal_distance_days, threshold_used, link_type),
+            )
+
+    def get_temporal_links(self, person_id: int) -> list[dict]:
+        """Get all temporal links for a person, ordered chronologically."""
+        with self.connection() as conn:
+            return [dict(row) for row in conn.execute(
+                """SELECT tl.*, fa.estimated_age AS age_a, fb.estimated_age AS age_b
+                   FROM temporal_links tl
+                   JOIN faces fa ON fa.id = tl.face_id_a
+                   JOIN faces fb ON fb.id = tl.face_id_b
+                   WHERE tl.person_id = ?
+                   ORDER BY tl.created_at""",
+                (person_id,),
+            ).fetchall()]
+
+    def get_temporal_chain(self, person_id: int) -> list[dict]:
+        """Get the temporal chain for a person as a flat list of faces with dates.
+
+        Returns ordered list of dicts: face_id, estimated_age, photo_date, similarity_to_next
+        """
+        with self.connection() as conn:
+            # Get all faces for person with dates
+            faces = conn.execute(
+                """SELECT f.id AS face_id, f.estimated_age,
+                          COALESCE(fm.exif_date, fi.modified) AS photo_date
+                   FROM faces f
+                   JOIN files fi ON fi.id = f.file_id
+                   LEFT JOIN file_metadata fm ON fm.file_id = f.file_id
+                   WHERE f.person_id = ?
+                   ORDER BY photo_date""",
+                (person_id,),
+            ).fetchall()
+            return [dict(row) for row in faces]
+
+    def delete_temporal_links(self, person_id: int) -> int:
+        """Delete all temporal links for a person. Returns count deleted."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM temporal_links WHERE person_id = ?",
+                (person_id,),
+            )
+            return cursor.rowcount
+
+    def get_weak_temporal_links(self, person_id: int, min_threshold_ratio: float = 0.7) -> list[dict]:
+        """Get temporal links where similarity is below threshold * ratio (weak links for review)."""
+        with self.connection() as conn:
+            return [dict(row) for row in conn.execute(
+                """SELECT tl.*, fa.estimated_age AS age_a, fb.estimated_age AS age_b
+                   FROM temporal_links tl
+                   JOIN faces fa ON fa.id = tl.face_id_a
+                   JOIN faces fb ON fb.id = tl.face_id_b
+                   WHERE tl.person_id = ?
+                     AND tl.threshold_used IS NOT NULL
+                     AND tl.similarity < tl.threshold_used * ?
+                   ORDER BY tl.similarity ASC""",
+                (person_id, min_threshold_ratio),
+            ).fetchall()]
+
+    def update_temporal_link_type(
+        self, face_id_a: int, face_id_b: int, link_type: str
+    ) -> None:
+        """Update the classification of a temporal link between two faces."""
+        with self.connection() as conn:
+            conn.execute(
+                """UPDATE temporal_links SET link_type = ?
+                   WHERE face_id_a = ? AND face_id_b = ?""",
+                (link_type, face_id_a, face_id_b),
+            )
+
+    def delete_temporal_link(self, face_id_a: int, face_id_b: int) -> None:
+        """Delete a single temporal link between two faces."""
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM temporal_links WHERE face_id_a = ? AND face_id_b = ?",
+                (face_id_a, face_id_b),
+            )
+
+    def update_file_scan_date(self, file_id: int, scan_date: datetime | None = None) -> None:
         """Update scan date (and undelete) for a file."""
         if scan_date is None:
             scan_date = datetime.now()
@@ -653,7 +1168,7 @@ class Database:
         self,
         file_id: int,
         faces_found: int = 0,
-        error: Optional[str] = None,
+        error: str | None = None,
     ) -> None:
         """Record that face analysis has been run for a file."""
         with self.connection() as conn:
@@ -687,13 +1202,38 @@ class Database:
                 return False
             return bool(row["faces_analyzed"])
 
+    def clear_failed_face_analysis(self, drive_id: str | None = None) -> int:
+        """Clear face analysis status for files that had 0 faces (potential failures).
+
+        This allows re-running analysis on files that may have failed to load.
+
+        Args:
+            drive_id: Optional drive ID to limit clearing to specific drive
+
+        Returns:
+            Number of files cleared
+        """
+        with self.connection() as conn:
+            if drive_id:
+                cursor = conn.execute(
+                    """DELETE FROM file_ai_status
+                       WHERE faces_found = 0
+                       AND file_id IN (SELECT id FROM files WHERE drive_id = ?)""",
+                    (drive_id,)
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM file_ai_status WHERE faces_found = 0"
+                )
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
     def get_image_files_missing_face_analysis(
         self,
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
-        """Get image files that have not been processed for face analysis."""
-        extensions = [".jpg", ".jpeg", ".png", ".heic", ".webp"]
+        """Get image/PDF files that have not been processed for face analysis."""
+        extensions = [".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".tiff", ".tif", ".bmp", ".pdf"]
         placeholders = ", ".join("?" for _ in extensions)
         query = f"""
             SELECT f.* FROM files f
@@ -713,9 +1253,76 @@ class Database:
             rows = conn.execute(query, params).fetchall()
             return [FileRecord(**dict(row)) for row in rows]
 
+    def clear_face_analysis_no_faces_in_directory(
+        self,
+        directory_path: str,
+    ) -> int:
+        """Clear face analysis status for files with 0 faces in a directory.
+
+        This allows re-running face detection on files that were previously
+        scanned but had no faces detected (e.g., if the model missed faces).
+
+        Args:
+            directory_path: Directory path to clear (recursive)
+
+        Returns:
+            Number of files cleared
+        """
+        normalized_path = os.path.normcase(os.path.normpath(directory_path))
+        with self.connection() as conn:
+            # Get file IDs in directory with faces_found=0
+            rows = conn.execute(
+                """SELECT f.id, f.path FROM files f
+                   JOIN file_ai_status s ON s.file_id = f.id
+                   WHERE f.is_deleted = FALSE
+                     AND s.faces_analyzed = TRUE
+                     AND (s.faces_found IS NULL OR s.faces_found = 0)""",
+            ).fetchall()
+
+            # Filter by path in Python to avoid SQL backslash escaping issues
+            matching_ids = []
+            for row in rows:
+                file_id = row[0]
+                norm = os.path.normcase(os.path.normpath(row[1]))
+                if norm.startswith(normalized_path):
+                    matching_ids.append(file_id)
+
+            if not matching_ids:
+                return 0
+
+            placeholders = ", ".join("?" for _ in matching_ids)
+            conn.execute(
+                f"DELETE FROM file_ai_status WHERE file_id IN ({placeholders})",
+                matching_ids,
+            )
+            return len(matching_ids)
+
+    def get_image_files_missing_face_analysis_in_directory(
+        self,
+        directory_path: str,
+        limit: int = 5000,
+    ) -> list[FileRecord]:
+        """Get image/PDF files in a directory (recursively) that haven't been analyzed for faces."""
+        normalized_path = os.path.normpath(directory_path).replace("\\", "/")
+        extensions = [".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".tiff", ".tif", ".bmp", ".pdf"]
+        placeholders = ", ".join("?" for _ in extensions)
+        query = f"""
+            SELECT f.* FROM files f
+            LEFT JOIN file_ai_status s ON s.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND REPLACE(f.path, '\\', '/') LIKE ?
+              AND LOWER(f.file_type) IN ({placeholders})
+              AND (s.faces_analyzed IS NULL OR s.faces_analyzed = FALSE)
+            LIMIT ?
+        """
+        params: list[Any] = [f"{normalized_path}%"] + [ext.lower() for ext in extensions] + [limit]
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
     def backfill_face_status_from_existing_faces(
         self,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> int:
         """Mark files with existing faces as already analyzed."""
         query = """
@@ -736,7 +1343,7 @@ class Database:
             cursor = conn.execute(query, params)
             return cursor.rowcount if cursor.rowcount is not None else 0
 
-    def get_file_count(self, drive_id: Optional[str] = None) -> int:
+    def get_file_count(self, drive_id: str | None = None) -> int:
         """Get total file count."""
         with self.connection() as conn:
             if drive_id:
@@ -778,7 +1385,7 @@ class Database:
                 )
             )
 
-    def get_file_metadata(self, file_id: int) -> Optional[FileMetadata]:
+    def get_file_metadata(self, file_id: int) -> FileMetadata | None:
         """Get metadata for a file."""
         with self.connection() as conn:
             row = conn.execute(
@@ -793,7 +1400,7 @@ class Database:
         self,
         extensions: list[str],
         last_id: int = 0,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
         limit: int = 200,
     ) -> list[FileRecord]:
         """Get files with given extensions after an ID for paging."""
@@ -822,7 +1429,7 @@ class Database:
         self,
         extensions: list[str],
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get files without extracted metadata for provided extensions."""
         if not extensions:
@@ -850,7 +1457,7 @@ class Database:
         self,
         extensions: list[str],
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get files missing OCR/text extraction for provided extensions."""
         if not extensions:
@@ -878,7 +1485,7 @@ class Database:
         self,
         extensions: list[str],
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get files missing AI summaries for provided extensions."""
         if not extensions:
@@ -902,10 +1509,58 @@ class Database:
             rows = conn.execute(query, params).fetchall()
             return [FileRecord(**dict(row)) for row in rows]
 
+    def get_files_needing_summary_in_directory(
+        self,
+        directory_path: str,
+        limit: int = 500,
+        file_types: list[str] | None = None,
+    ) -> list[FileRecord]:
+        """Get files in a directory (and subdirectories) that need AI summaries.
+
+        Args:
+            directory_path: Directory path to search in
+            limit: Maximum number of files to return
+            file_types: Optional list of file extensions to filter (e.g. ['.jpg', '.pdf'])
+                       If None, includes all supported types (images, documents, videos)
+
+        Returns:
+            List of FileRecord objects missing summaries
+        """
+        normalized_path = os.path.normpath(directory_path).replace("\\", "/")
+
+        query = """
+            SELECT f.* FROM files f
+            LEFT JOIN ai_summaries a ON a.file_id = f.id
+            WHERE f.is_deleted = FALSE
+              AND REPLACE(f.path, '\\', '/') LIKE ?
+              AND a.file_id IS NULL
+        """
+        params: list[Any] = [f"{normalized_path}%"]
+
+        if file_types:
+            placeholders = ", ".join("?" for _ in file_types)
+            query += f" AND LOWER(f.file_type) IN ({placeholders})"
+            params.extend([ext.lower() for ext in file_types])
+        else:
+            image_exts = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
+            doc_exts = [".txt", ".md", ".pdf", ".rtf", ".docx", ".odt", ".pptx", ".xlsx"]
+            video_exts = [".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm"]
+            all_exts = image_exts + doc_exts + video_exts
+            placeholders = ", ".join("?" for _ in all_exts)
+            query += f" AND LOWER(f.file_type) IN ({placeholders})"
+            params.extend([ext.lower() for ext in all_exts])
+
+        query += " LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [FileRecord(**dict(row)) for row in rows]
+
     def get_image_files_missing_metadata(
         self,
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get image files without extracted metadata."""
         extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
@@ -931,7 +1586,7 @@ class Database:
     def get_image_files_missing_scene_analysis(
         self,
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get image files missing scene analysis."""
         extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
@@ -957,7 +1612,7 @@ class Database:
     def get_image_files_missing_scene_objects(
         self,
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get image files with scene analysis but missing object labels."""
         extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
@@ -983,7 +1638,7 @@ class Database:
     def get_image_files_missing_ocr(
         self,
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get image files missing OCR text."""
         extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
@@ -1009,7 +1664,7 @@ class Database:
     def get_image_files_missing_summaries(
         self,
         limit: int = 200,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> list[FileRecord]:
         """Get image files missing AI summaries."""
         extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".heif"]
@@ -1041,7 +1696,7 @@ class Database:
         match_type: MatchType,
         similarity: float,
         file_ids: list[int],
-        keeper_id: Optional[int] = None
+        keeper_id: int | None = None
     ) -> int:
         """Create a duplicate group with members.
 
@@ -1080,7 +1735,7 @@ class Database:
 
             return group_id
 
-    def get_duplicate_group(self, group_id: int, include_files: bool = False) -> Optional[DuplicateGroup]:
+    def get_duplicate_group(self, group_id: int, include_files: bool = False) -> DuplicateGroup | None:
         """Get a duplicate group by ID."""
         with self.connection() as conn:
             row = conn.execute(
@@ -1128,8 +1783,8 @@ class Database:
 
     def get_duplicate_groups(
         self,
-        status: Optional[GroupStatus] = None,
-        match_type: Optional[MatchType] = None,
+        status: GroupStatus | None = None,
+        match_type: MatchType | None = None,
         limit: int = 100,
         offset: int = 0
     ) -> list[DuplicateGroup]:
@@ -1226,11 +1881,11 @@ class Database:
 
     def get_action_log(
         self,
-        action_type: Optional[ActionType] = None,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
-        reversed: Optional[bool] = None,
-        path_contains: Optional[str] = None,
+        action_type: ActionType | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        reversed: bool | None = None,
+        path_contains: str | None = None,
         limit: int = 100,
         offset: int = 0
     ) -> list[ActionLogEntry]:
@@ -1288,10 +1943,10 @@ class Database:
 
     def get_action_log_count(
         self,
-        action_type: Optional[ActionType] = None,
-        start_date: Optional[datetime] = None,
-        end_date: Optional[datetime] = None,
-        reversed: Optional[bool] = None,
+        action_type: ActionType | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+        reversed: bool | None = None,
     ) -> int:
         """Get total count of action log entries matching filters."""
         with self.connection() as conn:
@@ -1316,7 +1971,7 @@ class Database:
 
             return conn.execute(query, params).fetchone()[0]
 
-    def get_action_log_by_id(self, action_id: int) -> Optional[ActionLogEntry]:
+    def get_action_log_by_id(self, action_id: int) -> ActionLogEntry | None:
         """Get a single action log entry by ID.
 
         Args:
@@ -1345,6 +2000,28 @@ class Database:
                 (action_id,)
             )
 
+    def delete_action_log_before(
+        self,
+        cutoff: datetime,
+        only_reversed: bool = True,
+    ) -> int:
+        """Delete action log entries older than a cutoff.
+
+        Args:
+            cutoff: Delete entries older than this timestamp
+            only_reversed: If True, only delete entries already reversed
+
+        Returns:
+            Number of entries deleted
+        """
+        with self.connection() as conn:
+            query = "DELETE FROM action_log WHERE timestamp < ?"
+            params: list[Any] = [cutoff]
+            if only_reversed:
+                query += " AND reversed = TRUE"
+            cursor = conn.execute(query, params)
+            return cursor.rowcount if cursor.rowcount is not None else 0
+
     # ==========================================================================
     # Persons and Faces
     # ==========================================================================
@@ -1371,7 +2048,7 @@ class Database:
             )
             return cursor.fetchone()[0]
 
-    def get_person(self, person_id: int) -> Optional[Person]:
+    def get_person(self, person_id: int) -> Person | None:
         """Get a person by ID."""
         with self.connection() as conn:
             row = conn.execute(
@@ -1533,6 +2210,384 @@ class Database:
 
             return face_count
 
+    # =========================================================================
+    # Person Relationships
+    # =========================================================================
+
+    def add_relationship(self, rel: PersonRelationship) -> int:
+        """Add a relationship between two persons.
+
+        Returns:
+            Relationship ID.
+        """
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """INSERT INTO person_relationships
+                   (person_a_id, person_b_id, relationship_type, confidence, notes)
+                   VALUES (?, ?, ?, ?, ?) RETURNING id""",
+                (rel.person_a_id, rel.person_b_id, rel.relationship_type,
+                 rel.confidence, rel.notes),
+            )
+            return cursor.fetchone()[0]
+
+    def get_relationships(self, person_id: int) -> list[dict]:
+        """Get all relationships for a person, with related person info.
+
+        Returns list of dicts with keys:
+            id, other_person_id, other_person_name, relationship_type,
+            direction ('outgoing' or 'incoming'), confidence, notes
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT r.id, r.person_a_id, r.person_b_id,
+                          r.relationship_type, r.confidence, r.notes,
+                          pa.name AS name_a, pb.name AS name_b
+                   FROM person_relationships r
+                   JOIN persons pa ON r.person_a_id = pa.id
+                   JOIN persons pb ON r.person_b_id = pb.id
+                   WHERE r.person_a_id = ? OR r.person_b_id = ?""",
+                (person_id, person_id),
+            ).fetchall()
+
+            results = []
+            for row in rows:
+                r = dict(row)
+                if r["person_a_id"] == person_id:
+                    results.append({
+                        "id": r["id"],
+                        "other_person_id": r["person_b_id"],
+                        "other_person_name": r["name_b"],
+                        "relationship_type": r["relationship_type"],
+                        "direction": "outgoing",
+                        "confidence": r["confidence"],
+                        "notes": r["notes"],
+                    })
+                else:
+                    # Flip the relationship label for incoming
+                    rel_type = r["relationship_type"]
+                    if rel_type == "parent":
+                        rel_type = "child"
+                    elif rel_type == "child":
+                        rel_type = "parent"
+                    results.append({
+                        "id": r["id"],
+                        "other_person_id": r["person_a_id"],
+                        "other_person_name": r["name_a"],
+                        "relationship_type": rel_type,
+                        "direction": "incoming",
+                        "confidence": r["confidence"],
+                        "notes": r["notes"],
+                    })
+            return results
+
+    def delete_relationship(self, rel_id: int) -> None:
+        """Delete a relationship by ID."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM person_relationships WHERE id = ?", (rel_id,))
+
+    def get_related_persons(
+        self, person_id: int, rel_type: str | None = None
+    ) -> list[Person]:
+        """Get persons related to the given person.
+
+        Args:
+            person_id: The person to find relatives for.
+            rel_type: Optional filter by relationship type (uses the
+                      effective type after direction flip).
+        """
+        rels = self.get_relationships(person_id)
+        if rel_type:
+            rels = [r for r in rels if r["relationship_type"] == rel_type]
+        person_ids = [r["other_person_id"] for r in rels]
+        if not person_ids:
+            return []
+        with self.connection() as conn:
+            placeholders = ",".join("?" * len(person_ids))
+            rows = conn.execute(
+                f"SELECT * FROM persons WHERE id IN ({placeholders})",
+                person_ids,
+            ).fetchall()
+            return [Person(**dict(row)) for row in rows]
+
+    def get_co_occurrence_counts(
+        self, person_id: int, min_count: int = 5
+    ) -> list[dict]:
+        """Count how many photos a person shares with each other person.
+
+        Returns list of dicts: {person_id, name, shared_photos}
+        sorted by shared_photos descending.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT f2.person_id, p.name,
+                          COUNT(DISTINCT f1.file_id) AS shared_photos
+                   FROM faces f1
+                   JOIN faces f2 ON f1.file_id = f2.file_id
+                        AND f1.person_id != f2.person_id
+                   JOIN persons p ON f2.person_id = p.id
+                   WHERE f1.person_id = ?
+                     AND f2.person_id IS NOT NULL
+                   GROUP BY f2.person_id
+                   HAVING shared_photos >= ?
+                   ORDER BY shared_photos DESC""",
+                (person_id, min_count),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def suggest_relationships(self, person_id: int) -> list[dict]:
+        """Suggest relationships based on co-occurrence and age gaps.
+
+        Returns list of dicts:
+            {person_id, name, shared_photos, age_gap, suggested_type, reason}
+        """
+        co = self.get_co_occurrence_counts(person_id, min_count=3)
+        person = self.get_person(person_id)
+        if not person:
+            return []
+
+        # Existing relationship person IDs (skip already-related)
+        existing_ids = {
+            r["other_person_id"] for r in self.get_relationships(person_id)
+        }
+
+        suggestions: list[dict] = []
+        for entry in co:
+            other_id = entry["person_id"]
+            if other_id in existing_ids:
+                continue
+            other = self.get_person(other_id)
+            if not other:
+                continue
+
+            age_gap: int | None = None
+            suggested_type = "other"
+            reason = f"Appear together in {entry['shared_photos']} photos"
+
+            if person.birth_year and other.birth_year:
+                age_gap = abs(person.birth_year - other.birth_year)
+                if age_gap <= 5:
+                    suggested_type = "sibling"
+                    reason += f"; close in age ({age_gap}yr gap)"
+                elif 18 <= age_gap <= 45:
+                    # Determine parent vs child direction
+                    if person.birth_year < other.birth_year:
+                        suggested_type = "parent"
+                        reason += f"; {age_gap}yr older (possible parent)"
+                    else:
+                        suggested_type = "child"
+                        reason += f"; {age_gap}yr younger (possible child)"
+
+            # Name-based hint
+            if person.name and other.name:
+                p_parts = person.name.strip().split()
+                o_parts = other.name.strip().split()
+                if len(p_parts) > 1 and len(o_parts) > 1:
+                    if p_parts[-1].lower() == o_parts[-1].lower():
+                        reason += "; share last name"
+
+            suggestions.append({
+                "person_id": other_id,
+                "name": other.name,
+                "shared_photos": entry["shared_photos"],
+                "age_gap": age_gap,
+                "suggested_type": suggested_type,
+                "reason": reason,
+            })
+
+        return suggestions
+
+    # =========================================================================
+    # Family Groups
+    # =========================================================================
+
+    def add_family_group(self, group: FamilyGroup) -> int:
+        """Create a new family group. Returns group ID."""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO family_groups (name, notes) VALUES (?, ?) RETURNING id",
+                (group.name, group.notes),
+            )
+            return cursor.fetchone()[0]
+
+    def get_all_family_groups(self) -> list[FamilyGroup]:
+        """Get all family groups."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM family_groups ORDER BY name"
+            ).fetchall()
+            return [FamilyGroup(**dict(r)) for r in rows]
+
+    def get_family_group(self, group_id: int) -> FamilyGroup | None:
+        """Get a single family group by ID."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM family_groups WHERE id = ?", (group_id,)
+            ).fetchone()
+            return FamilyGroup(**dict(row)) if row else None
+
+    def update_family_group(self, group: FamilyGroup) -> None:
+        """Update a family group's name/notes."""
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE family_groups SET name = ?, notes = ? WHERE id = ?",
+                (group.name, group.notes, group.id),
+            )
+
+    def delete_family_group(self, group_id: int) -> None:
+        """Delete a family group and all its memberships."""
+        with self.connection() as conn:
+            conn.execute("DELETE FROM family_groups WHERE id = ?", (group_id,))
+
+    def add_family_group_member(
+        self, group_id: int, person_id: int, role: str | None = None
+    ) -> None:
+        """Add a person to a family group."""
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO family_group_members
+                   (family_group_id, person_id, role) VALUES (?, ?, ?)""",
+                (group_id, person_id, role),
+            )
+
+    def remove_family_group_member(self, group_id: int, person_id: int) -> None:
+        """Remove a person from a family group."""
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM family_group_members WHERE family_group_id = ? AND person_id = ?",
+                (group_id, person_id),
+            )
+
+    def get_family_group_members(self, group_id: int) -> list[dict]:
+        """Get members of a family group with person details.
+
+        Returns list of dicts: {person_id, name, role, photo_count, birth_year}
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT fgm.person_id, p.name, fgm.role,
+                          p.photo_count, p.birth_year
+                   FROM family_group_members fgm
+                   JOIN persons p ON fgm.person_id = p.id
+                   WHERE fgm.family_group_id = ?
+                   ORDER BY p.name""",
+                (group_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_person_family_groups(self, person_id: int) -> list[FamilyGroup]:
+        """Get all family groups a person belongs to."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT fg.* FROM family_groups fg
+                   JOIN family_group_members fgm ON fg.id = fgm.family_group_id
+                   WHERE fgm.person_id = ?
+                   ORDER BY fg.name""",
+                (person_id,),
+            ).fetchall()
+            return [FamilyGroup(**dict(r)) for r in rows]
+
+    def get_family_group_file_ids(self, group_id: int) -> list[int]:
+        """Get all file IDs containing faces of any family group member."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT f.file_id
+                   FROM faces f
+                   JOIN family_group_members fgm ON f.person_id = fgm.person_id
+                   WHERE fgm.family_group_id = ?""",
+                (group_id,),
+            ).fetchall()
+            return [r[0] for r in rows]
+
+    # ------------------------------------------------------------------ #
+    #  Celebrity Match CRUD                                                #
+    # ------------------------------------------------------------------ #
+
+    def add_celebrity_match(self, match: CelebrityMatch) -> int:
+        """Add a celebrity identification match result.
+
+        Returns:
+            Match ID
+        """
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """INSERT OR REPLACE INTO celebrity_matches
+                   (face_id, person_id, provider, celebrity_name, confidence,
+                    external_id, external_urls, known_for, status, reviewed_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   RETURNING id""",
+                (
+                    match.face_id, match.person_id, match.provider,
+                    match.celebrity_name, match.confidence,
+                    match.external_id, match.external_urls, match.known_for,
+                    match.status, match.reviewed_at,
+                    match.created_at or datetime.now(),
+                ),
+            )
+            return cursor.fetchone()[0]
+
+    def get_celebrity_match(self, match_id: int) -> CelebrityMatch | None:
+        """Get a celebrity match by ID."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM celebrity_matches WHERE id = ?", (match_id,)
+            ).fetchone()
+            if row:
+                return CelebrityMatch(**dict(row))
+            return None
+
+    def get_celebrity_matches_for_face(self, face_id: int) -> list[CelebrityMatch]:
+        """Get all celebrity matches for a specific face."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM celebrity_matches WHERE face_id = ?", (face_id,)
+            ).fetchall()
+            return [CelebrityMatch(**dict(r)) for r in rows]
+
+    def get_pending_celebrity_matches(self, limit: int = 100) -> list[CelebrityMatch]:
+        """Get all pending celebrity matches awaiting user review."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM celebrity_matches
+                   WHERE status = 'pending'
+                   ORDER BY confidence DESC
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()
+            return [CelebrityMatch(**dict(r)) for r in rows]
+
+    def update_celebrity_match_status(
+        self, match_id: int, status: str, person_id: int | None = None
+    ) -> None:
+        """Update the status of a celebrity match (confirm/reject)."""
+        with self.connection() as conn:
+            conn.execute(
+                """UPDATE celebrity_matches
+                   SET status = ?, person_id = ?, reviewed_at = ?
+                   WHERE id = ?""",
+                (status, person_id, datetime.now(), match_id),
+            )
+
+    def get_celebrity_match_count(self, status: str | None = None) -> int:
+        """Get count of celebrity matches, optionally filtered by status."""
+        with self.connection() as conn:
+            if status:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM celebrity_matches WHERE status = ?",
+                    (status,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM celebrity_matches"
+                ).fetchone()
+            return row[0] if row else 0
+
+    def delete_celebrity_matches_for_face(self, face_id: int) -> None:
+        """Delete all celebrity matches for a face."""
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM celebrity_matches WHERE face_id = ?", (face_id,)
+            )
+
     def add_face(self, face: Face) -> int:
         """Add a detected face.
 
@@ -1542,14 +2597,15 @@ class Database:
         with self.connection() as conn:
             cursor = conn.execute(
                 """INSERT INTO faces (file_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h,
-                   embedding, confidence, estimated_age, estimated_gender, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   embedding, confidence, estimated_age, estimated_gender,
+                   page_number, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    RETURNING id""",
                 (
                     face.file_id, face.person_id, face.bbox_x, face.bbox_y,
                     face.bbox_w, face.bbox_h, face.embedding, face.confidence,
                     face.estimated_age, face.estimated_gender,
-                    face.created_at or datetime.now()
+                    face.page_number, face.created_at or datetime.now()
                 )
             )
             return cursor.fetchone()[0]
@@ -1561,6 +2617,31 @@ class Database:
                 "SELECT * FROM faces WHERE file_id = ?", (file_id,)
             ).fetchall()
             return [Face(**dict(row)) for row in rows]
+
+    def get_photo_date_for_face(self, face_id: int) -> datetime | None:
+        """Get the EXIF photo date for a face's source file.
+
+        Joins faces -> file_metadata to get exif_date in a single query.
+
+        Args:
+            face_id: Face ID to look up
+
+        Returns:
+            EXIF date if available, else None
+        """
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT fm.exif_date FROM file_metadata fm
+                   JOIN faces f ON f.file_id = fm.file_id
+                   WHERE f.id = ?""",
+                (face_id,),
+            ).fetchone()
+            if row and row[0]:
+                val = row[0]
+                if isinstance(val, str):
+                    return datetime.fromisoformat(val)
+                return val
+            return None
 
     def delete_faces_for_file(self, file_id: int) -> int:
         """Delete all faces for a file."""
@@ -1653,7 +2734,7 @@ class Database:
     def get_unassigned_faces(
         self,
         limit: int = 10000,
-        min_confidence: Optional[float] = None,
+        min_confidence: float | None = None,
     ) -> list[Face]:
         """Get faces not assigned to any person."""
         query = "SELECT * FROM faces WHERE person_id IS NULL"
@@ -1667,6 +2748,46 @@ class Database:
             rows = conn.execute(query, params).fetchall()
             return [Face(**dict(row)) for row in rows]
 
+    def get_unassigned_faces_in_directory(
+        self,
+        directory_path: str,
+        min_confidence: float | None = None,
+        limit: int = 10000,
+    ) -> list[Face]:
+        """Get faces not assigned to any person within a directory."""
+        normalized_path = os.path.normcase(os.path.normpath(directory_path))
+
+        with self.connection() as conn:
+            # Step 1: Get all file IDs in this directory
+            file_rows = conn.execute(
+                "SELECT id, path FROM files WHERE is_deleted = FALSE"
+            ).fetchall()
+            dir_file_ids = []
+            for file_row in file_rows:
+                norm = os.path.normcase(os.path.normpath(file_row[1]))
+                if norm.startswith(normalized_path):
+                    dir_file_ids.append(file_row[0])
+
+            if not dir_file_ids:
+                return []
+
+            # Step 2: Get unassigned faces for those files
+            placeholders = ", ".join("?" for _ in dir_file_ids)
+            query = f"""
+                SELECT * FROM faces
+                WHERE person_id IS NULL
+                  AND file_id IN ({placeholders})
+            """
+            params: list[Any] = list(dir_file_ids)
+            if min_confidence is not None:
+                query += " AND confidence >= ?"
+                params.append(min_confidence)
+            query += " LIMIT ?"
+            params.append(limit)
+
+            rows = conn.execute(query, params).fetchall()
+            return [Face(**dict(row)) for row in rows]
+
     def get_all_faces(self, limit: int = 100000) -> list[Face]:
         """Get all faces."""
         with self.connection() as conn:
@@ -1675,7 +2796,7 @@ class Database:
             ).fetchall()
             return [Face(**dict(row)) for row in rows]
 
-    def add_face_blacklist(self, file_id: int, reason: Optional[str] = None) -> None:
+    def add_face_blacklist(self, file_id: int, reason: str | None = None) -> None:
         """Blacklist a file from future face detection."""
         with self.connection() as conn:
             conn.execute(
@@ -1696,6 +2817,65 @@ class Database:
             ).fetchone()
             return row is not None
 
+    # ==========================================================================
+    # PDF Extractions
+    # ==========================================================================
+
+    def add_pdf_extraction(
+        self, source_file_id: int, page_number: int, extracted_file_id: int
+    ) -> None:
+        """Record that a PDF page has been extracted to a JPEG file."""
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO pdf_extractions (source_file_id, page_number, extracted_file_id, created_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(source_file_id, page_number) DO UPDATE SET
+                       extracted_file_id = ?, created_at = ?""",
+                (
+                    source_file_id, page_number, extracted_file_id, datetime.now(),
+                    extracted_file_id, datetime.now(),
+                )
+            )
+
+    def get_pdf_extractions(self, source_file_id: int) -> list[tuple[int, int]]:
+        """Get all extracted pages for a PDF.
+
+        Returns:
+            List of (page_number, extracted_file_id) sorted by page_number.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT page_number, extracted_file_id FROM pdf_extractions
+                   WHERE source_file_id = ? ORDER BY page_number""",
+                (source_file_id,)
+            ).fetchall()
+            return [(row["page_number"], row["extracted_file_id"]) for row in rows]
+
+    def get_pdf_extracted_page(
+        self, source_file_id: int, page_number: int
+    ) -> int | None:
+        """Get the extracted file ID for a specific PDF page.
+
+        Returns:
+            extracted_file_id or None if not extracted.
+        """
+        with self.connection() as conn:
+            row = conn.execute(
+                """SELECT extracted_file_id FROM pdf_extractions
+                   WHERE source_file_id = ? AND page_number = ?""",
+                (source_file_id, page_number)
+            ).fetchone()
+            return row["extracted_file_id"] if row else None
+
+    def is_pdf_extracted(self, source_file_id: int) -> bool:
+        """Check if a PDF has any extracted page JPEGs."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pdf_extractions WHERE source_file_id = ? LIMIT 1",
+                (source_file_id,)
+            ).fetchone()
+            return row is not None
+
     def create_face_cluster_run(self, method: str = "auto") -> int:
         """Create a new face cluster run."""
         with self.connection() as conn:
@@ -1705,7 +2885,7 @@ class Database:
             )
             return cursor.fetchone()[0]
 
-    def get_latest_face_cluster_run(self) -> Optional[tuple[int, str]]:
+    def get_latest_face_cluster_run(self) -> tuple[int, str] | None:
         """Get the most recent face cluster run."""
         with self.connection() as conn:
             row = conn.execute(
@@ -1771,7 +2951,7 @@ class Database:
         clusters: dict[int, list[int]] = {}
         for row in rows:
             clusters.setdefault(row["cluster_id"], []).append(row["face_id"])
-        return [(cid, face_ids) for cid, face_ids in clusters.items()]
+        return list(clusters.items())
 
     def move_faces_to_new_cluster(
         self,
@@ -1779,7 +2959,7 @@ class Database:
         face_ids: list[int],
         from_cluster_id: int,
         method: str = "manual",
-    ) -> Optional[int]:
+    ) -> int | None:
         """Move faces to a new cluster and record history."""
         if not face_ids:
             return None
@@ -1820,7 +3000,7 @@ class Database:
             cursor = conn.execute("DELETE FROM faces")
             return cursor.rowcount if cursor.rowcount is not None else 0
 
-    def delete_unassigned_faces(self, drive_id: Optional[str] = None) -> int:
+    def delete_unassigned_faces(self, drive_id: str | None = None) -> int:
         """Delete faces without a person assignment."""
         with self.connection() as conn:
             if drive_id:
@@ -1839,7 +3019,7 @@ class Database:
     def delete_low_confidence_faces(
         self,
         min_confidence: float,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> int:
         """Delete faces below a confidence threshold."""
         with self.connection() as conn:
@@ -1857,7 +3037,7 @@ class Database:
                 )
             return cursor.rowcount if cursor.rowcount is not None else 0
 
-    def get_face(self, face_id: int) -> Optional[Face]:
+    def get_face(self, face_id: int) -> Face | None:
         """Get a face by ID."""
         with self.connection() as conn:
             row = conn.execute(
@@ -1887,8 +3067,8 @@ class Database:
 
     def get_face_count(
         self,
-        person_id: Optional[int] = None,
-        min_confidence: Optional[float] = None,
+        person_id: int | None = None,
+        min_confidence: float | None = None,
     ) -> int:
         """Get count of faces, optionally for a specific person."""
         with self.connection() as conn:
@@ -1919,7 +3099,7 @@ class Database:
     def get_low_confidence_face_count(
         self,
         threshold: float,
-        drive_id: Optional[str] = None,
+        drive_id: str | None = None,
     ) -> int:
         """Get count of faces below the confidence threshold."""
         with self.connection() as conn:
@@ -1960,7 +3140,7 @@ class Database:
                 )
             )
 
-    def get_scene_analysis(self, file_id: int) -> Optional[SceneAnalysis]:
+    def get_scene_analysis(self, file_id: int) -> SceneAnalysis | None:
         """Get scene analysis for a file."""
         with self.connection() as conn:
             row = conn.execute(
@@ -1973,7 +3153,7 @@ class Database:
 
     def get_all_scene_analyses_with_embeddings(
         self, limit: int = 100000
-    ) -> list[tuple[int, Optional[bytes], Optional[str]]]:
+    ) -> list[tuple[int, bytes | None, str | None]]:
         """Get all scene analyses with embeddings for search.
 
         Returns:
@@ -2033,7 +3213,7 @@ class Database:
                 )
             )
 
-    def get_ocr_result(self, file_id: int) -> Optional[OCRResult]:
+    def get_ocr_result(self, file_id: int) -> OCRResult | None:
         """Get OCR result for a file."""
         with self.connection() as conn:
             row = conn.execute(
@@ -2088,7 +3268,7 @@ class Database:
             )
             return cursor.fetchone()[0]
 
-    def get_pet(self, pet_id: int) -> Optional[Pet]:
+    def get_pet(self, pet_id: int) -> Pet | None:
         """Get a pet by ID."""
         with self.connection() as conn:
             row = conn.execute(
@@ -2216,7 +3396,7 @@ class Database:
                 (pet_id, detection_id)
             )
 
-    def get_pet_detection_count(self, pet_id: Optional[int] = None) -> int:
+    def get_pet_detection_count(self, pet_id: int | None = None) -> int:
         """Get count of pet detections."""
         with self.connection() as conn:
             if pet_id is not None:
@@ -2280,31 +3460,33 @@ class Database:
         with self.connection() as conn:
             conn.execute(
                 """INSERT INTO ai_summaries (file_id, summary, summary_model,
-                   people_mentioned, activities, mood_atmosphere, time_of_day,
-                   season_weather, document_type, document_summary, key_entities,
-                   generated_at, user_edited)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   people_mentioned, pets_mentioned, activities, mood_atmosphere,
+                   time_of_day, season_weather, document_type, document_summary,
+                   key_entities, generated_at, user_edited)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(file_id) DO UPDATE SET
                    summary = ?, summary_model = ?, people_mentioned = ?,
-                   activities = ?, mood_atmosphere = ?, time_of_day = ?,
-                   season_weather = ?, document_type = ?, document_summary = ?,
-                   key_entities = ?, generated_at = ?, user_edited = ?""",
+                   pets_mentioned = ?, activities = ?, mood_atmosphere = ?,
+                   time_of_day = ?, season_weather = ?, document_type = ?,
+                   document_summary = ?, key_entities = ?, generated_at = ?,
+                   user_edited = ?""",
                 (
                     summary.file_id, summary.summary, summary.summary_model,
-                    summary.people_mentioned, summary.activities,
-                    summary.mood_atmosphere, summary.time_of_day,
+                    summary.people_mentioned, summary.pets_mentioned,
+                    summary.activities, summary.mood_atmosphere, summary.time_of_day,
                     summary.season_weather, summary.document_type,
                     summary.document_summary, summary.key_entities,
                     summary.generated_at or datetime.now(), summary.user_edited,
                     summary.summary, summary.summary_model, summary.people_mentioned,
-                    summary.activities, summary.mood_atmosphere, summary.time_of_day,
+                    summary.pets_mentioned, summary.activities,
+                    summary.mood_atmosphere, summary.time_of_day,
                     summary.season_weather, summary.document_type,
                     summary.document_summary, summary.key_entities,
                     summary.generated_at or datetime.now(), summary.user_edited
                 )
             )
 
-    def get_ai_summary(self, file_id: int) -> Optional[AISummary]:
+    def get_ai_summary(self, file_id: int) -> AISummary | None:
         """Get AI summary for a file."""
         with self.connection() as conn:
             row = conn.execute(
@@ -2337,7 +3519,7 @@ class Database:
 
     def get_files_needing_summary(
         self,
-        file_type: Optional[str] = None,
+        file_type: str | None = None,
         limit: int = 100
     ) -> list[FileRecord]:
         """Get files that don't have AI summaries yet.
@@ -2388,7 +3570,7 @@ class Database:
             )
             return cursor.fetchone()[0]
 
-    def get_tag(self, tag_id: int) -> Optional[Tag]:
+    def get_tag(self, tag_id: int) -> Tag | None:
         """Get a tag by ID."""
         with self.connection() as conn:
             row = conn.execute(
@@ -2402,7 +3584,7 @@ class Database:
                 return Tag(**data)
             return None
 
-    def get_tag_by_name(self, name: str) -> Optional[Tag]:
+    def get_tag_by_name(self, name: str) -> Tag | None:
         """Get a tag by name."""
         with self.connection() as conn:
             row = conn.execute(
@@ -2416,7 +3598,7 @@ class Database:
                 return Tag(**data)
             return None
 
-    def get_all_tags(self, category: Optional[TagCategory] = None) -> list[Tag]:
+    def get_all_tags(self, category: TagCategory | None = None) -> list[Tag]:
         """Get all tags, optionally filtered by category."""
         with self.connection() as conn:
             if category:
@@ -2440,7 +3622,7 @@ class Database:
     def get_or_create_tag(
         self,
         name: str,
-        category: Optional[TagCategory] = None,
+        category: TagCategory | None = None,
         is_system: bool = False
     ) -> int:
         """Get a tag by name, creating it if it doesn't exist.
@@ -2486,7 +3668,7 @@ class Database:
         self,
         file_id: int,
         tag_names: list[str],
-        category: Optional[TagCategory] = None,
+        category: TagCategory | None = None,
         source: TagSource = TagSource.AI,
         confidence: float = 1.0
     ) -> None:

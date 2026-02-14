@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS faces (
     confidence REAL,
     estimated_age INTEGER,
     estimated_gender TEXT,
+    page_number INTEGER DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -157,6 +158,18 @@ CREATE TABLE IF NOT EXISTS face_cluster_history (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- PDF page extraction tracking (links source PDF to extracted JPEG pages)
+CREATE TABLE IF NOT EXISTS pdf_extractions (
+    source_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,          -- 0-indexed internally
+    extracted_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_file_id, page_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pdf_extractions_source ON pdf_extractions(source_file_id);
+CREATE INDEX IF NOT EXISTS idx_pdf_extractions_extracted ON pdf_extractions(extracted_file_id);
+
 -- Per-file AI analysis status (used to avoid reprocessing)
 CREATE TABLE IF NOT EXISTS file_ai_status (
     file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -193,6 +206,7 @@ CREATE TABLE IF NOT EXISTS ai_summaries (
     summary TEXT,               -- "Emma and Dad at beach, golden retriever playing in waves"
     summary_model TEXT,         -- "llava:13b", "gpt-4-vision", "claude-3-opus"
     people_mentioned TEXT,      -- JSON: ["Emma", "Dad"]
+    pets_mentioned TEXT,        -- JSON: ["Max", "Whiskers"]
     activities TEXT,            -- JSON: ["playing", "swimming", "building sandcastle"]
     mood_atmosphere TEXT,       -- "joyful", "serene", "celebratory"
     time_of_day TEXT,           -- "sunset", "morning", "night"
@@ -261,6 +275,19 @@ CREATE INDEX IF NOT EXISTS idx_pets_species ON pets(species);
 CREATE INDEX IF NOT EXISTS idx_pet_detections_file ON pet_detections(file_id);
 CREATE INDEX IF NOT EXISTS idx_pet_detections_pet ON pet_detections(pet_id);
 
+-- Video frame hashes (for near-duplicate video detection)
+CREATE TABLE IF NOT EXISTS video_frames (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    frame_index INTEGER NOT NULL,
+    timestamp_sec REAL NOT NULL,
+    phash TEXT,
+    dhash TEXT,
+    UNIQUE(file_id, frame_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_video_frames_file ON video_frames(file_id);
+
 -- Action audit log (all file operations)
 CREATE TABLE IF NOT EXISTS action_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -307,6 +334,7 @@ CREATE INDEX IF NOT EXISTS idx_persons_name ON persons(name);
 CREATE VIRTUAL TABLE IF NOT EXISTS ai_summaries_fts USING fts5(
     summary,
     people_mentioned,
+    pets_mentioned,
     activities,
     document_summary,
     key_entities,
@@ -322,20 +350,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS ocr_fts USING fts5(
 
 -- Triggers to keep FTS tables in sync
 CREATE TRIGGER IF NOT EXISTS ai_summaries_ai AFTER INSERT ON ai_summaries BEGIN
-    INSERT INTO ai_summaries_fts(rowid, summary, people_mentioned, activities, document_summary, key_entities)
-    VALUES (new.file_id, new.summary, new.people_mentioned, new.activities, new.document_summary, new.key_entities);
+    INSERT INTO ai_summaries_fts(rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+    VALUES (new.file_id, new.summary, new.people_mentioned, new.pets_mentioned, new.activities, new.document_summary, new.key_entities);
 END;
 
 CREATE TRIGGER IF NOT EXISTS ai_summaries_ad AFTER DELETE ON ai_summaries BEGIN
-    INSERT INTO ai_summaries_fts(ai_summaries_fts, rowid, summary, people_mentioned, activities, document_summary, key_entities)
-    VALUES ('delete', old.file_id, old.summary, old.people_mentioned, old.activities, old.document_summary, old.key_entities);
+    INSERT INTO ai_summaries_fts(ai_summaries_fts, rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+    VALUES ('delete', old.file_id, old.summary, old.people_mentioned, old.pets_mentioned, old.activities, old.document_summary, old.key_entities);
 END;
 
 CREATE TRIGGER IF NOT EXISTS ai_summaries_au AFTER UPDATE ON ai_summaries BEGIN
-    INSERT INTO ai_summaries_fts(ai_summaries_fts, rowid, summary, people_mentioned, activities, document_summary, key_entities)
-    VALUES ('delete', old.file_id, old.summary, old.people_mentioned, old.activities, old.document_summary, old.key_entities);
-    INSERT INTO ai_summaries_fts(rowid, summary, people_mentioned, activities, document_summary, key_entities)
-    VALUES (new.file_id, new.summary, new.people_mentioned, new.activities, new.document_summary, new.key_entities);
+    INSERT INTO ai_summaries_fts(ai_summaries_fts, rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+    VALUES ('delete', old.file_id, old.summary, old.people_mentioned, old.pets_mentioned, old.activities, old.document_summary, old.key_entities);
+    INSERT INTO ai_summaries_fts(rowid, summary, people_mentioned, pets_mentioned, activities, document_summary, key_entities)
+    VALUES (new.file_id, new.summary, new.people_mentioned, new.pets_mentioned, new.activities, new.document_summary, new.key_entities);
 END;
 
 CREATE TRIGGER IF NOT EXISTS ocr_ai AFTER INSERT ON ocr_results BEGIN
@@ -350,6 +378,27 @@ CREATE TRIGGER IF NOT EXISTS ocr_au AFTER UPDATE ON ocr_results BEGIN
     INSERT INTO ocr_fts(ocr_fts, rowid, extracted_text) VALUES ('delete', old.file_id, old.extracted_text);
     INSERT INTO ocr_fts(rowid, extracted_text) VALUES (new.file_id, new.extracted_text);
 END;
+
+-- Celebrity identification matches (links faces to celebrity identification results)
+CREATE TABLE IF NOT EXISTS celebrity_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    face_id INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+    person_id INTEGER REFERENCES persons(id) ON DELETE SET NULL,
+    provider TEXT NOT NULL,             -- 'rekognition', 'local_db'
+    celebrity_name TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    external_id TEXT,                   -- Provider-specific ID
+    external_urls TEXT,                 -- JSON: [{"label":"IMDB","url":"..."}]
+    known_for TEXT,                     -- Short description from API
+    status TEXT DEFAULT 'pending',      -- 'pending', 'confirmed', 'rejected'
+    reviewed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(face_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_celebrity_matches_face ON celebrity_matches(face_id);
+CREATE INDEX IF NOT EXISTS idx_celebrity_matches_status ON celebrity_matches(status);
+CREATE INDEX IF NOT EXISTS idx_celebrity_matches_name ON celebrity_matches(celebrity_name);
 
 -- Insert initial schema version
 INSERT OR IGNORE INTO schema_version (version) VALUES (2);
