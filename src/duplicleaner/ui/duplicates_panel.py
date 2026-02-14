@@ -5,7 +5,9 @@ Dear PyGui UI component for reviewing and resolving duplicate files.
 
 import os
 import subprocess
+import time
 import threading
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +16,7 @@ import dearpygui.dearpygui as dpg
 
 try:
     import numpy as np
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageChops, ImageOps
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -59,6 +61,14 @@ class DuplicatesPanel:
     TAG_EXPORT_DIALOG = "dup_export_dialog"
     TAG_EXPORT_FORMAT = "dup_export_format"
     TAG_EXPORT_SCOPE = "dup_export_scope"
+    TAG_CMP_MODE_TOOLBAR = "cmp_mode_toolbar"
+    TAG_CMP_DRAWLIST = "cmp_drawlist"
+    TAG_CMP_BLEND_SLIDER = "cmp_blend_slider"
+    TAG_CMP_ZOOM_TEXT = "cmp_zoom_text"
+    TAG_CMP_HANDLER_REGISTRY = "cmp_handler_registry"
+    TAG_CMP_PDF_NAV = "cmp_pdf_nav"
+    TAG_CMP_PDF_PAGE_TEXT = "cmp_pdf_page_text"
+    TAG_CMP_PDF_DIFF_TEXT = "cmp_pdf_diff_text"
 
     # Image file extensions for preview
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.heic', '.heif'}
@@ -127,6 +137,44 @@ class DuplicatesPanel:
         self._ctx_file_id: int | None = None
         self._group_row_handler_registries: list[int | str] = []
         self._file_detail_handler_registries: list[int | str] = []
+
+        # Comparison mode state (for 2-image overlay modes)
+        self._cmp_mode: str = "grid"
+        self._cmp_is_two_images: bool = False
+        self._cmp_images: list = []  # Full-res PIL images (max 2)
+        self._cmp_image_paths: list[str] = []
+        self._cmp_common_size: tuple[int, int] = (0, 0)
+
+        # Overlay mode state
+        self._cmp_blend_alpha: float = 0.5
+        self._cmp_swipe_position: float = 0.5
+        self._cmp_flicker_index: int = 0
+        self._cmp_flicker_timer: float = 0.0
+        self._cmp_flicker_interval: float = 0.5
+
+        # Comparison viewport textures
+        self._cmp_overlay_texture: str | None = None
+        self._cmp_grid_drawlist_tags: list[str] = []
+        self._cmp_grid_textures: list[str | None] = [None, None]
+
+        # Synchronized zoom/pan state
+        self._cmp_zoom_level: float = 1.0
+        self._cmp_pan_x: float = 0.0
+        self._cmp_pan_y: float = 0.0
+        self._cmp_fit_scale: float = 1.0
+        self._cmp_viewport_size: tuple[int, int] = (400, 400)
+
+        # PDF page comparison state
+        self._cmp_is_pdf_pair: bool = False
+        self._cmp_pdf_paths: list[str] = []
+        self._cmp_pdf_page_counts: list[int] = []
+        self._cmp_pdf_current_page: int = 0
+        self._cmp_pdf_diff_pages: list[int] = []
+        self._cmp_pdf_diff_thread: threading.Thread | None = None
+        self._cmp_standalone_mode: bool = False
+        self._cmp_pdf_scan_done: bool = False
+        self._cmp_pdf_scan_result: list[int] = []
+        self._cmp_pdf_scan_nav_target: int | None = None
 
         # Build UI
         self._build_ui()
@@ -446,6 +494,51 @@ class DuplicatesPanel:
                 tag="comparison_hint"
             )
             dpg.add_separator()
+
+            # Mode toolbar (hidden by default, shown when exactly 2 images)
+            with dpg.group(horizontal=True, tag=self.TAG_CMP_MODE_TOOLBAR, show=False):
+                dpg.add_text("View:")
+                dpg.add_button(label="[Grid]", callback=lambda: self._set_cmp_mode("grid"),
+                               tag="cmp_btn_grid", width=70)
+                dpg.add_button(label="Difference", callback=lambda: self._set_cmp_mode("difference"),
+                               tag="cmp_btn_difference", width=85)
+                dpg.add_button(label="Overlay", callback=lambda: self._set_cmp_mode("overlay"),
+                               tag="cmp_btn_overlay", width=70)
+                dpg.add_button(label="Flicker", callback=lambda: self._set_cmp_mode("flicker"),
+                               tag="cmp_btn_flicker", width=65)
+                dpg.add_button(label="Swipe", callback=lambda: self._set_cmp_mode("swipe"),
+                               tag="cmp_btn_swipe", width=60)
+                dpg.add_spacer(width=10)
+                dpg.add_slider_float(
+                    label="Blend",
+                    tag=self.TAG_CMP_BLEND_SLIDER,
+                    default_value=0.5,
+                    min_value=0.0,
+                    max_value=1.0,
+                    width=120,
+                    callback=self._on_blend_slider_change,
+                    show=False,
+                )
+                dpg.add_spacer(width=10)
+                dpg.add_button(label="Fit", callback=self._cmp_zoom_fit,
+                               tag="cmp_btn_fit", width=40)
+                dpg.add_button(label="1:1", callback=self._cmp_zoom_100,
+                               tag="cmp_btn_100", width=40)
+                dpg.add_text("100%", tag=self.TAG_CMP_ZOOM_TEXT)
+
+            # PDF page navigation bar (hidden by default)
+            with dpg.group(horizontal=True, tag=self.TAG_CMP_PDF_NAV, show=False):
+                dpg.add_button(label="<< First", callback=self._cmp_pdf_first, width=60)
+                dpg.add_button(label="< Prev", callback=self._cmp_pdf_prev, width=55)
+                dpg.add_text("Page 1 of 1", tag=self.TAG_CMP_PDF_PAGE_TEXT)
+                dpg.add_button(label="Next >", callback=self._cmp_pdf_next, width=55)
+                dpg.add_button(label="Last >>", callback=self._cmp_pdf_last, width=60)
+                dpg.add_spacer(width=15)
+                dpg.add_button(label="< Prev Diff", callback=self._cmp_pdf_prev_diff, width=80)
+                dpg.add_button(label="Next Diff >", callback=self._cmp_pdf_next_diff, width=80)
+                dpg.add_spacer(width=10)
+                dpg.add_text("", tag=self.TAG_CMP_PDF_DIFF_TEXT)
+
             dpg.add_spacer(height=5)
 
             # Container for images - will be populated dynamically
@@ -480,9 +573,17 @@ class DuplicatesPanel:
                 dpg.add_spacer(width=20)
                 dpg.add_button(
                     label="Close",
-                    callback=lambda: dpg.hide_item(self.TAG_COMPARISON_DIALOG),
+                    callback=self._close_comparison_dialog,
                     width=80
                 )
+
+        # Handler registry for zoom/pan in comparison dialog
+        with dpg.handler_registry(tag=self.TAG_CMP_HANDLER_REGISTRY):
+            dpg.add_mouse_wheel_handler(callback=self._on_cmp_mouse_wheel)
+            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left,
+                                       callback=self._on_cmp_mouse_drag)
+            dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left,
+                                          callback=self._on_cmp_mouse_release)
 
     def _create_confirm_dialog(self) -> None:
         """Create the action confirmation dialog."""
@@ -706,8 +807,8 @@ class DuplicatesPanel:
     def _show_comparison_dialog(self, group_id: int) -> None:
         """Show the comparison dialog for a duplicate group.
 
-        Supports any number of files in a grid layout (3 columns).
-        Each file has a checkbox to mark it as a keeper.
+        Supports any number of files in a grid layout.
+        When exactly 2 image files, enables overlay comparison modes and zoom/pan.
         """
         # Clear existing content
         children = dpg.get_item_children("comparison_content", slot=1)
@@ -719,6 +820,32 @@ class DuplicatesPanel:
         self._comparison_keep_checks = {}
         self._comparison_file_ids = []
         self._comparison_group_id = group_id
+
+        # Reset comparison mode state
+        self._cmp_mode = "grid"
+        self._cmp_images = []
+        self._cmp_image_paths = []
+        self._cmp_zoom_level = 1.0
+        self._cmp_pan_x = 0.0
+        self._cmp_pan_y = 0.0
+        self._cmp_blend_alpha = 0.5
+        self._cmp_swipe_position = 0.5
+        self._cmp_flicker_index = 0
+        self._cmp_flicker_timer = 0.0
+        self._cmp_is_two_images = False
+        self._cmp_grid_drawlist_tags = []
+        self._cmp_cleanup_overlay_texture()
+
+        # Reset PDF state
+        self._cmp_is_pdf_pair = False
+        self._cmp_pdf_paths = []
+        self._cmp_pdf_page_counts = []
+        self._cmp_pdf_current_page = 0
+        self._cmp_pdf_diff_pages = []
+        self._cmp_pdf_scan_done = False
+        self._cmp_pdf_scan_result = []
+        self._cmp_pdf_scan_nav_target = None
+        self._cmp_standalone_mode = False
 
         group = self.db.get_duplicate_group(group_id, include_files=True)
         if not group:
@@ -742,7 +869,207 @@ class DuplicatesPanel:
         # Store file IDs for action
         self._comparison_file_ids = [f.id for f in image_files]
 
-        # Determine grid columns based on file count
+        # Determine if this is a 2-image comparison (images only, not videos)
+        image_only_files = [f for f in image_files if self._is_image_file(f.path)]
+        self._cmp_is_two_images = (len(image_only_files) == 2)
+
+        # Show/hide mode toolbar
+        if dpg.does_item_exist(self.TAG_CMP_MODE_TOOLBAR):
+            dpg.configure_item(self.TAG_CMP_MODE_TOOLBAR, show=self._cmp_is_two_images)
+
+        # Preload full-resolution images for 2-image modes
+        if self._cmp_is_two_images:
+            self._cmp_load_full_images(image_only_files[0].path, image_only_files[1].path)
+
+        # Show/hide PDF navigation bar
+        if dpg.does_item_exist(self.TAG_CMP_PDF_NAV):
+            dpg.configure_item(self.TAG_CMP_PDF_NAV, show=self._cmp_is_pdf_pair)
+        if dpg.does_item_exist(self.TAG_CMP_PDF_DIFF_TEXT):
+            dpg.set_value(self.TAG_CMP_PDF_DIFF_TEXT, "Scanning pages..." if self._cmp_is_pdf_pair else "")
+        if dpg.does_item_exist(self.TAG_CMP_PDF_PAGE_TEXT):
+            if self._cmp_is_pdf_pair:
+                max_pages = max(self._cmp_pdf_page_counts) if self._cmp_pdf_page_counts else 1
+                dpg.set_value(self.TAG_CMP_PDF_PAGE_TEXT, f"Page 1 of {max_pages}")
+
+        # For PDF pairs, auto-switch to difference mode and start diff scan
+        if self._cmp_is_pdf_pair:
+            self._cmp_mode = "difference"
+            # Start background diff scan
+            self._cmp_pdf_diff_thread = threading.Thread(
+                target=self._cmp_pdf_scan_diffs,
+                daemon=True,
+            )
+            self._cmp_pdf_diff_thread.start()
+
+        # Reset blend slider
+        if dpg.does_item_exist(self.TAG_CMP_BLEND_SLIDER):
+            dpg.set_value(self.TAG_CMP_BLEND_SLIDER, 0.5)
+            dpg.configure_item(self.TAG_CMP_BLEND_SLIDER, show=False)
+
+        # Ensure action buttons are visible (may have been hidden by standalone mode)
+        for btn_tag in ("comparison_btn_quarantine", "comparison_btn_trash", "comparison_btn_delete"):
+            if dpg.does_item_exist(btn_tag):
+                dpg.configure_item(btn_tag, show=True)
+        if dpg.does_item_exist("comparison_hint"):
+            dpg.set_value(
+                "comparison_hint",
+                "Check the files you want to KEEP, then use the action buttons below.",
+            )
+
+        # Highlight active mode button
+        self._cmp_update_mode_buttons()
+
+        # Update zoom text
+        if dpg.does_item_exist(self.TAG_CMP_ZOOM_TEXT):
+            dpg.set_value(self.TAG_CMP_ZOOM_TEXT, "100%")
+
+        # Render the appropriate view
+        self._render_comparison_view(image_files)
+
+        # Show dialog
+        dpg.show_item(self.TAG_COMPARISON_DIALOG)
+        self._center_dialog(self.TAG_COMPARISON_DIALOG, 950, 750)
+
+    def show_file_comparison(self, path1: str, path2: str) -> None:
+        """Show comparison dialog for two arbitrary files (standalone mode).
+
+        Called from files panel's 'Compare with...' context menu.
+        No duplicate group is involved - action buttons are hidden.
+        """
+        # Clear existing content
+        children = dpg.get_item_children("comparison_content", slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+        # Reset comparison state
+        self._comparison_keep_checks = {}
+        self._comparison_file_ids = []
+        self._comparison_group_id = None
+        self._cmp_standalone_mode = True
+
+        # Reset comparison mode state
+        self._cmp_mode = "grid"
+        self._cmp_images = []
+        self._cmp_image_paths = []
+        self._cmp_zoom_level = 1.0
+        self._cmp_pan_x = 0.0
+        self._cmp_pan_y = 0.0
+        self._cmp_blend_alpha = 0.5
+        self._cmp_swipe_position = 0.5
+        self._cmp_flicker_index = 0
+        self._cmp_flicker_timer = 0.0
+        self._cmp_is_two_images = True
+        self._cmp_grid_drawlist_tags = []
+        self._cmp_cleanup_overlay_texture()
+
+        # Reset PDF state
+        self._cmp_is_pdf_pair = False
+        self._cmp_pdf_paths = []
+        self._cmp_pdf_page_counts = []
+        self._cmp_pdf_current_page = 0
+        self._cmp_pdf_diff_pages = []
+        self._cmp_pdf_scan_done = False
+        self._cmp_pdf_scan_result = []
+        self._cmp_pdf_scan_nav_target = None
+
+        # Load images
+        self._cmp_load_full_images(path1, path2)
+
+        # Show/hide toolbars
+        if dpg.does_item_exist(self.TAG_CMP_MODE_TOOLBAR):
+            dpg.configure_item(self.TAG_CMP_MODE_TOOLBAR, show=True)
+        if dpg.does_item_exist(self.TAG_CMP_PDF_NAV):
+            dpg.configure_item(self.TAG_CMP_PDF_NAV, show=self._cmp_is_pdf_pair)
+        if dpg.does_item_exist(self.TAG_CMP_PDF_DIFF_TEXT):
+            dpg.set_value(self.TAG_CMP_PDF_DIFF_TEXT, "Scanning pages..." if self._cmp_is_pdf_pair else "")
+        if dpg.does_item_exist(self.TAG_CMP_PDF_PAGE_TEXT):
+            if self._cmp_is_pdf_pair:
+                max_pages = max(self._cmp_pdf_page_counts) if self._cmp_pdf_page_counts else 1
+                dpg.set_value(self.TAG_CMP_PDF_PAGE_TEXT, f"Page 1 of {max_pages}")
+
+        # For PDF pairs, auto-switch to difference mode and start diff scan
+        if self._cmp_is_pdf_pair:
+            self._cmp_mode = "difference"
+            self._cmp_pdf_diff_thread = threading.Thread(
+                target=self._cmp_pdf_scan_diffs,
+                daemon=True,
+            )
+            self._cmp_pdf_diff_thread.start()
+
+        # Reset blend slider
+        if dpg.does_item_exist(self.TAG_CMP_BLEND_SLIDER):
+            dpg.set_value(self.TAG_CMP_BLEND_SLIDER, 0.5)
+            dpg.configure_item(self.TAG_CMP_BLEND_SLIDER, show=False)
+
+        # Update mode buttons
+        self._cmp_update_mode_buttons()
+
+        # Update zoom text
+        if dpg.does_item_exist(self.TAG_CMP_ZOOM_TEXT):
+            dpg.set_value(self.TAG_CMP_ZOOM_TEXT, "100%")
+
+        # Hide action buttons in standalone mode
+        if dpg.does_item_exist("comparison_btn_quarantine"):
+            dpg.configure_item("comparison_btn_quarantine", show=False)
+        if dpg.does_item_exist("comparison_btn_trash"):
+            dpg.configure_item("comparison_btn_trash", show=False)
+        if dpg.does_item_exist("comparison_btn_delete"):
+            dpg.configure_item("comparison_btn_delete", show=False)
+        if dpg.does_item_exist("comparison_hint"):
+            dpg.set_value("comparison_hint", f"Comparing: {Path(path1).name}  vs  {Path(path2).name}")
+
+        # Build a minimal file list for rendering
+        class _StandaloneFile:
+            def __init__(self, path):
+                self.path = path
+                self.filename = Path(path).name
+                self.id = None
+                self.size = os.path.getsize(path) if os.path.exists(path) else 0
+                self.modified = datetime.fromtimestamp(os.path.getmtime(path)) if os.path.exists(path) else None
+
+        standalone_files = [_StandaloneFile(path1), _StandaloneFile(path2)]
+
+        # Render the view
+        self._render_comparison_view(standalone_files)
+
+        # Show dialog
+        dpg.show_item(self.TAG_COMPARISON_DIALOG)
+        self._center_dialog(self.TAG_COMPARISON_DIALOG, 950, 750)
+
+    def _find_best_quality_file(self, image_files: list) -> int | None:
+        """Find the file ID with the best quality score."""
+        best_file_id = None
+        best_score = -1
+        for file in image_files:
+            analysis = self.db.get_scene_analysis(file.id)
+            if analysis and analysis.quality_score is not None and analysis.quality_score > best_score:
+                best_score = analysis.quality_score
+                best_file_id = file.id
+        return best_file_id
+
+    def _render_comparison_view(self, image_files: list) -> None:
+        """Render the comparison view based on current mode."""
+        # Clear existing content
+        children = dpg.get_item_children("comparison_content", slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+        # Clean up old overlay texture
+        self._cmp_cleanup_overlay_texture()
+
+        if self._cmp_mode == "grid":
+            self._render_cmp_grid(image_files)
+        elif self._cmp_mode in ("difference", "overlay", "flicker", "swipe"):
+            if not self._cmp_is_two_images:
+                dpg.add_text("Overlay modes require exactly 2 images.",
+                             parent="comparison_content")
+                return
+            self._render_cmp_overlay_mode()
+
+    def _render_cmp_grid(self, image_files: list) -> None:
+        """Render the grid comparison view."""
         n_files = len(image_files)
         if n_files <= 2:
             n_cols = n_files
@@ -757,41 +1084,47 @@ class DuplicatesPanel:
             n_cols = 4
             thumb_size = 200
 
-        # Find best quality file for default selection
-        best_file_id = None
-        best_score = -1
-        for file in image_files:
-            analysis = self.db.get_scene_analysis(file.id)
-            if analysis and analysis.quality_score is not None and analysis.quality_score > best_score:
-                best_score = analysis.quality_score
-                best_file_id = file.id
+        best_file_id = self._find_best_quality_file(image_files)
+        use_drawlists = (n_files == 2 and self._cmp_is_two_images)
+        self._cmp_grid_drawlist_tags = []
 
-        # Render grid rows
         for row_start in range(0, n_files, n_cols):
             row_files = image_files[row_start:row_start + n_cols]
             with dpg.group(horizontal=True, parent="comparison_content"):
-                for file in row_files:
+                for idx, file in enumerate(row_files):
+                    file_index = row_start + idx
                     with dpg.child_window(width=thumb_size + 30, border=True, height=-1, autosize_y=True):
-                        # Keep checkbox
-                        cb_tag = f"cmp_keep_{file.id}"
-                        is_best = (file.id == best_file_id)
-                        dpg.add_checkbox(
-                            label="KEEP" + (" (Best)" if is_best else ""),
-                            tag=cb_tag,
-                            default_value=is_best,
-                        )
-                        self._comparison_keep_checks[file.id] = cb_tag
+                        # Keep checkbox (use index for standalone mode where id is None)
+                        file_key = file.id if file.id is not None else f"standalone_{file_index}"
+                        cb_tag = f"cmp_keep_{file_key}"
+                        is_best = (file.id is not None and file.id == best_file_id)
+                        if not self._cmp_standalone_mode:
+                            dpg.add_checkbox(
+                                label="KEEP" + (" (Best)" if is_best else ""),
+                                tag=cb_tag,
+                                default_value=is_best,
+                            )
+                            self._comparison_keep_checks[file.id] = cb_tag
 
                         # Thumbnail or video info
                         if self._is_image_file(file.path):
-                            texture_tag = self._load_image_texture(file.path, size=thumb_size)
-                            if texture_tag:
-                                dpg.add_image(texture_tag)
+                            if use_drawlists and file_index < 2:
+                                dl_tag = f"cmp_grid_draw_{file_index}"
+                                self._cmp_grid_drawlist_tags.append(dl_tag)
+                                dpg.add_drawlist(
+                                    width=thumb_size, height=thumb_size,
+                                    tag=dl_tag
+                                )
+                                self._cmp_render_grid_drawlist(file_index, thumb_size)
                             else:
-                                dpg.add_text("[Preview unavailable]", color=get_text_color("disabled"))
+                                texture_tag = self._load_image_texture(file.path, size=thumb_size)
+                                if texture_tag:
+                                    dpg.add_image(texture_tag)
+                                else:
+                                    dpg.add_text("[Preview unavailable]", color=get_text_color("disabled"))
                         elif self._is_video_file(file.path):
                             dpg.add_text("[VIDEO]", color=get_accent_color())
-                            vid_meta = self.db.get_file_metadata(file.id)
+                            vid_meta = self.db.get_file_metadata(file.id) if file.id is not None else None
                             if vid_meta:
                                 if vid_meta.duration_seconds:
                                     mins = int(vid_meta.duration_seconds // 60)
@@ -826,7 +1159,7 @@ class DuplicatesPanel:
                             )
 
                         # EXIF metadata
-                        metadata = self.db.get_file_metadata(file.id)
+                        metadata = self.db.get_file_metadata(file.id) if file.id is not None else None
                         if metadata:
                             if metadata.camera_make or metadata.camera_model:
                                 camera = " ".join(filter(None, [metadata.camera_make, metadata.camera_model]))
@@ -837,7 +1170,7 @@ class DuplicatesPanel:
                                 dpg.add_text(f"Location: {metadata.location_name}", color=get_text_color("disabled"), wrap=thumb_size)
 
                         # Quality scores
-                        analysis = self.db.get_scene_analysis(file.id)
+                        analysis = self.db.get_scene_analysis(file.id) if file.id is not None else None
                         if analysis and analysis.quality_score is not None:
                             score = analysis.quality_score
                             q_color = get_status_color("success") if score >= 80 else get_status_color("warning") if score >= 50 else get_status_color("error")
@@ -864,9 +1197,863 @@ class DuplicatesPanel:
                                 width=60
                             )
 
-        # Show dialog
-        dpg.show_item(self.TAG_COMPARISON_DIALOG)
-        self._center_dialog(self.TAG_COMPARISON_DIALOG, 950, 750)
+    # --- Comparison: Image Loading Helpers ---
+
+    def _cmp_load_full_images(self, path1: str, path2: str) -> None:
+        """Load two full-resolution images and compute common dimensions.
+
+        Supports PDF files by rendering the current page via PyMuPDF.
+        """
+        self._cmp_images = []
+        self._cmp_image_paths = [path1, path2]
+
+        # Detect PDF pair
+        is_pdf1 = path1.lower().endswith('.pdf')
+        is_pdf2 = path2.lower().endswith('.pdf')
+        if is_pdf1 and is_pdf2:
+            self._cmp_is_pdf_pair = True
+            self._cmp_pdf_paths = [path1, path2]
+            from duplicleaner.ui.files_panel import _get_pdf_page_count
+            self._cmp_pdf_page_counts = [
+                _get_pdf_page_count(path1),
+                _get_pdf_page_count(path2),
+            ]
+        else:
+            self._cmp_is_pdf_pair = False
+            self._cmp_pdf_paths = []
+            self._cmp_pdf_page_counts = []
+
+        for path in [path1, path2]:
+            try:
+                if path.lower().endswith('.pdf'):
+                    from duplicleaner.ui.files_panel import _render_pdf_page
+                    img = _render_pdf_page(path, page_num=self._cmp_pdf_current_page, zoom=2.0)
+                    if img is None:
+                        self._cmp_images.append(None)
+                        continue
+                else:
+                    img = Image.open(path)
+                    img = ImageOps.exif_transpose(img)
+                # Cap at 4000px max dimension to limit memory
+                max_dim = 4000
+                if img.width > max_dim or img.height > max_dim:
+                    scale = min(max_dim / img.width, max_dim / img.height)
+                    img = img.resize(
+                        (int(img.width * scale), int(img.height * scale)),
+                        Image.Resampling.LANCZOS,
+                    )
+                if img.mode != "RGBA":
+                    img = img.convert("RGBA")
+                self._cmp_images.append(img)
+            except Exception as e:
+                logger.warning("Failed to load image for comparison: %s: %s", path, e)
+                self._cmp_images.append(None)
+
+        # Compute common size for overlay modes
+        if len(self._cmp_images) == 2 and all(self._cmp_images):
+            w1, h1 = self._cmp_images[0].size
+            w2, h2 = self._cmp_images[1].size
+            common_w = max(w1, w2)
+            common_h = max(h1, h2)
+            self._cmp_common_size = (common_w, common_h)
+
+            # Compute fit scale for viewport
+            viewport_w = 880
+            viewport_h = 550
+            self._cmp_viewport_size = (viewport_w, viewport_h)
+            self._cmp_fit_scale = min(
+                viewport_w / max(common_w, 1),
+                viewport_h / max(common_h, 1),
+                1.0,
+            )
+            self._cmp_zoom_level = self._cmp_fit_scale
+        else:
+            self._cmp_common_size = (0, 0)
+
+    def _cmp_get_resized_pair(self):
+        """Get both images resized to common dimensions."""
+        if len(self._cmp_images) != 2:
+            return None, None
+        w, h = self._cmp_common_size
+        if w == 0 or h == 0:
+            return None, None
+
+        results = []
+        for img in self._cmp_images:
+            if img is None:
+                results.append(None)
+                continue
+            if img.size != (w, h):
+                resized = img.resize((w, h), Image.Resampling.LANCZOS)
+            else:
+                resized = img.copy()
+            results.append(resized)
+        return results[0], results[1]
+
+    # --- Comparison: Overlay Mode Rendering ---
+
+    def _render_cmp_overlay_mode(self) -> None:
+        """Render overlay comparison modes (difference, blend, flicker, swipe)."""
+        img1, img2 = self._cmp_get_resized_pair()
+        if img1 is None or img2 is None:
+            dpg.add_text("Could not load images for comparison.",
+                         parent="comparison_content")
+            return
+
+        # Check for pixel-identical images in difference mode
+        if self._cmp_mode == "difference":
+            diff_raw = ImageChops.difference(img1.convert("RGB"), img2.convert("RGB"))
+            if not diff_raw.getbbox():
+                dpg.add_text("Images are pixel-identical.",
+                             parent="comparison_content",
+                             color=get_status_color("success"))
+                dpg.add_spacer(height=5, parent="comparison_content")
+
+        # Keep checkboxes for the 2 files (or labels in standalone mode)
+        with dpg.group(horizontal=True, parent="comparison_content"):
+            for i, path in enumerate(self._cmp_image_paths):
+                file_id = self._comparison_file_ids[i] if i < len(self._comparison_file_ids) else None
+                if self._cmp_standalone_mode:
+                    label = "A" if i == 0 else "B"
+                    dpg.add_text(f"[{label}] {Path(path).name}", color=get_accent_color())
+                elif file_id is not None:
+                    cb_tag = f"cmp_keep_{file_id}"
+                    if file_id not in self._comparison_keep_checks:
+                        best_id = self._find_best_quality_file_by_ids(self._comparison_file_ids)
+                        dpg.add_checkbox(
+                            label=f"KEEP: {Path(path).name}",
+                            tag=cb_tag,
+                            default_value=(file_id == best_id),
+                        )
+                        self._comparison_keep_checks[file_id] = cb_tag
+                dpg.add_spacer(width=20)
+
+        # Create drawlist and render composite
+        viewport_w, viewport_h = self._cmp_viewport_size
+        dpg.add_drawlist(
+            width=viewport_w, height=viewport_h,
+            tag=self.TAG_CMP_DRAWLIST,
+            parent="comparison_content",
+        )
+
+        composite = self._cmp_build_composite(img1, img2)
+        if composite:
+            self._cmp_render_overlay_to_drawlist(composite)
+
+    def _find_best_quality_file_by_ids(self, file_ids: list[int]) -> int | None:
+        """Find the file ID with the best quality score from a list of IDs."""
+        best_id = None
+        best_score = -1
+        for fid in file_ids:
+            analysis = self.db.get_scene_analysis(fid)
+            if analysis and analysis.quality_score is not None and analysis.quality_score > best_score:
+                best_score = analysis.quality_score
+                best_id = fid
+        return best_id
+
+    def _cmp_build_composite(self, img1, img2):
+        """Build composite image based on current comparison mode."""
+        try:
+            if self._cmp_mode == "difference":
+                diff = ImageChops.difference(img1.convert("RGB"), img2.convert("RGB"))
+                diff_amplified = diff.point(lambda x: min(255, x * 3))
+                composite = diff_amplified.convert("RGBA")
+                # Add highlight boxes around changed regions for PDF pairs
+                if self._cmp_is_pdf_pair:
+                    self._draw_diff_highlight_boxes(composite, diff)
+                return composite
+            elif self._cmp_mode == "overlay":
+                alpha = self._cmp_blend_alpha
+                return Image.blend(img1, img2, alpha)
+            elif self._cmp_mode == "flicker":
+                return img1 if self._cmp_flicker_index == 0 else img2
+            elif self._cmp_mode == "swipe":
+                w, h = img1.size
+                split_x = int(w * self._cmp_swipe_position)
+                split_x = max(1, min(w - 1, split_x))
+                composite = img1.copy()
+                right_crop = img2.crop((split_x, 0, w, h))
+                composite.paste(right_crop, (split_x, 0))
+                return composite
+        except Exception as e:
+            logger.warning("Failed to build composite for mode %s: %s", self._cmp_mode, e)
+        return None
+
+    def _draw_diff_highlight_boxes(self, composite: "Image.Image", diff_rgb: "Image.Image") -> None:
+        """Draw semi-transparent highlight boxes around regions with pixel differences.
+
+        Divides the image into a grid of cells, finds cells with significant
+        differences, merges adjacent changed cells into rectangular regions,
+        and draws colored borders around them.
+        """
+        from PIL import ImageDraw
+
+        w, h = diff_rgb.size
+        # Convert diff to grayscale for threshold analysis
+        gray = diff_rgb.convert("L")
+        pixels = gray.load()
+
+        # Divide into grid cells
+        cell_cols = 30
+        cell_rows = 40
+        cell_w = max(1, w // cell_cols)
+        cell_h = max(1, h // cell_rows)
+        threshold = 25  # Pixel value threshold for "changed"
+        min_changed_pct = 0.02  # 2% of cell pixels must differ
+
+        # Find which cells have significant changes
+        changed_cells = set()
+        for cy in range(cell_rows):
+            for cx in range(cell_cols):
+                x0 = cx * cell_w
+                y0 = cy * cell_h
+                x1 = min(x0 + cell_w, w)
+                y1 = min(y0 + cell_h, h)
+                total = 0
+                changed = 0
+                for py in range(y0, y1, 2):  # Sample every 2nd pixel for speed
+                    for px in range(x0, x1, 2):
+                        total += 1
+                        if pixels[px, py] > threshold:
+                            changed += 1
+                if total > 0 and changed / total >= min_changed_pct:
+                    changed_cells.add((cx, cy))
+
+        if not changed_cells:
+            return
+
+        # Merge adjacent changed cells into rectangular regions using flood-fill
+        visited = set()
+        regions = []
+        for cell in sorted(changed_cells):
+            if cell in visited:
+                continue
+            # BFS to find connected component
+            bfs_queue = deque([cell])
+            visited.add(cell)
+            min_cx = max_cx = cell[0]
+            min_cy = max_cy = cell[1]
+            while bfs_queue:
+                cx, cy = bfs_queue.popleft()
+                min_cx = min(min_cx, cx)
+                max_cx = max(max_cx, cx)
+                min_cy = min(min_cy, cy)
+                max_cy = max(max_cy, cy)
+                for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nx, ny = cx + dx, cy + dy
+                    if (nx, ny) in changed_cells and (nx, ny) not in visited:
+                        visited.add((nx, ny))
+                        bfs_queue.append((nx, ny))
+            regions.append((min_cx, min_cy, max_cx, max_cy))
+
+        # Draw highlight rectangles on the composite
+        draw = ImageDraw.Draw(composite)
+        for min_cx, min_cy, max_cx, max_cy in regions:
+            x0 = max(0, min_cx * cell_w - 3)
+            y0 = max(0, min_cy * cell_h - 3)
+            x1 = min(w - 1, (max_cx + 1) * cell_w + 3)
+            y1 = min(h - 1, (max_cy + 1) * cell_h + 3)
+            # Draw a magenta border (2px thick)
+            for offset in range(3):
+                draw.rectangle(
+                    [x0 - offset, y0 - offset, x1 + offset, y1 + offset],
+                    outline=(255, 0, 200, 200),
+                )
+
+    def _cmp_render_overlay_to_drawlist(self, composite) -> None:
+        """Render a composite PIL image into the overlay drawlist with zoom/pan."""
+        if not dpg.does_item_exist(self.TAG_CMP_DRAWLIST):
+            return
+
+        # Clear drawlist children
+        for child in dpg.get_item_children(self.TAG_CMP_DRAWLIST, 2) or []:
+            dpg.delete_item(child)
+
+        # Clean up old overlay texture
+        self._cmp_cleanup_overlay_texture()
+
+        vw, vh = self._cmp_viewport_size
+        img_w, img_h = composite.size
+
+        # Compute the visible region in image space
+        scale = self._cmp_zoom_level
+        view_w_img = vw / max(scale, 0.01)
+        view_h_img = vh / max(scale, 0.01)
+
+        # Clamp pan
+        max_pan_x = max(0, img_w - view_w_img)
+        max_pan_y = max(0, img_h - view_h_img)
+        self._cmp_pan_x = max(0, min(self._cmp_pan_x, max_pan_x))
+        self._cmp_pan_y = max(0, min(self._cmp_pan_y, max_pan_y))
+
+        # Crop visible region
+        left = int(self._cmp_pan_x)
+        top = int(self._cmp_pan_y)
+        right = min(img_w, int(self._cmp_pan_x + view_w_img))
+        bottom = min(img_h, int(self._cmp_pan_y + view_h_img))
+
+        if right <= left or bottom <= top:
+            return
+
+        cropped = composite.crop((left, top, right, bottom))
+        cropped = cropped.resize((vw, vh), Image.Resampling.LANCZOS)
+
+        if cropped.mode != "RGBA":
+            cropped = cropped.convert("RGBA")
+        data = np.array(cropped).astype(np.float32) / 255.0
+
+        self._texture_counter += 1
+        tex_tag = f"cmp_overlay_tex_{self._texture_counter}"
+        if not dpg.does_item_exist("dup_texture_registry"):
+            dpg.add_texture_registry(tag="dup_texture_registry")
+        dpg.add_static_texture(
+            width=vw, height=vh,
+            default_value=data.flatten().tolist(),
+            tag=tex_tag,
+            parent="dup_texture_registry",
+        )
+        self._cmp_overlay_texture = tex_tag
+
+        # Draw background
+        dpg.draw_rectangle(
+            (0, 0), (vw, vh),
+            color=(30, 30, 30, 255), fill=(30, 30, 30, 255),
+            parent=self.TAG_CMP_DRAWLIST,
+        )
+
+        # Draw image
+        dpg.draw_image(
+            tex_tag, (0, 0), (vw, vh),
+            parent=self.TAG_CMP_DRAWLIST,
+        )
+
+        # Draw swipe divider line
+        if self._cmp_mode == "swipe":
+            divider_x = int(vw * self._cmp_swipe_position)
+            dpg.draw_line(
+                (divider_x, 0), (divider_x, vh),
+                color=(255, 255, 255, 200), thickness=2,
+                parent=self.TAG_CMP_DRAWLIST,
+            )
+            # Draw small handle
+            dpg.draw_rectangle(
+                (divider_x - 8, vh // 2 - 15),
+                (divider_x + 8, vh // 2 + 15),
+                color=(255, 255, 255, 200), fill=(100, 100, 100, 180),
+                parent=self.TAG_CMP_DRAWLIST,
+            )
+
+        # Update zoom text
+        if dpg.does_item_exist(self.TAG_CMP_ZOOM_TEXT):
+            pct = int(self._cmp_zoom_level / max(self._cmp_fit_scale, 0.01) * 100)
+            dpg.set_value(self.TAG_CMP_ZOOM_TEXT, f"{pct}%")
+
+    def _cmp_cleanup_overlay_texture(self) -> None:
+        """Clean up the current overlay texture."""
+        if self._cmp_overlay_texture and dpg.does_item_exist(self._cmp_overlay_texture):
+            with contextlib.suppress(Exception):
+                dpg.delete_item(self._cmp_overlay_texture)
+        self._cmp_overlay_texture = None
+
+    # --- Comparison: Mode Switching ---
+
+    def _set_cmp_mode(self, mode: str) -> None:
+        """Switch between comparison modes."""
+        old_mode = self._cmp_mode
+        self._cmp_mode = mode
+
+        # Reset zoom/pan when switching modes
+        self._cmp_zoom_level = self._cmp_fit_scale
+        self._cmp_pan_x = 0.0
+        self._cmp_pan_y = 0.0
+
+        # Show/hide blend slider
+        if dpg.does_item_exist(self.TAG_CMP_BLEND_SLIDER):
+            dpg.configure_item(self.TAG_CMP_BLEND_SLIDER, show=(mode == "overlay"))
+
+        # Highlight active mode button
+        self._cmp_update_mode_buttons()
+
+        # Reset flicker timer
+        self._cmp_flicker_index = 0
+        self._cmp_flicker_timer = time.time()
+
+        # Re-render
+        if self._comparison_group_id is not None:
+            group = self.db.get_duplicate_group(self._comparison_group_id, include_files=True)
+            if group:
+                image_files = [
+                    member.file for member in group.members
+                    if member.file and (self._is_image_file(member.file.path)
+                                        or self._is_video_file(member.file.path))
+                ]
+                # Preserve checkbox state by saving and restoring
+                saved_checks = {}
+                for fid, cb_tag in self._comparison_keep_checks.items():
+                    try:
+                        if dpg.does_item_exist(cb_tag):
+                            saved_checks[fid] = dpg.get_value(cb_tag)
+                    except Exception:
+                        pass
+                self._comparison_keep_checks = {}
+                self._render_comparison_view(image_files)
+                # Restore checkbox values
+                for fid, val in saved_checks.items():
+                    cb_tag = self._comparison_keep_checks.get(fid)
+                    if cb_tag and dpg.does_item_exist(cb_tag):
+                        dpg.set_value(cb_tag, val)
+
+    def _cmp_update_mode_buttons(self) -> None:
+        """Update mode button labels to highlight the active mode."""
+        modes = ["grid", "difference", "overlay", "flicker", "swipe"]
+        for m in modes:
+            btn_tag = f"cmp_btn_{m}"
+            if dpg.does_item_exist(btn_tag):
+                label = m.title()
+                if m == self._cmp_mode:
+                    label = f"[{label}]"
+                dpg.configure_item(btn_tag, label=label)
+
+    def _on_blend_slider_change(self, sender, app_data, user_data=None) -> None:
+        """Handle blend slider movement."""
+        self._cmp_blend_alpha = app_data
+        self._cmp_refresh_overlay()
+
+    def _cmp_refresh_overlay(self) -> None:
+        """Re-render the overlay without rebuilding the full UI."""
+        if self._cmp_mode not in ("difference", "overlay", "flicker", "swipe"):
+            return
+        img1, img2 = self._cmp_get_resized_pair()
+        if img1 is None or img2 is None:
+            return
+        composite = self._cmp_build_composite(img1, img2)
+        if composite:
+            self._cmp_render_overlay_to_drawlist(composite)
+
+    # --- Comparison: PDF Page Navigation ---
+
+    def _cmp_pdf_first(self, sender=None, app_data=None) -> None:
+        """Navigate to first PDF page."""
+        if self._cmp_is_pdf_pair:
+            self._cmp_pdf_go_to_page(0)
+
+    def _cmp_pdf_prev(self, sender=None, app_data=None) -> None:
+        """Navigate to previous PDF page."""
+        if self._cmp_is_pdf_pair and self._cmp_pdf_current_page > 0:
+            self._cmp_pdf_go_to_page(self._cmp_pdf_current_page - 1)
+
+    def _cmp_pdf_next(self, sender=None, app_data=None) -> None:
+        """Navigate to next PDF page."""
+        if not self._cmp_is_pdf_pair:
+            return
+        max_page = max(self._cmp_pdf_page_counts) if self._cmp_pdf_page_counts else 1
+        if self._cmp_pdf_current_page < max_page - 1:
+            self._cmp_pdf_go_to_page(self._cmp_pdf_current_page + 1)
+
+    def _cmp_pdf_last(self, sender=None, app_data=None) -> None:
+        """Navigate to last PDF page."""
+        if not self._cmp_is_pdf_pair:
+            return
+        max_page = max(self._cmp_pdf_page_counts) if self._cmp_pdf_page_counts else 1
+        self._cmp_pdf_go_to_page(max_page - 1)
+
+    def _cmp_pdf_prev_diff(self, sender=None, app_data=None) -> None:
+        """Navigate to previous page with differences."""
+        if not self._cmp_is_pdf_pair or not self._cmp_pdf_diff_pages:
+            return
+        # Find the largest diff page less than current
+        prev_pages = [p for p in self._cmp_pdf_diff_pages if p < self._cmp_pdf_current_page]
+        if prev_pages:
+            self._cmp_pdf_go_to_page(prev_pages[-1])
+        else:
+            # Wrap around to last diff page
+            self._cmp_pdf_go_to_page(self._cmp_pdf_diff_pages[-1])
+
+    def _cmp_pdf_next_diff(self, sender=None, app_data=None) -> None:
+        """Navigate to next page with differences."""
+        if not self._cmp_is_pdf_pair or not self._cmp_pdf_diff_pages:
+            return
+        # Find the smallest diff page greater than current
+        next_pages = [p for p in self._cmp_pdf_diff_pages if p > self._cmp_pdf_current_page]
+        if next_pages:
+            self._cmp_pdf_go_to_page(next_pages[0])
+        else:
+            # Wrap around to first diff page
+            self._cmp_pdf_go_to_page(self._cmp_pdf_diff_pages[0])
+
+    def _cmp_pdf_go_to_page(self, page_num: int) -> None:
+        """Render both PDFs at the given page and refresh the comparison."""
+        from duplicleaner.ui.files_panel import _render_pdf_page
+
+        self._cmp_pdf_current_page = page_num
+        max_pages = max(self._cmp_pdf_page_counts) if self._cmp_pdf_page_counts else 1
+
+        # Render each PDF at this page
+        new_images = []
+        for i, path in enumerate(self._cmp_pdf_paths):
+            page_count = self._cmp_pdf_page_counts[i] if i < len(self._cmp_pdf_page_counts) else 0
+            if page_num < page_count:
+                img = _render_pdf_page(path, page_num=page_num, zoom=2.0)
+            else:
+                img = None  # This PDF doesn't have this page
+
+            if img is not None:
+                max_dim = 4000
+                if img.width > max_dim or img.height > max_dim:
+                    scale = min(max_dim / img.width, max_dim / img.height)
+                    img = img.resize(
+                        (int(img.width * scale), int(img.height * scale)),
+                        Image.Resampling.LANCZOS,
+                    )
+                if img.mode != "RGBA":
+                    img = img.convert("RGBA")
+            else:
+                # Create a gray placeholder for missing pages
+                if new_images and new_images[0] is not None:
+                    w, h = new_images[0].size
+                else:
+                    w, h = 800, 1100  # Default letter-size ratio
+                img = Image.new("RGBA", (w, h), (80, 80, 80, 255))
+
+            new_images.append(img)
+
+        self._cmp_images = new_images
+
+        # Recompute common size
+        if len(self._cmp_images) == 2 and all(self._cmp_images):
+            w1, h1 = self._cmp_images[0].size
+            w2, h2 = self._cmp_images[1].size
+            common_w = max(w1, w2)
+            common_h = max(h1, h2)
+            self._cmp_common_size = (common_w, common_h)
+
+            viewport_w, viewport_h = self._cmp_viewport_size
+            self._cmp_fit_scale = min(
+                viewport_w / max(common_w, 1),
+                viewport_h / max(common_h, 1),
+                1.0,
+            )
+            self._cmp_zoom_level = self._cmp_fit_scale
+
+        # Update page indicator
+        if dpg.does_item_exist(self.TAG_CMP_PDF_PAGE_TEXT):
+            is_diff = page_num in self._cmp_pdf_diff_pages
+            marker = " [DIFF]" if is_diff else ""
+            dpg.set_value(
+                self.TAG_CMP_PDF_PAGE_TEXT,
+                f"Page {page_num + 1} of {max_pages}{marker}"
+            )
+
+        # Refresh the overlay/grid view
+        self._cmp_pan_x = 0.0
+        self._cmp_pan_y = 0.0
+        self._cmp_refresh_overlay()
+
+    def _cmp_pdf_scan_diffs(self) -> None:
+        """Scan all PDF page pairs to find pages with pixel differences.
+
+        Runs in a background thread to avoid blocking the UI.
+        """
+        from duplicleaner.ui.files_panel import _render_pdf_page
+
+        if not self._cmp_is_pdf_pair or len(self._cmp_pdf_paths) != 2:
+            return
+
+        path1, path2 = self._cmp_pdf_paths
+        count1 = self._cmp_pdf_page_counts[0] if len(self._cmp_pdf_page_counts) > 0 else 0
+        count2 = self._cmp_pdf_page_counts[1] if len(self._cmp_pdf_page_counts) > 1 else 0
+        max_pages = max(count1, count2)
+
+        diff_pages = []
+        for page_num in range(max_pages):
+            # If one PDF doesn't have this page, it's automatically different
+            if page_num >= count1 or page_num >= count2:
+                diff_pages.append(page_num)
+                continue
+
+            try:
+                img1 = _render_pdf_page(path1, page_num=page_num, zoom=1.0)
+                img2 = _render_pdf_page(path2, page_num=page_num, zoom=1.0)
+
+                if img1 is None or img2 is None:
+                    diff_pages.append(page_num)
+                    continue
+
+                # Resize to common dimensions for comparison
+                w = max(img1.width, img2.width)
+                h = max(img1.height, img2.height)
+                if img1.size != (w, h):
+                    img1 = img1.resize((w, h), Image.Resampling.LANCZOS)
+                if img2.size != (w, h):
+                    img2 = img2.resize((w, h), Image.Resampling.LANCZOS)
+
+                diff = ImageChops.difference(img1.convert("RGB"), img2.convert("RGB"))
+                if diff.getbbox() is not None:
+                    diff_pages.append(page_num)
+            except Exception as e:
+                logger.debug("Error comparing PDF page %d: %s", page_num, e)
+                diff_pages.append(page_num)
+
+        # Store results and signal main thread (DPG is not thread-safe)
+        sorted_diffs = sorted(diff_pages)
+        nav_target = None
+        if sorted_diffs and self._cmp_pdf_current_page not in sorted_diffs:
+            nav_target = sorted_diffs[0]
+        self._cmp_pdf_scan_result = sorted_diffs
+        self._cmp_pdf_scan_nav_target = nav_target
+        self._cmp_pdf_scan_done = True
+
+    # --- Comparison: Flicker Frame Callback ---
+
+    def on_frame(self) -> None:
+        """Process UI updates on the main thread. Called each render frame."""
+        # Process pending PDF diff scan results from background thread
+        if self._cmp_pdf_scan_done:
+            self._cmp_pdf_scan_done = False
+            self._cmp_pdf_diff_pages = self._cmp_pdf_scan_result
+            diff_pages = self._cmp_pdf_scan_result
+            self._cmp_pdf_scan_result = []
+            if dpg.does_item_exist(self.TAG_CMP_PDF_DIFF_TEXT):
+                if diff_pages:
+                    page_list = ", ".join(str(p + 1) for p in diff_pages[:10])
+                    if len(diff_pages) > 10:
+                        page_list += "..."
+                    dpg.set_value(
+                        self.TAG_CMP_PDF_DIFF_TEXT,
+                        f"{len(diff_pages)} page(s) differ: {page_list}"
+                    )
+                else:
+                    dpg.set_value(self.TAG_CMP_PDF_DIFF_TEXT, "All pages identical")
+            if self._cmp_pdf_scan_nav_target is not None:
+                self._cmp_pdf_go_to_page(self._cmp_pdf_scan_nav_target)
+                self._cmp_pdf_scan_nav_target = None
+
+        if self._cmp_mode != "flicker":
+            return
+        if not dpg.does_item_exist(self.TAG_COMPARISON_DIALOG):
+            return
+        if not dpg.is_item_shown(self.TAG_COMPARISON_DIALOG):
+            return
+
+        now = time.time()
+        if now - self._cmp_flicker_timer >= self._cmp_flicker_interval:
+            self._cmp_flicker_timer = now
+            self._cmp_flicker_index = 1 - self._cmp_flicker_index
+            self._cmp_refresh_overlay()
+
+    # --- Comparison: Zoom/Pan Mouse Handlers ---
+
+    def _on_cmp_mouse_wheel(self, sender, app_data, user_data=None) -> None:
+        """Handle mouse wheel for zoom in comparison dialog."""
+        if not dpg.does_item_exist(self.TAG_COMPARISON_DIALOG):
+            return
+        if not dpg.is_item_shown(self.TAG_COMPARISON_DIALOG):
+            return
+
+        hovering = self._cmp_is_hovering_drawlist()
+        if not hovering:
+            return
+
+        # Zoom: scroll up = zoom in, scroll down = zoom out
+        zoom_factor = 1.15
+        if app_data > 0:
+            self._cmp_zoom_level *= zoom_factor
+        elif app_data < 0:
+            self._cmp_zoom_level /= zoom_factor
+
+        # Clamp zoom
+        min_zoom = self._cmp_fit_scale * 0.5
+        self._cmp_zoom_level = max(min_zoom, min(self._cmp_zoom_level, 10.0))
+
+        self._cmp_refresh_current_view()
+
+    def _on_cmp_mouse_drag(self, sender, app_data, user_data=None) -> None:
+        """Handle mouse drag for pan in comparison dialog."""
+        if not dpg.does_item_exist(self.TAG_COMPARISON_DIALOG):
+            return
+        if not dpg.is_item_shown(self.TAG_COMPARISON_DIALOG):
+            return
+        if not self._cmp_is_hovering_drawlist():
+            return
+
+        # app_data for mouse_drag_handler: [mouse_x, dx, dy, ...]
+        if not app_data or len(app_data) < 3:
+            return
+
+        dx = app_data[1]
+        dy = app_data[2]
+
+        # In swipe mode, check if drag is near the divider
+        if self._cmp_mode == "swipe" and dpg.does_item_exist(self.TAG_CMP_DRAWLIST):
+            try:
+                mouse_x, _ = dpg.get_mouse_pos()
+                rect_min = dpg.get_item_rect_min(self.TAG_CMP_DRAWLIST)
+                local_x = mouse_x - rect_min[0]
+                vw = self._cmp_viewport_size[0]
+                divider_x = vw * self._cmp_swipe_position
+                if abs(local_x - divider_x) < 25:
+                    # Move divider instead of panning
+                    self._cmp_swipe_position = max(0.05, min(0.95, local_x / max(vw, 1)))
+                    self._cmp_refresh_overlay()
+                    return
+            except (KeyError, SystemError):
+                pass
+
+        # Convert screen delta to image-space delta
+        scale = max(self._cmp_zoom_level, 0.01)
+        self._cmp_pan_x -= dx / scale
+        self._cmp_pan_y -= dy / scale
+
+        self._cmp_refresh_current_view()
+
+    def _on_cmp_mouse_release(self, sender, app_data, user_data=None) -> None:
+        """Handle mouse release."""
+        pass
+
+    def _cmp_is_hovering_drawlist(self) -> bool:
+        """Check if the mouse is hovering over any comparison drawlist."""
+        # Check overlay drawlist
+        if self._cmp_mode in ("difference", "overlay", "flicker", "swipe"):
+            if dpg.does_item_exist(self.TAG_CMP_DRAWLIST):
+                try:
+                    if dpg.is_item_hovered(self.TAG_CMP_DRAWLIST):
+                        return True
+                except (KeyError, SystemError):
+                    pass
+        # Check grid drawlists
+        elif self._cmp_mode == "grid" and self._cmp_is_two_images:
+            for dl_tag in self._cmp_grid_drawlist_tags:
+                if dpg.does_item_exist(dl_tag):
+                    try:
+                        if dpg.is_item_hovered(dl_tag):
+                            return True
+                    except (KeyError, SystemError):
+                        pass
+        return False
+
+    # --- Comparison: Zoom Presets ---
+
+    def _cmp_zoom_fit(self) -> None:
+        """Reset zoom to fit the images in the viewport."""
+        self._cmp_zoom_level = self._cmp_fit_scale
+        self._cmp_pan_x = 0.0
+        self._cmp_pan_y = 0.0
+        self._cmp_refresh_current_view()
+
+    def _cmp_zoom_100(self) -> None:
+        """Set zoom to 1:1 (actual pixels)."""
+        self._cmp_zoom_level = 1.0
+        w, h = self._cmp_common_size
+        vw, vh = self._cmp_viewport_size
+        self._cmp_pan_x = max(0, (w - vw) / 2)
+        self._cmp_pan_y = max(0, (h - vh) / 2)
+        self._cmp_refresh_current_view()
+
+    def _cmp_refresh_current_view(self) -> None:
+        """Re-render the current view (either overlay or grid drawlists)."""
+        if self._cmp_mode in ("difference", "overlay", "flicker", "swipe"):
+            self._cmp_refresh_overlay()
+        elif self._cmp_mode == "grid" and self._cmp_is_two_images:
+            self._cmp_refresh_grid_drawlists()
+        # Update zoom text
+        if dpg.does_item_exist(self.TAG_CMP_ZOOM_TEXT):
+            pct = int(self._cmp_zoom_level / max(self._cmp_fit_scale, 0.01) * 100)
+            dpg.set_value(self.TAG_CMP_ZOOM_TEXT, f"{pct}%")
+
+    # --- Comparison: Grid Drawlist Rendering (Zoom in Grid Mode) ---
+
+    def _cmp_render_grid_drawlist(self, index: int, display_size: int) -> None:
+        """Render a single grid drawlist with zoom/pan for a 2-image comparison."""
+        dl_tag = f"cmp_grid_draw_{index}"
+        if not dpg.does_item_exist(dl_tag):
+            return
+
+        # Clear drawlist children
+        for child in dpg.get_item_children(dl_tag, 2) or []:
+            dpg.delete_item(child)
+
+        if index >= len(self._cmp_images) or self._cmp_images[index] is None:
+            return
+
+        img = self._cmp_images[index]
+        img_w, img_h = img.size
+
+        # Compute visible region based on zoom/pan
+        scale = max(self._cmp_zoom_level, 0.01)
+        view_w_img = display_size / scale
+        view_h_img = display_size / scale
+
+        pan_x = max(0, min(self._cmp_pan_x, max(0, img_w - view_w_img)))
+        pan_y = max(0, min(self._cmp_pan_y, max(0, img_h - view_h_img)))
+
+        left = int(pan_x)
+        top = int(pan_y)
+        right = min(img_w, int(pan_x + view_w_img))
+        bottom = min(img_h, int(pan_y + view_h_img))
+
+        if right <= left or bottom <= top:
+            return
+
+        cropped = img.crop((left, top, right, bottom))
+        cropped = cropped.resize((display_size, display_size), Image.Resampling.LANCZOS)
+
+        if cropped.mode != "RGBA":
+            cropped = cropped.convert("RGBA")
+        data = np.array(cropped).astype(np.float32) / 255.0
+
+        # Clean up old grid texture
+        if index < len(self._cmp_grid_textures) and self._cmp_grid_textures[index]:
+            if dpg.does_item_exist(self._cmp_grid_textures[index]):
+                with contextlib.suppress(Exception):
+                    dpg.delete_item(self._cmp_grid_textures[index])
+
+        self._texture_counter += 1
+        tex_tag = f"cmp_grid_tex_{self._texture_counter}"
+        if not dpg.does_item_exist("dup_texture_registry"):
+            dpg.add_texture_registry(tag="dup_texture_registry")
+        dpg.add_static_texture(
+            width=display_size, height=display_size,
+            default_value=data.flatten().tolist(),
+            tag=tex_tag,
+            parent="dup_texture_registry",
+        )
+        # Ensure list is large enough
+        while len(self._cmp_grid_textures) <= index:
+            self._cmp_grid_textures.append(None)
+        self._cmp_grid_textures[index] = tex_tag
+
+        dpg.draw_rectangle(
+            (0, 0), (display_size, display_size),
+            color=(30, 30, 30, 255), fill=(30, 30, 30, 255),
+            parent=dl_tag,
+        )
+        dpg.draw_image(tex_tag, (0, 0), (display_size, display_size), parent=dl_tag)
+
+    def _cmp_refresh_grid_drawlists(self) -> None:
+        """Re-render both grid drawlists with current zoom/pan."""
+        for i, dl_tag in enumerate(self._cmp_grid_drawlist_tags):
+            if dpg.does_item_exist(dl_tag):
+                size = dpg.get_item_width(dl_tag)
+                self._cmp_render_grid_drawlist(i, size)
+        # Update zoom text
+        if dpg.does_item_exist(self.TAG_CMP_ZOOM_TEXT):
+            pct = int(self._cmp_zoom_level / max(self._cmp_fit_scale, 0.01) * 100)
+            dpg.set_value(self.TAG_CMP_ZOOM_TEXT, f"{pct}%")
+
+    # --- Comparison: Close and Cleanup ---
+
+    def _close_comparison_dialog(self) -> None:
+        """Close the comparison dialog and clean up resources."""
+        self._cmp_cleanup_overlay_texture()
+        for tex in self._cmp_grid_textures:
+            if tex and dpg.does_item_exist(tex):
+                with contextlib.suppress(Exception):
+                    dpg.delete_item(tex)
+        self._cmp_grid_textures = [None, None]
+        self._cmp_images = []
+        self._cmp_image_paths = []
+        self._cmp_mode = "grid"
+        dpg.hide_item(self.TAG_COMPARISON_DIALOG)
 
     def _comparison_action(self, action_type: str) -> None:
         """Execute action on unchecked files in the comparison dialog.
@@ -2268,6 +3455,20 @@ class DuplicatesPanel:
         if dpg.does_item_exist("dup_texture_registry"):
             with contextlib.suppress(Exception):
                 dpg.delete_item("dup_texture_registry")
+
+        # Clean up comparison mode resources
+        self._cmp_cleanup_overlay_texture()
+        for tex in self._cmp_grid_textures:
+            if tex and dpg.does_item_exist(tex):
+                with contextlib.suppress(Exception):
+                    dpg.delete_item(tex)
+        self._cmp_grid_textures = [None, None]
+        self._cmp_images = []
+
+        # Clean up comparison handler registry
+        if dpg.does_item_exist(self.TAG_CMP_HANDLER_REGISTRY):
+            with contextlib.suppress(Exception):
+                dpg.delete_item(self.TAG_CMP_HANDLER_REGISTRY)
 
     # --- Export ---
 

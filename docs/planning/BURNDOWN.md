@@ -1,7 +1,7 @@
 # DupliCleaner Feature Burndown
 
 **Last updated:** 2026-02-14
-**Total items:** 130 | **Completed:** 128 | **Deferred:** 2 | **Remaining:** 0
+**Total items:** 130 | **Completed:** 130 | **Deferred:** 0 | **Remaining:** 0
 
 ---
 
@@ -112,9 +112,9 @@ Connect existing backend code to the UI. Establish undo/rollback so all future d
 **Doc:** [`side-by-side-comparison-enhancements.md`](side-by-side-comparison-enhancements.md)
 **Effort:** Medium | **Type:** UI work
 
-- [-] 1.4.1 - Implement synchronized zoom/pan between compared images (deferred - complex DPG work)
+- [x] 1.4.1 - Implement synchronized zoom/pan between compared images ~~2026-02-14~~
 - [x] 1.4.2 - Add EXIF comparison table below images ~~2026-02-12~~
-- [-] 1.4.3 - Add pixel difference / highlight overlay view (deferred - complex DPG work)
+- [x] 1.4.3 - Add pixel difference / highlight overlay view ~~2026-02-14~~
 - [x] 1.4.4 - Support multi-file grid comparison (3+ files) ~~2026-02-12~~
 
 ---
@@ -322,14 +322,14 @@ Power-user features requiring all foundational data.
 | Tier | Description | Items | Done | Deferred | % |
 |------|-------------|-------|------|----------|---|
 | 0 | UI Polish & Interaction | 28 | 28 | 0 | 100% |
-| 1 | Core Wiring & Safety Net | 20 | 18 | 2 | 100% |
+| 1 | Core Wiring & Safety Net | 20 | 20 | 0 | 100% |
 | 2 | Duplicate Detection Expansion | 10 | 10 | 0 | 100% |
 | 3 | Organization & File Management | 18 | 18 | 0 | 100% |
 | 4 | Face & Person Intelligence | 20 | 20 | 0 | 100% |
 | 5 | Pet & Audio Intelligence | 10 | 10 | 0 | 100% |
 | 6 | Data Portability & Reporting | 12 | 12 | 0 | 100% |
 | 7 | Advanced Analytics & Corpus | 12 | 12 | 0 | 100% |
-| **Total** | | **130** | **128** | **2** | **100%** |
+| **Total** | | **130** | **130** | **0** | **100%** |
 
 ---
 

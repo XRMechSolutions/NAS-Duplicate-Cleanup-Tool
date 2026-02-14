@@ -312,6 +312,10 @@ class DupliCleanerApp:
                 with dpg.tab(label="Log", tag=self.TAG_TAB_LOG):
                     self._create_log_panel()
 
+            # Wire cross-panel callbacks
+            if hasattr(self, 'files_panel') and hasattr(self, 'duplicates_panel'):
+                self.files_panel.on_compare_files = self.duplicates_panel.show_file_comparison
+
             # Status bar at bottom
             dpg.add_spacer(height=10)
             self._create_status_bar(parent=self.TAG_MAIN_WINDOW)
@@ -2061,6 +2065,8 @@ class DupliCleanerApp:
                         self.faces_panel.on_tab_activated()
             if self.faces_panel:
                 self.faces_panel.on_frame()
+            if self.duplicates_panel:
+                self.duplicates_panel.on_frame()
             dpg.render_dearpygui_frame()
 
         self.cleanup()

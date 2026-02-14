@@ -186,6 +186,10 @@ class FilesPanel:
         self._thumbnail_size: int = 96
         self._thumb_grid_handler_registries: list[int | str] = []
 
+        # Standalone file comparison callback (set by app after panels created)
+        self.on_compare_files: Callable[[str, str], None] | None = None
+        self._compare_source_path: str | None = None
+
         self._create_ui()
         self._create_assign_dialog()
         self._create_meta_preview_dialog()
@@ -450,6 +454,9 @@ class FilesPanel:
             dpg.add_selectable(label="Detect Faces", callback=self._ctx_detect_faces)
             dpg.add_separator()
             dpg.add_selectable(label="Copy Path", callback=self._ctx_copy_path)
+            dpg.add_separator()
+            dpg.add_selectable(label="Compare with...", callback=self._ctx_compare_with,
+                               tag="ctx_compare_with")
 
     def _on_key_up(self, sender, app_data) -> None:
         """Navigate to previous file in the list."""
@@ -2485,6 +2492,62 @@ class FilesPanel:
                 self.on_status_update(f"Copied: {file_record.path}")
         except Exception as exc:
             logger.error(f"Failed to copy path: {exc}")
+
+    def _ctx_compare_with(self, sender=None, app_data=None) -> None:
+        """Context menu: compare current file with another file."""
+        dpg.configure_item(self.TAG_CONTEXT_MENU, show=False)
+        self._context_menu_shown = False
+        if not self._selected_file_id:
+            return
+        file_record = self.db.get_file(self._selected_file_id)
+        if not file_record:
+            return
+        self._compare_source_path = file_record.path
+
+        # Open file dialog to pick comparison target
+        tag = "compare_file_dialog"
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+
+        # Determine file filter based on source file type
+        ext = Path(file_record.path).suffix.lower()
+        if ext == '.pdf':
+            default_ext = ".pdf"
+        else:
+            default_ext = ""
+
+        with dpg.file_dialog(
+            label="Select file to compare with",
+            callback=self._on_compare_file_selected,
+            cancel_callback=lambda: None,
+            tag=tag,
+            width=700,
+            height=400,
+            default_path=str(Path(file_record.path).parent),
+        ):
+            if ext == '.pdf':
+                dpg.add_file_extension(".pdf", color=(0, 255, 0, 255))
+            dpg.add_file_extension(".*")
+
+    def _on_compare_file_selected(self, sender, app_data) -> None:
+        """Handle file selection from the compare file dialog."""
+        if not app_data or "file_path_name" not in app_data:
+            return
+        target_path = app_data["file_path_name"]
+        source_path = self._compare_source_path
+
+        if not source_path or not target_path:
+            return
+        if not os.path.exists(target_path):
+            if self.on_status_update:
+                self.on_status_update(f"File not found: {target_path}")
+            return
+
+        if self.on_compare_files:
+            self.on_compare_files(source_path, target_path)
+        else:
+            if self.on_status_update:
+                self.on_status_update("Compare feature not available (duplicates panel not loaded)")
 
     # --- Metadata Write ---
 
