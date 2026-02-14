@@ -4,38 +4,41 @@ Dear PyGui application with tabbed interface for managing duplicate files,
 organizing photos, and AI-powered content analysis.
 """
 
-from pathlib import Path
-from typing import Callable, Optional
-
 import os
-import re
 import subprocess
-import sys
-import tempfile
 import threading
+from collections.abc import Callable
+from pathlib import Path
 
 import dearpygui.dearpygui as dpg
 
-from duplicleaner.utils.logging import get_logger, setup_logging
-from duplicleaner.utils.profiling import profile_block
-from duplicleaner.utils.config import get_config, save_config
-from duplicleaner.utils.keystore import AIProvider, get_keystore, mask_api_key
-from duplicleaner.db.database import get_database
-from duplicleaner.ui.search_panel import SearchPanel
-from duplicleaner.ui.documentation_panel import DocumentationPanel
-from duplicleaner.ui.status_log_panel import StatusLogPanel
-from duplicleaner.drives.manager import DriveManager, normalize_path
 from duplicleaner.ai.model_manager import ModelManager
+from duplicleaner.core.actions import ActionEngine
+from duplicleaner.core.analysis_runner import AnalysisOptions, AnalysisRunner
+from duplicleaner.core.versioning import ChangeEntry, VersionEntry, VersionTracker
+from duplicleaner.core.folder_watcher import FolderWatcher, WatchEvent
+from duplicleaner.core.versioning_service import VersioningService
+from duplicleaner.db.database import get_database
+from duplicleaner.drives.manager import DriveManager, normalize_path
+from duplicleaner.ui.documentation_panel import DocumentationPanel
 from duplicleaner.ui.drives_panel import DrivesPanel
 from duplicleaner.ui.duplicates_panel import DuplicatesPanel
-from duplicleaner.ui.organize_panel import OrganizePanel
 from duplicleaner.ui.faces_panel import FacesPanel
-from duplicleaner.ui.tooltips import add_tooltip, SETTINGS_TOOLTIPS
-from duplicleaner.core.analysis_runner import AnalysisRunner, AnalysisOptions
-from duplicleaner.core.versioning_service import VersioningService
-from duplicleaner.core.versioning import VersionTracker, VersionEntry, ChangeEntry
-from duplicleaner.core.actions import ActionEngine
-from duplicleaner.ui.theme import apply_theme, get_theme_manager, get_status_color, get_accent_color, get_text_color
+from duplicleaner.ui.files_panel import FilesPanel
+from duplicleaner.ui.organize_panel import OrganizePanel
+from duplicleaner.ui.search_panel import SearchPanel
+from duplicleaner.ui.status_log_panel import StatusLogPanel
+from duplicleaner.ui.theme import (
+    apply_theme,
+    get_accent_color,
+    get_status_color,
+    get_text_color,
+)
+from duplicleaner.ui.tooltips import SETTINGS_TOOLTIPS, add_tooltip
+from duplicleaner.utils.config import get_app_data_dir, get_config, save_config
+from duplicleaner.utils.keystore import AIProvider, get_keystore
+from duplicleaner.utils.logging import get_logger, setup_logging
+from duplicleaner.utils.profiling import profile_block
 
 logger = get_logger(__name__)
 
@@ -51,9 +54,16 @@ class DupliCleanerApp:
     TAG_FILE_COUNT = "file_count"
     TAG_STORAGE_INFO = "storage_info"
     TAG_GPU_STATUS = "gpu_status"
+    TAG_REPORT_DIALOG = "report_config_dialog"
+    TAG_REPORT_FORMAT = "report_format"
+    TAG_REPORT_INC_STORAGE = "report_inc_storage"
+    TAG_REPORT_INC_DUPLICATES = "report_inc_duplicates"
+    TAG_REPORT_INC_PERSONS = "report_inc_persons"
+    TAG_REPORT_INC_ACTIONS = "report_inc_actions"
 
     # Tab tags
     TAG_TAB_DRIVES = "tab_drives"
+    TAG_TAB_FILES = "tab_files"
     TAG_TAB_DUPLICATES = "tab_duplicates"
     TAG_TAB_ORGANIZE = "tab_organize"
     TAG_TAB_FACES = "tab_faces"
@@ -64,6 +74,7 @@ class DupliCleanerApp:
 
     # Content area tags
     TAG_CONTENT_DRIVES = "content_drives"
+    TAG_CONTENT_FILES = "content_files"
     TAG_CONTENT_DUPLICATES = "content_duplicates"
     TAG_CONTENT_ORGANIZE = "content_organize"
     TAG_CONTENT_FACES = "content_faces"
@@ -108,6 +119,9 @@ class DupliCleanerApp:
     TAG_SUMMARY_MODEL_GOOGLE = "settings_summary_model_google"
     TAG_SUMMARY_MAX_TOKENS = "settings_summary_max_tokens"
     TAG_SUMMARY_TEMPERATURE = "settings_summary_temperature"
+    TAG_AUDIO_WHISPER_MODEL = "settings_audio_whisper_model"
+    TAG_AUDIO_WHISPER_DEVICE = "settings_audio_whisper_device"
+    TAG_AUDIO_WHISPER_COMPUTE = "settings_audio_whisper_compute"
     TAG_METADATA_LOCATION_LOOKUP = "settings_metadata_location_lookup"
     TAG_METADATA_LOCATION_LEVEL = "settings_metadata_location_level"
     TAG_ANALYSIS_STATUS = "analysis_status_text"
@@ -124,6 +138,10 @@ class DupliCleanerApp:
     TAG_GPU_HELP_GROUP = "gpu_help_group"
     TAG_GPU_HELP_TEXT = "gpu_help_text"
     TAG_THEME_SELECTOR = "settings_theme_selector"
+    TAG_DB_SELECTOR = "settings_db_selector"
+    TAG_DB_NEW_NAME = "settings_db_new_name"
+    TAG_DB_STATUS = "settings_db_status"
+    TAG_DB_NAME = "db_name"
 
     def __init__(self) -> None:
         """Initialize the application."""
@@ -133,26 +151,30 @@ class DupliCleanerApp:
             self.db = get_database()
         with profile_block("startup.keystore"):
             self.keystore = get_keystore()
-        self.search_panel: Optional[SearchPanel] = None
-        self.status_log_panel: Optional[StatusLogPanel] = None
+        self.search_panel: SearchPanel | None = None
+        self.status_log_panel: StatusLogPanel | None = None
         self.drive_manager = DriveManager(self.db)
         self._wizard_step = 0
         self.versioning_service = VersioningService(self.config.versioning)
+        self.folder_watcher = FolderWatcher(
+            on_new_files=self._on_watch_new_files,
+            on_status=lambda msg: self.update_status(msg),
+        )
         self._version_history_entries: list[VersionEntry] = []
-        self._version_history_file: Optional[Path] = None
-        self._selected_history_commit: Optional[str] = None
-        self.drives_panel: Optional[DrivesPanel] = None
-        self.duplicates_panel: Optional[DuplicatesPanel] = None
-        self.organize_panel: Optional[OrganizePanel] = None
-        self.faces_panel: Optional[FacesPanel] = None
-        self.documentation_panel: Optional[DocumentationPanel] = None
+        self._version_history_file: Path | None = None
+        self._selected_history_commit: str | None = None
+        self.drives_panel: DrivesPanel | None = None
+        self.duplicates_panel: DuplicatesPanel | None = None
+        self.organize_panel: OrganizePanel | None = None
+        self.faces_panel: FacesPanel | None = None
+        self.documentation_panel: DocumentationPanel | None = None
         self.action_engine = ActionEngine(self.db)
         self._model_download_state: dict[str, str] = {}
         self._doc_fonts: dict[str, str] = {}
         self._model_download_queue: list[str] = []
         self._ai_deps_installing = False
         self._face_worker_active = False
-        self._analysis_thread: Optional[threading.Thread] = None
+        self._analysis_thread: threading.Thread | None = None
         self._analysis_cancel_event = threading.Event()
         self._analysis_running = False
 
@@ -188,6 +210,7 @@ class DupliCleanerApp:
         # Create main window
         with profile_block("startup.main_window"):
             self._create_main_window()
+            self._create_report_dialog()
         with profile_block("startup.setup_wizard"):
             self._create_setup_wizard()
 
@@ -223,10 +246,10 @@ class DupliCleanerApp:
             heading_font = fonts_dir / "playfairdisplayvariablefontwght.ttf"
             if body_font.exists() and heading_font.exists():
                 with dpg.font_registry():
-                    doc_body = dpg.add_font(str(body_font), 16, tag="doc_body_font")
-                    doc_h1 = dpg.add_font(str(heading_font), 22, tag="doc_h1_font")
-                    doc_h2 = dpg.add_font(str(heading_font), 19, tag="doc_h2_font")
-                    doc_h3 = dpg.add_font(str(heading_font), 17, tag="doc_h3_font")
+                    dpg.add_font(str(body_font), 16, tag="doc_body_font")
+                    dpg.add_font(str(heading_font), 22, tag="doc_h1_font")
+                    dpg.add_font(str(heading_font), 19, tag="doc_h2_font")
+                    dpg.add_font(str(heading_font), 17, tag="doc_h3_font")
                 self._doc_fonts = {
                     "body": "doc_body_font",
                     "h1": "doc_h1_font",
@@ -252,10 +275,14 @@ class DupliCleanerApp:
             no_close=True,
         ):
             # Tab bar for main navigation
-            with dpg.tab_bar(tag=self.TAG_TAB_BAR):
+            with dpg.tab_bar(tag=self.TAG_TAB_BAR, callback=self._on_tab_changed):
                 # Drives tab
                 with dpg.tab(label="Drives", tag=self.TAG_TAB_DRIVES):
                     self._create_drives_panel()
+
+                # Files tab
+                with dpg.tab(label="Files", tag=self.TAG_TAB_FILES):
+                    self._create_files_panel()
 
                 # Duplicates tab
                 with dpg.tab(label="Duplicates", tag=self.TAG_TAB_DUPLICATES):
@@ -291,14 +318,19 @@ class DupliCleanerApp:
 
     def _create_status_bar(self, parent: int | str) -> None:
         """Create the status bar."""
+        db_stem = Path(self.config.database_path).stem
         with dpg.group(parent=parent, horizontal=True, tag=self.TAG_STATUS_BAR):
             dpg.add_text("", tag=self.TAG_STATUS_TEXT, color=get_status_color("info"))
+            dpg.add_spacer(width=20)
+            dpg.add_text(f"DB: {db_stem}", tag=self.TAG_DB_NAME, color=get_text_color("secondary"))
             dpg.add_spacer(width=20)
             dpg.add_text("Files: 0", tag=self.TAG_FILE_COUNT, color=get_text_color("secondary"))
             dpg.add_spacer(width=20)
             dpg.add_text("Storage: 0 B", tag=self.TAG_STORAGE_INFO, color=get_text_color("secondary"))
             dpg.add_spacer(width=20)
             dpg.add_text("GPU: Unknown", tag=self.TAG_GPU_STATUS, color=get_text_color("secondary"))
+            dpg.add_spacer(width=20)
+            dpg.add_button(label="Generate Report", callback=self._on_generate_report, small=True)
 
     def _format_bytes(self, size: int) -> str:
         """Format bytes to human-readable string."""
@@ -338,6 +370,16 @@ class DupliCleanerApp:
                 parent=self.TAG_CONTENT_DRIVES,
                 on_status_update=self.update_status,
                 on_face_worker_state_change=self._on_face_worker_state_change,
+                folder_watcher=self.folder_watcher,
+            )
+
+    def _create_files_panel(self) -> None:
+        """Create the files browser panel."""
+        with dpg.child_window(tag=self.TAG_CONTENT_FILES, autosize_x=True, autosize_y=True):
+            self.files_panel = FilesPanel(
+                parent=self.TAG_CONTENT_FILES,
+                drive_manager=self.drives_panel.drive_manager if hasattr(self, 'drives_panel') else None,
+                on_status_update=self.update_status,
             )
 
     def _create_duplicates_panel(self) -> None:
@@ -371,6 +413,13 @@ class DupliCleanerApp:
         self._face_worker_active = active
         if self.faces_panel:
             self.faces_panel.set_background_face_analysis_active(active)
+
+    def _on_tab_changed(self, sender, app_data, user_data) -> None:
+        selected = app_data
+        if selected is None and dpg.does_item_exist(self.TAG_TAB_BAR):
+            selected = dpg.get_value(self.TAG_TAB_BAR)
+        if dpg.does_item_exist(self.TAG_TAB_FACES) and selected == dpg.get_alias_id(self.TAG_TAB_FACES) and self.faces_panel:
+            self.faces_panel.on_tab_activated()
 
     def _create_search_panel(self) -> None:
         """Create the search panel."""
@@ -539,11 +588,10 @@ class DupliCleanerApp:
 
     def _wizard_next(self) -> None:
         """Advance wizard."""
-        if self._wizard_step == 1:
+        if self._wizard_step == 1 and not self.drive_manager.get_all_drives():
             # Ensure at least one drive
-            if not self.drive_manager.get_all_drives():
-                self._set_wizard_status("Add at least one drive before continuing.", level="warning")
-                return
+            self._set_wizard_status("Add at least one drive before continuing.", level="warning")
+            return
 
         if self._wizard_step == 2:
             self.config.ai.enabled = dpg.get_value("wizard_ai_enabled")
@@ -672,24 +720,133 @@ class DupliCleanerApp:
             self.update_status(result.message, level="info" if result.success else "error")
 
     def _refresh_model_status(self) -> None:
-        """Refresh the status of all models."""
-        # This method needs to be implemented.
-        self.update_status("Model status refresh not yet implemented.", level="warning")
+        """Refresh the status of all AI models by checking availability."""
+        model_checks = {
+            self.TAG_MODEL_STATUS_FACES: ("insightface", "faces"),
+            self.TAG_MODEL_STATUS_CLIP: ("open_clip", "clip"),
+            self.TAG_MODEL_STATUS_YOLO: ("ultralytics", "yolo"),
+            self.TAG_MODEL_STATUS_OCR: ("easyocr", "ocr"),
+        }
+
+        def check_models():
+            for status_tag, (module_name, model_key) in model_checks.items():
+                try:
+                    __import__(module_name)
+                    is_downloaded = self.config.ai.downloaded_models.get(model_key, False)
+                    if is_downloaded:
+                        dpg.set_value(status_tag, "Ready")
+                        dpg.configure_item(status_tag, color=get_status_color("success"))
+                    else:
+                        dpg.set_value(status_tag, "Installed, not downloaded")
+                        dpg.configure_item(status_tag, color=get_status_color("warning"))
+                except ImportError:
+                    dpg.set_value(status_tag, "Library not installed")
+                    dpg.configure_item(status_tag, color=get_status_color("error"))
+            self.update_status("Model status refreshed.")
+
+        threading.Thread(target=check_models, daemon=True).start()
 
     def _verify_models(self) -> None:
-        """Verify the integrity of all models."""
-        # This method needs to be implemented.
-        self.update_status("Model verification not yet implemented.", level="warning")
+        """Verify all AI models by attempting to load them."""
+        self.update_status("Verifying models...")
+        dpg.configure_item("verify_models_btn", enabled=False, label="Verifying...")
+
+        def verify():
+            manager = ModelManager(progress_callback=self.update_status)
+            methods = {
+                self.TAG_MODEL_STATUS_FACES: manager.download_faces,
+                self.TAG_MODEL_STATUS_CLIP: manager.download_clip,
+                self.TAG_MODEL_STATUS_YOLO: manager.download_yolo,
+                self.TAG_MODEL_STATUS_OCR: manager.download_ocr,
+            }
+            all_ok = True
+            for status_tag, method in methods.items():
+                dpg.set_value(status_tag, "Verifying...")
+                dpg.configure_item(status_tag, color=get_text_color("secondary"))
+                result = method()
+                if result.success:
+                    self.config.ai.downloaded_models[result.model] = True
+                    dpg.set_value(status_tag, "Verified OK")
+                    dpg.configure_item(status_tag, color=get_status_color("success"))
+                else:
+                    all_ok = False
+                    dpg.set_value(status_tag, result.message)
+                    dpg.configure_item(status_tag, color=get_status_color("error"))
+            save_config()
+            dpg.configure_item("verify_models_btn", enabled=True, label="Verify Models")
+            level = "info" if all_ok else "warning"
+            self.update_status("All models verified." if all_ok else "Some models failed verification.", level=level)
+
+        threading.Thread(target=verify, daemon=True).start()
 
     def _install_ai_dependencies(self) -> None:
-        """Install AI dependencies."""
-        # This method needs to be implemented.
-        self.update_status("AI dependency installation not yet implemented.", level="warning")
+        """Install AI dependencies via pip."""
+        if self._ai_deps_installing:
+            self.update_status("Installation already in progress.", level="warning")
+            return
+
+        variant = dpg.get_value(self.TAG_INSTALL_AI_DEPS_VARIANT)
+        scope = dpg.get_value(self.TAG_INSTALL_AI_DEPS_SCOPE)
+        is_gpu = "GPU" in variant
+        user_flag = ["--user"] if "User" in scope else []
+
+        # Core AI packages
+        packages = [
+            "insightface",
+            "open-clip-torch",
+            "ultralytics",
+            "easyocr",
+            "scikit-learn",
+        ]
+        if is_gpu:
+            packages.append("onnxruntime-gpu")
+        else:
+            packages.append("onnxruntime")
+
+        self._ai_deps_installing = True
+        dpg.configure_item(self.TAG_INSTALL_AI_DEPS_BUTTON, enabled=False, label="Installing...")
+        dpg.set_value(self.TAG_INSTALL_AI_DEPS_STATUS, "Starting installation...")
+
+        def install():
+            try:
+                import sys
+                cmd = [sys.executable, "-m", "pip", "install"] + user_flag + packages
+                self.update_status(f"Installing: {', '.join(packages)}")
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                if result.returncode == 0:
+                    dpg.set_value(self.TAG_INSTALL_AI_DEPS_STATUS, "Installation complete")
+                    dpg.configure_item(self.TAG_INSTALL_AI_DEPS_STATUS, color=get_status_color("success"))
+                    self.update_status("AI dependencies installed successfully.")
+                else:
+                    error_msg = result.stderr.strip().split("\n")[-1] if result.stderr else "Unknown error"
+                    dpg.set_value(self.TAG_INSTALL_AI_DEPS_STATUS, f"Failed: {error_msg[:80]}")
+                    dpg.configure_item(self.TAG_INSTALL_AI_DEPS_STATUS, color=get_status_color("error"))
+                    self.update_status(f"Installation failed: {error_msg[:120]}", level="error")
+            except subprocess.TimeoutExpired:
+                dpg.set_value(self.TAG_INSTALL_AI_DEPS_STATUS, "Installation timed out")
+                dpg.configure_item(self.TAG_INSTALL_AI_DEPS_STATUS, color=get_status_color("error"))
+                self.update_status("Installation timed out after 10 minutes.", level="error")
+            except Exception as e:
+                dpg.set_value(self.TAG_INSTALL_AI_DEPS_STATUS, f"Error: {e}")
+                dpg.configure_item(self.TAG_INSTALL_AI_DEPS_STATUS, color=get_status_color("error"))
+                self.update_status(f"Installation error: {e}", level="error")
+            finally:
+                self._ai_deps_installing = False
+                dpg.configure_item(self.TAG_INSTALL_AI_DEPS_BUTTON, enabled=True, label="Install AI Dependencies")
+
+        threading.Thread(target=install, daemon=True).start()
 
     def _on_ai_deps_variant_changed(self, sender, app_data, user_data) -> None:
         """Handle AI dependency variant change."""
-        # This method needs to be implemented.
-        self.update_status("AI dependency variant change not yet implemented.", level="warning")
+        variant = dpg.get_value(self.TAG_INSTALL_AI_DEPS_VARIANT)
+        self.config.ai.dependency_variant = "gpu" if "GPU" in variant else "cpu"
+        save_config()
+        self.update_status(f"AI dependency variant set to: {variant}")
 
     def _format_extension_list(self, extensions: list[str]) -> str:
         """Format a list of extensions into a comma-separated string."""
@@ -697,13 +854,110 @@ class DupliCleanerApp:
 
     def _on_run_analysis(self, sender, app_data, user_data) -> None:
         """Handle run analysis button click."""
-        # This method needs to be implemented.
-        self.update_status("Run analysis not yet implemented.", level="warning")
+        if self._analysis_running:
+            self.update_status("Analysis already running.", level="warning")
+            return
+
+        # Read configuration from UI
+        include_images = dpg.get_value(self.TAG_ANALYSIS_INCLUDE_IMAGES)
+        include_docs = dpg.get_value(self.TAG_ANALYSIS_INCLUDE_DOCS)
+        include_data = dpg.get_value(self.TAG_ANALYSIS_INCLUDE_DATA)
+        doc_ext_str = dpg.get_value(self.TAG_ANALYSIS_DOC_EXTENSIONS)
+        data_ext_str = dpg.get_value(self.TAG_ANALYSIS_DATA_EXTENSIONS)
+        reanalyze = dpg.get_value(self.TAG_ANALYSIS_REANALYZE)
+
+        # Read phase checkboxes
+        include_metadata = dpg.get_value("analysis_include_metadata")
+        include_scenes = dpg.get_value("analysis_include_scenes")
+        include_objects = dpg.get_value("analysis_include_objects")
+        include_ocr = dpg.get_value("analysis_include_ocr")
+        include_summaries = dpg.get_value("analysis_include_summaries")
+        include_audio = dpg.get_value("analysis_include_audio")
+
+        # Parse extension strings
+        doc_exts = [e.strip() for e in doc_ext_str.split(",") if e.strip()] if doc_ext_str else []
+        data_exts = [e.strip() for e in data_ext_str.split(",") if e.strip()] if data_ext_str else []
+
+        options = AnalysisOptions(
+            include_metadata=include_metadata,
+            include_scenes=include_scenes,
+            include_objects=include_objects,
+            include_ocr=include_ocr,
+            include_summaries=include_summaries,
+            include_audio=include_audio,
+            include_images=include_images,
+            include_documents=include_docs,
+            include_data_files=include_data,
+            document_extensions=doc_exts,
+            data_extensions=data_exts,
+            reanalyze_existing=reanalyze,
+        )
+
+        # Prepare UI
+        self._analysis_running = True
+        self._analysis_cancel_event.clear()
+        dpg.configure_item(self.TAG_ANALYSIS_RUN, enabled=False, label="Running...")
+        dpg.configure_item(self.TAG_ANALYSIS_CANCEL, enabled=True)
+        dpg.set_value(self.TAG_ANALYSIS_STATUS, "Starting analysis...")
+        dpg.configure_item(self.TAG_ANALYSIS_STATUS, color=get_status_color("info"))
+
+        def run_analysis():
+            try:
+                runner = AnalysisRunner(
+                    db=self.db,
+                    status_callback=lambda msg: self._on_analysis_status(msg),
+                    cancel_event=self._analysis_cancel_event,
+                )
+                stats = runner.run(options)
+
+                parts = []
+                if stats.metadata:
+                    parts.append(f"metadata: {stats.metadata}")
+                if stats.scenes:
+                    parts.append(f"scenes: {stats.scenes}")
+                if stats.objects:
+                    parts.append(f"objects: {stats.objects}")
+                if stats.ocr:
+                    parts.append(f"OCR: {stats.ocr}")
+                if stats.summaries:
+                    parts.append(f"summaries: {stats.summaries}")
+                summary = ", ".join(parts) if parts else "no files processed"
+
+                if self._analysis_cancel_event.is_set():
+                    dpg.set_value(self.TAG_ANALYSIS_STATUS, f"Cancelled. Partial results: {summary}")
+                    dpg.configure_item(self.TAG_ANALYSIS_STATUS, color=get_status_color("warning"))
+                    self.update_status(f"Analysis cancelled. Partial: {summary}", level="warning")
+                else:
+                    dpg.set_value(self.TAG_ANALYSIS_STATUS, f"Complete: {summary}")
+                    dpg.configure_item(self.TAG_ANALYSIS_STATUS, color=get_status_color("success"))
+                    self.update_status(f"Analysis complete: {summary}")
+            except Exception as e:
+                logger.error(f"Analysis failed: {e}")
+                dpg.set_value(self.TAG_ANALYSIS_STATUS, f"Error: {e}")
+                dpg.configure_item(self.TAG_ANALYSIS_STATUS, color=get_status_color("error"))
+                self.update_status(f"Analysis failed: {e}", level="error")
+            finally:
+                self._analysis_running = False
+                dpg.configure_item(self.TAG_ANALYSIS_RUN, enabled=True, label="Run Analysis")
+                dpg.configure_item(self.TAG_ANALYSIS_CANCEL, enabled=False)
+
+        self._analysis_thread = threading.Thread(target=run_analysis, daemon=True)
+        self._analysis_thread.start()
+
+    def _on_analysis_status(self, message: str) -> None:
+        """Handle status updates from analysis runner."""
+        dpg.set_value(self.TAG_ANALYSIS_STATUS, message)
+        self.update_status(message)
 
     def _on_cancel_analysis(self, sender, app_data, user_data) -> None:
         """Handle cancel analysis button click."""
-        # This method needs to be implemented.
-        self.update_status("Cancel analysis not yet implemented.", level="warning")
+        if not self._analysis_running:
+            return
+        self._analysis_cancel_event.set()
+        dpg.set_value(self.TAG_ANALYSIS_STATUS, "Cancelling...")
+        dpg.configure_item(self.TAG_ANALYSIS_STATUS, color=get_status_color("warning"))
+        dpg.configure_item(self.TAG_ANALYSIS_CANCEL, enabled=False)
+        self.update_status("Cancelling analysis...")
 
     def _create_settings_panel(self) -> None:
         """Create the settings panel."""
@@ -711,6 +965,39 @@ class DupliCleanerApp:
             dpg.add_text("Settings", color=(150, 200, 255))
             dpg.add_separator()
             dpg.add_spacer(height=10)
+
+            # Database selector
+            with dpg.collapsing_header(label="Database", default_open=False):
+                dpg.add_text("Select which database to use. Each database stores its own drives, files, and analysis results.",
+                             color=(150, 150, 150), wrap=500)
+                dpg.add_spacer(height=4)
+                db_files = self._scan_database_files()
+                current_db = self.config.active_database or "duplicleaner.db"
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Active database:")
+                    dpg.add_combo(
+                        items=db_files,
+                        default_value=current_db,
+                        tag=self.TAG_DB_SELECTOR,
+                        width=250,
+                    )
+                    dpg.add_button(label="Switch Database", callback=self._on_switch_database)
+                dpg.add_spacer(height=4)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Create new:")
+                    dpg.add_input_text(
+                        tag=self.TAG_DB_NEW_NAME,
+                        hint="my_photos.db",
+                        width=200,
+                    )
+                    dpg.add_button(label="Create", callback=self._on_create_database)
+                dpg.add_spacer(height=4)
+                dpg.add_text(
+                    f"Path: {self.config.database_path}",
+                    tag=self.TAG_DB_STATUS,
+                    color=(120, 120, 120),
+                    wrap=500,
+                )
 
             # General settings
             with dpg.collapsing_header(label="General", default_open=True):
@@ -782,10 +1069,9 @@ class DupliCleanerApp:
                     )
                     add_tooltip(max_size, SETTINGS_TOOLTIPS["max_file_size"])
                 process_videos_cb = dpg.add_checkbox(
-                    label="Process videos for near-duplicates (not implemented yet)",
+                    label="Process videos for near-duplicates",
                     tag="settings_process_videos",
-                    default_value=self.config.ai.process_videos,
-                    enabled=False,
+                    default_value=self.config.duplicates.video_near_duplicate,
                 )
                 add_tooltip(process_videos_cb, SETTINGS_TOOLTIPS["process_videos"])
 
@@ -872,7 +1158,7 @@ class DupliCleanerApp:
                 provider_combo = dpg.add_combo(
                     label="Summary provider",
                     tag=self.TAG_SUMMARY_PROVIDER,
-                    items=["local", "openai", "anthropic", "google"],
+                    items=["local", "lmstudio", "openai", "anthropic", "google"],
                     default_value=self.config.ai.summary_provider,
                     width=160,
                 )
@@ -929,6 +1215,36 @@ class DupliCleanerApp:
                         width=200,
                     )
                     add_tooltip(temp_slider, SETTINGS_TOOLTIPS["summary_temperature"])
+
+                dpg.add_spacer(height=6)
+                dpg.add_text("Audio Transcription (Whisper)", color=get_text_color("secondary"))
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Model:")
+                    whisper_model = dpg.add_input_text(
+                        tag=self.TAG_AUDIO_WHISPER_MODEL,
+                        default_value=self.config.ai.audio_whisper_model,
+                        width=140,
+                        hint="tiny/base/small/medium/large",
+                    )
+                    add_tooltip(whisper_model, SETTINGS_TOOLTIPS["audio_whisper_model"])
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Device:")
+                    whisper_device = dpg.add_combo(
+                        tag=self.TAG_AUDIO_WHISPER_DEVICE,
+                        items=["cpu", "cuda"],
+                        default_value=self.config.ai.audio_whisper_device,
+                        width=120,
+                    )
+                    add_tooltip(whisper_device, SETTINGS_TOOLTIPS["audio_whisper_device"])
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Compute:")
+                    whisper_compute = dpg.add_combo(
+                        tag=self.TAG_AUDIO_WHISPER_COMPUTE,
+                        items=["int8", "int8_float16", "float16", "float32"],
+                        default_value=self.config.ai.audio_whisper_compute_type,
+                        width=140,
+                    )
+                    add_tooltip(whisper_compute, SETTINGS_TOOLTIPS["audio_whisper_compute"])
 
             # AI model management
             with dpg.collapsing_header(label="AI Models", default_open=False):
@@ -1031,6 +1347,12 @@ class DupliCleanerApp:
                     default_value=self.config.ai.analysis_include_summaries,
                 )
                 add_tooltip(summaries_cb, SETTINGS_TOOLTIPS["analysis_include_summaries"])
+                audio_cb = dpg.add_checkbox(
+                    label="Audio transcription (Whisper)",
+                    tag="analysis_include_audio",
+                    default_value=self.config.ai.analysis_include_audio,
+                )
+                add_tooltip(audio_cb, SETTINGS_TOOLTIPS.get("analysis_include_audio", ""))
                 dpg.add_spacer(height=5)
                 images_cb = dpg.add_checkbox(
                     label="Analyze images",
@@ -1087,6 +1409,52 @@ class DupliCleanerApp:
                     )
                     add_tooltip(cancel_btn, SETTINGS_TOOLTIPS["analysis_cancel"])
                 dpg.add_text("", tag=self.TAG_ANALYSIS_STATUS, color=(150, 150, 150))
+
+            # Metadata writing settings
+            with dpg.collapsing_header(label="Metadata Writing", default_open=False):
+                dpg.add_text(
+                    "Write AI-generated data (summaries, tags, face names) back into image file metadata "
+                    "so it travels with the file. Supported by Windows Explorer, Lightroom, digiKam, etc.",
+                    color=(150, 150, 150), wrap=600,
+                )
+                dpg.add_spacer(height=5)
+                dpg.add_checkbox(
+                    label="Include AI summary in description fields",
+                    default_value=self.config.ai.metadata_include_summary,
+                    tag="settings_meta_include_summary",
+                )
+                dpg.add_checkbox(
+                    label="Include tags as keywords",
+                    default_value=self.config.ai.metadata_include_tags,
+                    tag="settings_meta_include_tags",
+                )
+                dpg.add_checkbox(
+                    label="Include face names and MWG face regions",
+                    default_value=self.config.ai.metadata_include_faces,
+                    tag="settings_meta_include_faces",
+                )
+                dpg.add_checkbox(
+                    label="Include quality score as star rating",
+                    default_value=self.config.ai.metadata_include_quality,
+                    tag="settings_meta_include_quality",
+                )
+                dpg.add_checkbox(
+                    label="Create backup before writing",
+                    default_value=self.config.ai.metadata_backup,
+                    tag="settings_meta_backup",
+                )
+                dpg.add_spacer(height=5)
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Tag prefix:")
+                    dpg.add_input_text(
+                        default_value=self.config.ai.metadata_tag_prefix,
+                        tag="settings_meta_tag_prefix",
+                        width=120,
+                        hint="AI",
+                    )
+                    dpg.add_text("(hierarchical tags: prefix|Category|Tag)", color=(120, 120, 120))
+                dpg.add_spacer(height=5)
+                dpg.add_button(label="Save Metadata Settings", callback=self._on_save_meta_settings)
 
             # Version tracking settings
             with dpg.collapsing_header(label="Version Tracking", default_open=False):
@@ -1157,27 +1525,128 @@ class DupliCleanerApp:
 
                 dpg.add_spacer(height=10)
                 dpg.add_text("Recent Changes", color=(200, 200, 200))
-                with dpg.child_window(height=180, border=True):
-                    with dpg.table(
-                        tag=self.TAG_VERSION_RECENT_TABLE,
-                        header_row=True,
-                        borders_innerH=True,
-                        borders_outerH=True,
-                        borders_innerV=True,
-                        borders_outerV=True,
-                        resizable=True,
-                        policy=dpg.mvTable_SizingStretchProp,
-                        row_background=True,
-                        scrollY=True,
-                        height=150,
-                    ):
-                        dpg.add_table_column(label="File", init_width_or_weight=140)
-                        dpg.add_table_column(label="Date", init_width_or_weight=120)
-                        dpg.add_table_column(label="Message", init_width_or_weight=240)
+                with dpg.child_window(height=180, border=True), dpg.table(
+                    tag=self.TAG_VERSION_RECENT_TABLE,
+                    header_row=True,
+                    borders_innerH=True,
+                    borders_outerH=True,
+                    borders_innerV=True,
+                    borders_outerV=True,
+                    resizable=True,
+                    policy=dpg.mvTable_SizingStretchProp,
+                    row_background=True,
+                    scrollY=True,
+                    height=150,
+                ):
+                    dpg.add_table_column(label="File", init_width_or_weight=140)
+                    dpg.add_table_column(label="Date", init_width_or_weight=120)
+                    dpg.add_table_column(label="Message", init_width_or_weight=240)
 
             # Save button
             dpg.add_spacer(height=10)
             dpg.add_button(label="Save Preferences", callback=self._on_save_settings)
+
+    def _scan_database_files(self) -> list[str]:
+        """Find all .db files in the app data directory."""
+        app_dir = get_app_data_dir()
+        db_files = sorted(p.name for p in app_dir.glob("*.db"))
+        if not db_files:
+            db_files = ["duplicleaner.db"]
+        elif "duplicleaner.db" not in db_files:
+            db_files.insert(0, "duplicleaner.db")
+        return db_files
+
+    def _on_switch_database(self, sender=None, app_data=None, user_data=None) -> None:
+        """Switch to the database selected in the combo box."""
+        selected = dpg.get_value(self.TAG_DB_SELECTOR)
+        if not selected:
+            return
+
+        app_dir = get_app_data_dir()
+        full_path = str(app_dir / selected)
+
+        if full_path == self.config.database_path:
+            self.update_status(f"Already using {selected}")
+            return
+
+        self.db.switch_to(full_path)
+        self.config.database_path = full_path
+        self.config.active_database = selected
+        save_config()
+
+        # Update status bar
+        db_stem = Path(full_path).stem
+        if dpg.does_item_exist(self.TAG_DB_NAME):
+            dpg.set_value(self.TAG_DB_NAME, f"DB: {db_stem}")
+        if dpg.does_item_exist(self.TAG_DB_STATUS):
+            dpg.set_value(self.TAG_DB_STATUS, f"Path: {full_path}")
+
+        self._refresh_all_panels()
+        self.update_status(f"Switched to database: {selected}")
+
+    def _on_create_database(self, sender=None, app_data=None, user_data=None) -> None:
+        """Create a new database and add it to the combo box."""
+        raw_name = dpg.get_value(self.TAG_DB_NEW_NAME).strip()
+        if not raw_name:
+            self.update_status("Enter a name for the new database.", level="warning")
+            return
+
+        # Sanitize: remove path separators, ensure .db extension
+        name = raw_name.replace("/", "").replace("\\", "").replace("..", "")
+        if not name.lower().endswith(".db"):
+            name += ".db"
+
+        # Add to combo if not already present
+        current_items = dpg.get_item_configuration(self.TAG_DB_SELECTOR)["items"]
+        if name not in current_items:
+            current_items.append(name)
+            dpg.configure_item(self.TAG_DB_SELECTOR, items=current_items)
+
+        dpg.set_value(self.TAG_DB_SELECTOR, name)
+        dpg.set_value(self.TAG_DB_NEW_NAME, "")
+        self.update_status(f"Created database entry: {name} - click 'Switch Database' to activate.")
+
+    def _refresh_all_panels(self) -> None:
+        """Refresh all panels after a database switch."""
+        try:
+            if self.drives_panel:
+                self.drives_panel._refresh_drive_list(probe=False)
+        except Exception as e:
+            logger.warning(f"Failed to refresh drives panel: {e}")
+
+        try:
+            if self.duplicates_panel:
+                self.duplicates_panel._refresh_groups()
+        except Exception as e:
+            logger.warning(f"Failed to refresh duplicates panel: {e}")
+
+        try:
+            if self.faces_panel:
+                self.faces_panel.refresh()
+        except Exception as e:
+            logger.warning(f"Failed to refresh faces panel: {e}")
+
+        try:
+            if hasattr(self, 'files_panel') and self.files_panel:
+                self.files_panel._refresh_tree()
+        except Exception as e:
+            logger.warning(f"Failed to refresh files panel: {e}")
+
+        try:
+            if self.search_panel:
+                self.search_panel.refresh()
+        except Exception as e:
+            logger.warning(f"Failed to refresh search panel: {e}")
+
+        # Update status bar stats
+        try:
+            stats = self.db.get_statistics()
+            self.update_file_count(stats.get("total_files", 0))
+            self.update_storage_info(stats.get("total_size", 0))
+        except Exception as e:
+            logger.warning(f"Failed to refresh stats: {e}")
+            self.update_file_count(0)
+            self.update_storage_info(0)
 
     def _on_save_settings(self) -> None:
         logger.info("Save settings clicked")
@@ -1187,7 +1656,7 @@ class DupliCleanerApp:
         self.config.duplicates.match_across_formats = dpg.get_value("settings_match_formats")
         self.config.duplicates.min_image_size = dpg.get_value("settings_min_image_size")
         self.config.scan.max_file_size_gb = dpg.get_value("settings_max_file_size_gb")
-        self.config.ai.process_videos = dpg.get_value("settings_process_videos")
+        self.config.duplicates.video_near_duplicate = dpg.get_value("settings_process_videos")
         self.config.ai.enabled = dpg.get_value("settings_ai_enabled")
         self.config.ai.use_gpu = dpg.get_value("settings_ai_use_gpu")
         self.config.ai.summary_provider = dpg.get_value(self.TAG_SUMMARY_PROVIDER)
@@ -1197,6 +1666,9 @@ class DupliCleanerApp:
         self.config.ai.summary_model_google = dpg.get_value(self.TAG_SUMMARY_MODEL_GOOGLE)
         self.config.ai.summary_max_tokens = dpg.get_value(self.TAG_SUMMARY_MAX_TOKENS)
         self.config.ai.summary_temperature = dpg.get_value(self.TAG_SUMMARY_TEMPERATURE)
+        self.config.ai.audio_whisper_model = dpg.get_value(self.TAG_AUDIO_WHISPER_MODEL)
+        self.config.ai.audio_whisper_device = dpg.get_value(self.TAG_AUDIO_WHISPER_DEVICE)
+        self.config.ai.audio_whisper_compute_type = dpg.get_value(self.TAG_AUDIO_WHISPER_COMPUTE)
         self.config.ai.metadata_location_lookup = dpg.get_value(self.TAG_METADATA_LOCATION_LOOKUP)
         self.config.ai.metadata_location_level = dpg.get_value(self.TAG_METADATA_LOCATION_LEVEL)
         save_config()
@@ -1530,7 +2002,7 @@ class DupliCleanerApp:
             logger.error("Failed to open file: %s", exc)
             self.update_status("Failed to open file.", level="error")
 
-    def _get_tracker_for_path(self, file_path: Path) -> Optional[VersionTracker]:
+    def _get_tracker_for_path(self, file_path: Path) -> VersionTracker | None:
         """Return a VersionTracker for a file if it is in a tracked folder."""
         resolved = file_path.resolve()
         for folder in self.config.versioning.tracked_folders:
@@ -1542,7 +2014,7 @@ class DupliCleanerApp:
             return self._build_tracker(root)
         return None
 
-    def _build_tracker(self, root_path: str | Path) -> Optional[VersionTracker]:
+    def _build_tracker(self, root_path: str | Path) -> VersionTracker | None:
         """Build a VersionTracker for the given root path."""
         root = Path(root_path)
         if not root.exists():
@@ -1573,13 +2045,135 @@ class DupliCleanerApp:
         with profile_block("startup.versioning_service.start"):
             self.versioning_service.start()
 
+        # Start folder watcher
+        with profile_block("startup.folder_watcher.start"):
+            self.folder_watcher.start()
+
         # Main render loop
+        _last_selected_tab = None
         while dpg.is_dearpygui_running():
+            if dpg.does_item_exist(self.TAG_TAB_BAR):
+                selected = dpg.get_value(self.TAG_TAB_BAR)
+                # Only call on_tab_activated when tab changes (not every frame!)
+                if selected != _last_selected_tab:
+                    _last_selected_tab = selected
+                    if dpg.does_item_exist(self.TAG_TAB_FACES) and selected == dpg.get_alias_id(self.TAG_TAB_FACES) and self.faces_panel:
+                        self.faces_panel.on_tab_activated()
             if self.faces_panel:
                 self.faces_panel.on_frame()
             dpg.render_dearpygui_frame()
 
         self.cleanup()
+
+    def _on_watch_new_files(self, event: WatchEvent) -> None:
+        """Handle new files detected by the folder watcher.
+
+        Runs incremental scan, hashing, and optional auto-organization
+        for the detected files.
+        """
+        from duplicleaner.core.hasher import Hasher
+        from duplicleaner.core.organizer import Organizer, OrganizeSettings
+        from duplicleaner.core.scanner import Scanner
+        from duplicleaner.utils.config import WatchFolderEntry
+
+        file_count = len(event.new_files)
+        folder_name = os.path.basename(event.watch_path)
+        self.update_status(f"Processing {file_count} new files from {folder_name}...")
+        logger.info("Watch event: %d new files from %s", file_count, event.watch_path)
+
+        # Find the matching watch folder config
+        config = get_config()
+        entry: WatchFolderEntry | None = None
+        for wf in config.watch.watch_folders:
+            if os.path.normpath(wf.path) == os.path.normpath(event.watch_path):
+                entry = wf
+                break
+
+        if not entry:
+            logger.warning("No config found for watch path: %s", event.watch_path)
+            return
+
+        # Ensure the folder's drive is registered
+        drive = None
+        for d in self.drive_manager.get_all_drives():
+            if event.watch_path.startswith(d.path):
+                drive = d
+                break
+
+        if not drive:
+            # Auto-register the watch folder as a drive
+            label = folder_name or "Watch Folder"
+            try:
+                drive = self.drive_manager.add_drive(event.watch_path, label)
+                logger.info("Auto-registered watch folder as drive: %s", label)
+            except ValueError:
+                logger.warning("Could not register watch folder as drive: %s", event.watch_path)
+                return
+
+        # Step 1: Incremental scan - add new files to database
+        if entry.auto_scan:
+            try:
+                scanner = Scanner()
+                added = 0
+                for file_path in event.new_files:
+                    if os.path.exists(file_path):
+                        scanner.add_single_file(drive, file_path)
+                        added += 1
+                self.update_status(f"Scanned {added} new files from {folder_name}")
+                logger.info("Incremental scan: %d files added", added)
+            except Exception as e:
+                logger.error("Incremental scan error: %s", e)
+
+            # Step 1b: Hash new files
+            try:
+                hasher = Hasher(db=self.db)
+                hasher.hash_drive(drive.id)
+                logger.info("Hashed new files from %s", folder_name)
+            except Exception as e:
+                logger.error("Hashing error: %s", e)
+
+        # Step 2: Auto-organize if enabled
+        if entry.auto_organize:
+            try:
+                settings = OrganizeSettings(
+                    source_dir=event.watch_path,
+                    date_format=entry.organize_format,
+                    by_date=True,
+                    by_location=entry.organize_by_location,
+                )
+                organizer = Organizer(settings)
+                preview = organizer.preview(event.new_files)
+                if preview.moves:
+                    result = organizer.execute(preview)
+                    self.update_status(
+                        f"Auto-organized {result.moved} files from {folder_name}"
+                    )
+                    logger.info("Auto-organized %d files", result.moved)
+            except Exception as e:
+                logger.error("Auto-organization error: %s", e)
+
+        # Step 3: Queue AI analysis if enabled
+        if entry.auto_ai_analysis:
+            try:
+                options = AnalysisOptions(
+                    drive_id=drive.id,
+                    include_metadata=True,
+                    include_scenes=True,
+                    include_objects=True,
+                    include_ocr=True,
+                    include_summaries=False,
+                    reanalyze_existing=False,
+                )
+                runner = AnalysisRunner(self.db)
+                runner.run(options)
+                self.update_status(f"AI analysis queued for {folder_name}")
+            except Exception as e:
+                logger.error("AI analysis error: %s", e)
+
+        # Final status
+        self.update_status(
+            f"Processed {file_count} new files from {folder_name}"
+        )
 
     def cleanup(self) -> None:
         """Clean up resources before exit."""
@@ -1599,6 +2193,7 @@ class DupliCleanerApp:
         if self.status_log_panel:
             self.status_log_panel.cleanup()
 
+        self.folder_watcher.stop()
         self.versioning_service.stop()
         save_config()
         dpg.destroy_context()
@@ -1709,9 +2304,7 @@ class DupliCleanerApp:
         if self.config.first_run and self._cuda_available:
             self.config.ai.dependency_variant = "gpu"
 
-        if self.config.ai.dependency_variant == "cpu":
-            self.config.ai.use_gpu = False
-        elif not self._cuda_available:
+        if self.config.ai.dependency_variant == "cpu" or not self._cuda_available:
             self.config.ai.use_gpu = False
 
     def _refresh_gpu_ui_state(self) -> None:
@@ -1758,6 +2351,150 @@ class DupliCleanerApp:
         apply_theme(theme_name)
         save_config()
         self.update_status(f"Theme changed to {app_data}", level="info")
+
+    def _on_save_meta_settings(self) -> None:
+        """Save metadata writing settings."""
+        self.config.ai.metadata_include_summary = dpg.get_value("settings_meta_include_summary")
+        self.config.ai.metadata_include_tags = dpg.get_value("settings_meta_include_tags")
+        self.config.ai.metadata_include_faces = dpg.get_value("settings_meta_include_faces")
+        self.config.ai.metadata_include_quality = dpg.get_value("settings_meta_include_quality")
+        self.config.ai.metadata_backup = dpg.get_value("settings_meta_backup")
+        self.config.ai.metadata_tag_prefix = dpg.get_value("settings_meta_tag_prefix") or "AI"
+        save_config()
+        self.update_status("Metadata writing settings saved.")
+
+    def _create_report_dialog(self) -> None:
+        """Create the report configuration dialog."""
+        with dpg.window(
+            tag=self.TAG_REPORT_DIALOG,
+            label="Generate Report",
+            modal=True,
+            show=False,
+            width=400,
+            height=300,
+            no_resize=True,
+        ):
+            dpg.add_text("Report Configuration", color=get_accent_color())
+            dpg.add_separator()
+            dpg.add_spacer(height=10)
+
+            dpg.add_text("Format:")
+            dpg.add_radio_button(
+                items=["HTML", "JSON"],
+                default_value="HTML",
+                tag=self.TAG_REPORT_FORMAT,
+            )
+            dpg.add_spacer(height=10)
+
+            dpg.add_text("Include sections:")
+            dpg.add_checkbox(label="Storage overview", default_value=True, tag=self.TAG_REPORT_INC_STORAGE)
+            dpg.add_checkbox(label="Duplicate analysis", default_value=True, tag=self.TAG_REPORT_INC_DUPLICATES)
+            dpg.add_checkbox(label="Person/face summary", default_value=True, tag=self.TAG_REPORT_INC_PERSONS)
+            dpg.add_checkbox(label="Action history", default_value=True, tag=self.TAG_REPORT_INC_ACTIONS)
+
+            dpg.add_spacer(height=15)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Generate", callback=self._on_do_generate_report, width=120)
+                dpg.add_button(
+                    label="Cancel", width=120,
+                    callback=lambda: dpg.configure_item(self.TAG_REPORT_DIALOG, show=False),
+                )
+
+    def _on_generate_report(self, sender=None, app_data=None, user_data=None) -> None:
+        """Show the report configuration dialog."""
+        dpg.configure_item(self.TAG_REPORT_DIALOG, show=True)
+        # Center dialog
+        try:
+            vw = dpg.get_viewport_width()
+            vh = dpg.get_viewport_height()
+            dpg.set_item_pos(self.TAG_REPORT_DIALOG, [max(0, (vw - 400) // 2), max(0, (vh - 300) // 2)])
+        except Exception:
+            pass
+
+    def _on_do_generate_report(self) -> None:
+        """Execute report generation with selected options."""
+        dpg.configure_item(self.TAG_REPORT_DIALOG, show=False)
+
+        fmt = dpg.get_value(self.TAG_REPORT_FORMAT)
+        inc_storage = dpg.get_value(self.TAG_REPORT_INC_STORAGE)
+        inc_duplicates = dpg.get_value(self.TAG_REPORT_INC_DUPLICATES)
+        inc_persons = dpg.get_value(self.TAG_REPORT_INC_PERSONS)
+        inc_actions = dpg.get_value(self.TAG_REPORT_INC_ACTIONS)
+
+        self.update_status("Generating report...")
+
+        try:
+            from duplicleaner.utils.export_manager import (
+                export_json,
+                generate_unified_report,
+                get_default_export_dir,
+                get_timestamped_filename,
+            )
+
+            export_dir = get_default_export_dir()
+
+            if fmt == "HTML":
+                filepath = export_dir / get_timestamped_filename("report", "html")
+                result = generate_unified_report(
+                    self.db,
+                    filepath,
+                    include_storage=inc_storage,
+                    include_duplicates=inc_duplicates,
+                    include_persons=inc_persons,
+                    include_actions=inc_actions,
+                )
+                self.update_status(f"Report generated: {result}")
+            else:
+                filepath = export_dir / get_timestamped_filename("report", "json")
+                # Build JSON data using same queries
+                from duplicleaner.db.models import GroupStatus
+                data: dict = {"generated": str(__import__("datetime").datetime.now())}
+
+                if inc_storage:
+                    with self.db.connection() as conn:
+                        row = conn.execute(
+                            "SELECT COUNT(*) as cnt, COALESCE(SUM(size), 0) as total FROM files WHERE is_deleted = FALSE"
+                        ).fetchone()
+                        data["storage"] = {"file_count": row["cnt"], "total_size": row["total"]}
+
+                if inc_duplicates:
+                    with self.db.connection() as conn:
+                        pending = conn.execute(
+                            "SELECT COUNT(*) as cnt, COALESCE(SUM(wasted_size), 0) as waste FROM duplicate_groups WHERE status = 'pending'"
+                        ).fetchone()
+                        resolved = conn.execute(
+                            "SELECT COUNT(*) as cnt FROM duplicate_groups WHERE status = 'resolved'"
+                        ).fetchone()
+                    data["duplicates"] = {
+                        "pending_groups": pending["cnt"],
+                        "recoverable_bytes": pending["waste"],
+                        "resolved_groups": resolved["cnt"],
+                    }
+
+                if inc_persons:
+                    persons = self.db.get_all_persons(include_hidden=False)
+                    named = [p for p in persons if p.name]
+                    data["persons"] = {
+                        "total": len(persons),
+                        "named": len(named),
+                        "roster": [{"name": p.name, "photos": p.photo_count} for p in named[:100]],
+                    }
+
+                if inc_actions:
+                    entries = self.db.get_action_log(limit=100)
+                    data["actions"] = [{
+                        "timestamp": str(e.timestamp),
+                        "action": e.action_type.value if e.action_type else "",
+                        "source": e.source_path,
+                        "size": e.file_size,
+                    } for e in entries]
+
+                export_json(data, filepath)
+                self.update_status(f"Report generated: {filepath}")
+
+        except Exception as exc:
+            logger.error("Report generation failed: %s", exc)
+            self.update_status(f"Report failed: {exc}", level="error")
 
 
 def run_app() -> None:

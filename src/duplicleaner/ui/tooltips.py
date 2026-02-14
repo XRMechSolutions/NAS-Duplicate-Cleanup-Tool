@@ -14,8 +14,8 @@ Usage:
     add_tooltip(some_widget, "Custom tooltip explaining this feature.")
 """
 
+
 import dearpygui.dearpygui as dpg
-from typing import Union
 
 from duplicleaner.ui.theme import get_text_color
 
@@ -24,7 +24,7 @@ DEFAULT_TOOLTIP_WIDTH = 320
 
 
 def add_tooltip(
-    parent: Union[int, str],
+    parent: int | str,
     text: str,
     width: int = DEFAULT_TOOLTIP_WIDTH,
 ) -> int:
@@ -51,7 +51,7 @@ def add_tooltip(
 
 
 def add_tooltip_to_table_header(
-    table_tag: Union[int, str],
+    table_tag: int | str,
     column_index: int,
     text: str,
     width: int = DEFAULT_TOOLTIP_WIDTH,
@@ -124,6 +124,12 @@ DRIVE_TOOLTIPS = {
         "Clear 'deleted' flags for files on this drive.\n"
         "Use after restoring files or if flags are out of sync.\n"
         "Files will be re-verified on next scan."
+    ),
+    "remap_drive": (
+        "Change the root path for this disconnected drive.\n"
+        "Use when files have been moved to a new location\n"
+        "(e.g., from C:\\Photos to \\\\NAS\\Photos).\n"
+        "All scan data, faces, and metadata are preserved."
     ),
 
     # --- Scan Option Checkboxes ---
@@ -605,6 +611,18 @@ SETTINGS_TOOLTIPS = {
     "summary_temperature": (
         "Lower = more deterministic, higher = more creative."
     ),
+    "audio_whisper_model": (
+        "Whisper model size for audio transcription.\n"
+        "Options: tiny, base, small, medium, large."
+    ),
+    "audio_whisper_device": (
+        "Device for Whisper transcription.\n"
+        "Use cuda if you have a supported GPU."
+    ),
+    "audio_whisper_compute": (
+        "Compute type for faster-whisper.\n"
+        "int8 is fastest on CPU; float16 for GPU."
+    ),
     "model_refresh": (
         "Refresh model download status."
     ),
@@ -641,6 +659,11 @@ SETTINGS_TOOLTIPS = {
     ),
     "analysis_include_summaries": (
         "Generate AI summaries using the selected provider."
+    ),
+    "analysis_include_audio": (
+        "Transcribe audio files using Whisper.\n"
+        "Supports MP3, WAV, M4A, FLAC, OGG, AAC, WMA, OPUS.\n"
+        "Requires faster-whisper or openai-whisper installed."
     ),
     "analysis_include_images": (
         "Include image files during analysis."

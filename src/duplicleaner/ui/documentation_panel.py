@@ -1,13 +1,12 @@
 """Documentation panel for in-app help content."""
 
-from pathlib import Path
-from typing import Optional
 import re
+from pathlib import Path
 
 import dearpygui.dearpygui as dpg
 
+from duplicleaner.ui.theme import get_accent_color, get_text_color
 from duplicleaner.utils.logging import get_logger
-from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
@@ -24,13 +23,13 @@ class DocumentationPanel:
     def __init__(
         self,
         parent: str,
-        docs_dir: Optional[Path] = None,
-        fonts: Optional[dict[str, str]] = None,
+        docs_dir: Path | None = None,
+        fonts: dict[str, str] | None = None,
     ) -> None:
         self.parent = parent
         self.docs_dir = docs_dir or self._resolve_docs_dir()
         self._chapters = self._build_chapters()
-        self._current_chapter: Optional[str] = None
+        self._current_chapter: str | None = None
         self._current_markdown: str = ""
         self._image_textures: dict[str, str] = {}
         self._wrap_width = 900

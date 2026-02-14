@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque
 
 import dearpygui.dearpygui as dpg
 
-from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
+from duplicleaner.ui.theme import get_accent_color, get_status_color, get_text_color
 
 LEVELS = ["info", "warning", "error"]
 
@@ -30,7 +30,7 @@ class StatusLogPanel:
     def __init__(self, parent: int | str, max_entries: int = 200):
         self.parent = parent
         self.max_entries = max_entries
-        self._entries: Deque[tuple[str, str]] = deque(maxlen=max_entries)
+        self._entries: deque[tuple[str, str]] = deque(maxlen=max_entries)
         self._selected_entries: set[str] = set()
         self._visible_entries: list[str] = []
         self._last_selected: str | None = None
@@ -66,9 +66,8 @@ class StatusLogPanel:
                 dpg.add_text("", tag=self.TAG_STATUS, color=get_text_color("disabled"))
 
             dpg.add_separator()
-            with dpg.child_window(height=400, border=True):
-                with dpg.group(tag=self.TAG_LIST_CONTAINER):
-                    dpg.add_text("")
+            with dpg.child_window(height=400, border=True), dpg.group(tag=self.TAG_LIST_CONTAINER):
+                dpg.add_text("")
 
     def add(self, message: str, level: str = "info") -> None:
         """Add a message to the log."""
@@ -248,9 +247,8 @@ class StatusLogPanel:
             return self._level_themes[color]
 
         theme_tag = f"status_log_theme_{color[0]}_{color[1]}_{color[2]}"
-        with dpg.theme(tag=theme_tag):
-            with dpg.theme_component(dpg.mvSelectable):
-                dpg.add_theme_color(dpg.mvThemeCol_Text, color)
+        with dpg.theme(tag=theme_tag), dpg.theme_component(dpg.mvSelectable):
+            dpg.add_theme_color(dpg.mvThemeCol_Text, color)
 
         self._level_themes[color] = theme_tag
         return theme_tag
@@ -259,18 +257,14 @@ class StatusLogPanel:
         """Clean up resources."""
         # Delete key handler registry
         if dpg.does_item_exist(self.TAG_KEY_HANDLER):
-            try:
+            with contextlib.suppress(Exception):
                 dpg.delete_item(self.TAG_KEY_HANDLER)
-            except Exception:
-                pass
 
         # Delete level themes
         for theme_tag in self._level_themes.values():
             if dpg.does_item_exist(theme_tag):
-                try:
+                with contextlib.suppress(Exception):
                     dpg.delete_item(theme_tag)
-                except Exception:
-                    pass
         self._level_themes.clear()
 
         # Clear entries

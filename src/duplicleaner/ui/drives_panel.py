@@ -3,26 +3,33 @@
 Dear PyGui UI component for managing drives and initiating scans.
 """
 
+import contextlib
 import os
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 import dearpygui.dearpygui as dpg
 
-from duplicleaner.db.models import Drive
-from duplicleaner.drives.manager import DriveManager, DriveStatus, DriveInfo
-from duplicleaner.drives.redundancy import RedundancyChecker, RedundancyReport, BackupPlanItem, ExclusionCandidate
-from duplicleaner.utils.config import get_config, save_config
-from duplicleaner.core.scanner import Scanner, ScanMode, ScanProgress, ScanState
-from duplicleaner.core.hasher import Hasher, HashProgress, HashState
-from duplicleaner.core.actions import ActionEngine, PendingAction, ActionType, OperationProgress
+from duplicleaner.core.actions import ActionEngine, ActionType, OperationProgress, PendingAction
+from duplicleaner.core.analysis_runner import AnalysisOptions, AnalysisRunner
 from duplicleaner.core.face_worker import FaceAnalysisWorker
-from duplicleaner.core.analysis_runner import AnalysisRunner, AnalysisOptions
+from duplicleaner.core.hasher import Hasher, HashProgress, HashState
+from duplicleaner.core.folder_watcher import FolderWatcher
+from duplicleaner.core.scanner import RecoveryManager, ScanMode, Scanner, ScanProgress, ScanState
+from duplicleaner.db.models import Drive
+from duplicleaner.drives.manager import DriveInfo, DriveManager, DriveStatus
+from duplicleaner.drives.redundancy import (
+    BackupPlanItem,
+    ExclusionCandidate,
+    RedundancyChecker,
+    RedundancyReport,
+)
+from duplicleaner.ui.theme import get_accent_color
+from duplicleaner.ui.tooltips import DRIVE_TOOLTIPS, add_tooltip
+from duplicleaner.utils.config import get_config, save_config
 from duplicleaner.utils.logging import get_logger
-from duplicleaner.ui.tooltips import add_tooltip, DRIVE_TOOLTIPS
-from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
@@ -92,13 +99,64 @@ class DrivesPanel:
     TAG_BTN_BACKUP_EXECUTE = "drives_btn_backup_execute"
     TAG_BTN_BACKUP_ANALYZE = "drives_btn_backup_analyze"
 
+    # Remap dialog tags
+    TAG_REMAP_DIALOG = "remap_drive_dialog"
+    TAG_REMAP_PATH = "remap_drive_path"
+
+    # Corrupt files tags
+    TAG_CORRUPT_HEADER = "drives_corrupt_header"
+    TAG_CORRUPT_TABLE = "corrupt_files_table"
+    TAG_CORRUPT_COUNT = "corrupt_files_count_text"
+    TAG_CORRUPT_PROGRESS = "corrupt_scan_progress_group"
+    TAG_CORRUPT_PROGRESS_BAR = "corrupt_scan_progress_bar"
+    TAG_CORRUPT_PROGRESS_TEXT = "corrupt_scan_progress_text"
+    TAG_BTN_CHECK_CORRUPT = "drives_btn_check_corrupt"
+    TAG_BTN_RECOVER_ALL = "drives_btn_recover_all"
+    TAG_RECOVERY_PROGRESS = "recovery_progress_group"
+    TAG_RECOVERY_PROGRESS_BAR = "recovery_progress_bar"
+    TAG_RECOVERY_PROGRESS_TEXT = "recovery_progress_text"
+
+    # Watch folders tags
+    TAG_WATCH_HEADER = "drives_watch_header"
+    TAG_WATCH_ENABLED = "watch_global_enabled"
+    TAG_WATCH_TABLE = "watch_folders_table"
+    TAG_WATCH_PATH_INPUT = "watch_folder_path_input"
+    TAG_WATCH_ADD_DIALOG = "watch_add_folder_dialog"
+    TAG_WATCH_POLL_INTERVAL = "watch_poll_interval"
+    TAG_WATCH_DEBOUNCE = "watch_debounce"
+    TAG_WATCH_AUTO_SCAN = "watch_auto_scan"
+    TAG_WATCH_AUTO_ORGANIZE = "watch_auto_organize"
+    TAG_WATCH_AUTO_AI = "watch_auto_ai"
+    TAG_WATCH_ORG_FORMAT = "watch_organize_format"
+    TAG_WATCH_STATUS = "watch_status_text"
+    TAG_BTN_WATCH_ADD = "drives_btn_watch_add"
+    TAG_BTN_WATCH_START = "drives_btn_watch_start"
+    TAG_WATCH_FOLDER_DIALOG = "watch_folder_browse_dialog"
+
+    # Folder summarization tags
+    TAG_SUMMARIZE_HEADER = "drives_summarize_header"
+    TAG_SUMMARIZE_FOLDER = "summarize_folder_input"
+    TAG_SUMMARIZE_PROVIDER = "summarize_provider_combo"
+    TAG_SUMMARIZE_MODEL = "summarize_model_input"
+    TAG_SUMMARIZE_FILE_TYPES = "summarize_file_types_input"
+    TAG_SUMMARIZE_LIMIT = "summarize_limit_input"
+    TAG_SUMMARIZE_BATCH_MODE = "summarize_batch_mode_checkbox"
+    TAG_SUMMARIZE_MODEL_STATUS = "summarize_model_status_text"
+    TAG_BTN_SUMMARIZE = "drives_btn_summarize"
+    TAG_BTN_SUMMARIZE_BROWSE = "drives_btn_summarize_browse"
+    TAG_SUMMARIZE_PROGRESS = "summarize_progress_group"
+    TAG_SUMMARIZE_PROGRESS_BAR = "summarize_progress_bar"
+    TAG_SUMMARIZE_PROGRESS_TEXT = "summarize_progress_text"
+    TAG_SUMMARIZE_DIALOG = "summarize_folder_dialog"
+
     def __init__(
         self,
         parent: int | str,
-        drive_manager: Optional[DriveManager] = None,
-        on_scan_complete: Optional[Callable[[str], None]] = None,
-        on_status_update: Optional[Callable[[str], None]] = None,
-        on_face_worker_state_change: Optional[Callable[[bool], None]] = None,
+        drive_manager: DriveManager | None = None,
+        on_scan_complete: Callable[[str], None] | None = None,
+        on_status_update: Callable[[str], None] | None = None,
+        on_face_worker_state_change: Callable[[bool], None] | None = None,
+        folder_watcher: FolderWatcher | None = None,
     ):
         """Initialize the drives panel.
 
@@ -106,43 +164,50 @@ class DrivesPanel:
             parent: Parent window/container tag
             drive_manager: DriveManager instance (creates one if not provided)
             on_scan_complete: Callback when scan completes (drive_id)
+            folder_watcher: FolderWatcher instance for watch folder management
         """
         self.parent = parent
         self.drive_manager = drive_manager or DriveManager(status_callback=self._on_drive_status_change)
         self.on_scan_complete = on_scan_complete
         self.on_status_update = on_status_update
         self.on_face_worker_state_change = on_face_worker_state_change
+        self._folder_watcher = folder_watcher
         self.redundancy_checker = RedundancyChecker(self.drive_manager.db, self.drive_manager)
         self.config = get_config()
 
         # Current scanner and hasher
-        self._scanner: Optional[Scanner] = None
-        self._hasher: Optional[Hasher] = None
-        self._scan_thread: Optional[threading.Thread] = None
-        self._current_scan_drive: Optional[str] = None
-        self._resume_state: Optional[dict] = None
-        self._face_worker: Optional[FaceAnalysisWorker] = None
-        self._face_worker_drive_id: Optional[str] = None
+        self._scanner: Scanner | None = None
+        self._hasher: Hasher | None = None
+        self._scan_thread: threading.Thread | None = None
+        self._current_scan_drive: str | None = None
+        self._resume_state: dict | None = None
+        self._face_worker: FaceAnalysisWorker | None = None
+        self._face_worker_drive_id: str | None = None
 
         # Selected drive
-        self._selected_drive_id: Optional[str] = None
-        self._redundancy_report: Optional[RedundancyReport] = None
+        self._selected_drive_id: str | None = None
+        self._redundancy_report: RedundancyReport | None = None
+        self._analytics_report = None  # StorageReport
         self._backup_plan: list[BackupPlanItem] = []
         self._drive_label_map: dict[str, str] = {}
-        self._action_engine: Optional[ActionEngine] = None
-        self._backup_thread: Optional[threading.Thread] = None
-        self._analysis_thread: Optional[threading.Thread] = None
-        self._analysis_worker_thread: Optional[threading.Thread] = None
+        self._action_engine: ActionEngine | None = None
+        self._backup_thread: threading.Thread | None = None
+        self._analysis_thread: threading.Thread | None = None
+        self._analysis_worker_thread: threading.Thread | None = None
         self._analysis_worker_stop = threading.Event()
-        self._hash_worker_thread: Optional[threading.Thread] = None
+        self._hash_worker_thread: threading.Thread | None = None
         self._hash_worker_stop = threading.Event()
         self._hash_lock = threading.Lock()
         self._queue_lock = threading.Lock()
         self._selection_tags: dict[str, str] = {}
         self._suppress_selection_events = False
         self._scan_all_queue: list[str] = []
-        self._scan_all_mode: Optional[ScanMode] = None
+        self._scan_all_mode: ScanMode | None = None
         self._scan_all_active = False
+        self._corrupt_scan_thread: threading.Thread | None = None
+        self._recovery_thread: threading.Thread | None = None
+        self._recovery_manager: RecoveryManager | None = None
+        self._corrupt_files_cache: list[dict] = []
         self._pending_full_refresh = True
         self._full_refresh_after = time.time() + 0.5
         self._pending_monitor_start = True
@@ -308,6 +373,176 @@ class DrivesPanel:
                 dpg.add_text("", tag=self.TAG_BG_STATUS)
 
             with dpg.collapsing_header(
+                label="Generate Summaries for Folder",
+                default_open=False,
+                tag=self.TAG_SUMMARIZE_HEADER,
+            ):
+                dpg.add_text(
+                    "Generate AI summaries for files. Uses selected drive below OR enter a folder path.",
+                    wrap=600
+                )
+                dpg.add_text(
+                    "If path not scanned, will auto-scan first (registers new drives automatically).",
+                    wrap=600,
+                    color=(180, 180, 180)
+                )
+                dpg.add_spacer(height=5)
+
+                dpg.add_text("Folder Path (optional - uses selected drive if empty):")
+                with dpg.group(horizontal=True):
+                    dpg.add_input_text(
+                        tag=self.TAG_SUMMARIZE_FOLDER,
+                        width=450,
+                        hint="Leave empty to use selected drive, or enter specific path"
+                    )
+                    btn = dpg.add_button(
+                        label="Browse...",
+                        tag=self.TAG_BTN_SUMMARIZE_BROWSE,
+                        callback=self._on_summarize_browse_click
+                    )
+                    add_tooltip(
+                        btn,
+                        "Browse for folder to summarize\n"
+                        "If not scanned, will auto-scan before summarization"
+                    )
+
+                dpg.add_spacer(height=5)
+
+                with dpg.group(horizontal=True):
+                    dpg.add_text("Provider:")
+                    dpg.add_combo(
+                        tag=self.TAG_SUMMARIZE_PROVIDER,
+                        items=["lmstudio", "local", "openai", "anthropic", "google"],
+                        default_value="lmstudio",
+                        width=150
+                    )
+                    add_tooltip(dpg.last_item(), "LLM provider (LMStudio=local, local=Ollama, others=cloud)")
+
+                    dpg.add_text("  Model (optional):")
+                    dpg.add_input_text(
+                        tag=self.TAG_SUMMARIZE_MODEL,
+                        width=200,
+                        hint="Leave empty for default"
+                    )
+
+                dpg.add_spacer(height=5)
+
+                with dpg.group(horizontal=True):
+                    dpg.add_text("File Types:")
+                    dpg.add_input_text(
+                        tag=self.TAG_SUMMARIZE_FILE_TYPES,
+                        width=200,
+                        hint=".jpg,.png,.pdf (or leave empty for all)"
+                    )
+                    add_tooltip(dpg.last_item(), "Comma-separated file extensions to process")
+
+                    dpg.add_text("  Limit:")
+                    dpg.add_input_text(
+                        tag=self.TAG_SUMMARIZE_LIMIT,
+                        width=80,
+                        default_value="500"
+                    )
+                    add_tooltip(dpg.last_item(), "Maximum number of files to process")
+
+                dpg.add_spacer(height=5)
+
+                # Batch mode checkbox
+                cb = dpg.add_checkbox(
+                    label="Enable intelligent batch processing (groups by file type, detects model)",
+                    tag=self.TAG_SUMMARIZE_BATCH_MODE,
+                    default_value=True
+                )
+                add_tooltip(
+                    cb,
+                    "When enabled, groups files by type and processes them in batches.\n"
+                    "Requires LMStudioMonitorService for automatic model detection.\n"
+                    "If disabled, processes files one-by-one in directory order."
+                )
+
+                dpg.add_spacer(height=5)
+
+                # Model status text (shows current loaded model if LMStudio)
+                dpg.add_text("", tag=self.TAG_SUMMARIZE_MODEL_STATUS, color=(180, 180, 180))
+
+                dpg.add_spacer(height=10)
+
+                btn = dpg.add_button(
+                    label="Generate Summaries",
+                    tag=self.TAG_BTN_SUMMARIZE,
+                    callback=self._on_summarize_click
+                )
+                add_tooltip(btn, "Start generating AI summaries for files in the folder")
+
+                dpg.add_spacer(height=10)
+
+                # Progress section (initially hidden)
+                with dpg.group(tag=self.TAG_SUMMARIZE_PROGRESS, show=False):
+                    dpg.add_text("Summarization Progress:", color=get_accent_color())
+                    dpg.add_spacer(height=5)
+                    dpg.add_text("", tag=self.TAG_SUMMARIZE_PROGRESS_TEXT)
+                    dpg.add_progress_bar(tag=self.TAG_SUMMARIZE_PROGRESS_BAR, default_value=0.0, width=-1)
+
+            with dpg.collapsing_header(
+                label="Watch Folders",
+                default_open=False,
+                tag=self.TAG_WATCH_HEADER,
+            ):
+                dpg.add_text(
+                    "Monitor folders for new files. When detected, auto-scan, hash, and optionally organize.",
+                    wrap=600,
+                )
+                dpg.add_spacer(height=5)
+
+                with dpg.group(horizontal=True):
+                    cb = dpg.add_checkbox(
+                        label="Enable folder watching",
+                        tag=self.TAG_WATCH_ENABLED,
+                        default_value=self.config.watch.global_enabled,
+                        callback=self._on_watch_enabled_toggle,
+                    )
+                    add_tooltip(cb, "Master toggle for all watch folders")
+                    dpg.add_spacer(width=15)
+                    btn = dpg.add_button(
+                        label="Add Watch Folder",
+                        tag=self.TAG_BTN_WATCH_ADD,
+                        callback=self._on_watch_add_click,
+                    )
+                    add_tooltip(btn, "Add a new folder to monitor for incoming files")
+                    btn = dpg.add_button(
+                        label="Start Watcher",
+                        tag=self.TAG_BTN_WATCH_START,
+                        callback=self._on_watch_start_stop_click,
+                    )
+                    add_tooltip(btn, "Start or stop the folder watcher")
+
+                dpg.add_spacer(height=5)
+                dpg.add_text("Not running", tag=self.TAG_WATCH_STATUS, color=(180, 180, 180))
+
+                dpg.add_spacer(height=5)
+                with dpg.child_window(height=160, border=True):
+                    with dpg.table(
+                        tag=self.TAG_WATCH_TABLE,
+                        header_row=True,
+                        borders_innerH=True,
+                        borders_outerH=True,
+                        borders_innerV=True,
+                        borders_outerV=True,
+                        resizable=True,
+                        policy=dpg.mvTable_SizingStretchProp,
+                        row_background=True,
+                        scrollY=True,
+                        height=130,
+                    ):
+                        dpg.add_table_column(label="Path", init_width_or_weight=250)
+                        dpg.add_table_column(label="Poll (s)", init_width_or_weight=60)
+                        dpg.add_table_column(label="Auto-Scan", init_width_or_weight=60)
+                        dpg.add_table_column(label="Auto-Org", init_width_or_weight=60)
+                        dpg.add_table_column(label="Enabled", init_width_or_weight=50)
+                        dpg.add_table_column(label="Action", width_fixed=True, init_width_or_weight=70)
+
+                self._refresh_watch_table()
+
+            with dpg.collapsing_header(
                 label="Advanced / Maintenance",
                 default_open=False,
                 tag=self.TAG_ADVANCED_HEADER,
@@ -386,6 +621,77 @@ class DrivesPanel:
                 dpg.add_text("Select a drive to view details.")
 
             dpg.add_spacer(height=10)
+
+            with dpg.collapsing_header(
+                label="Corrupt Files & Recovery",
+                default_open=False,
+                tag=self.TAG_CORRUPT_HEADER,
+            ):
+                dpg.add_text(
+                    "Scan for corrupt images and attempt automated recovery using progressive strategies.",
+                    wrap=600,
+                )
+                dpg.add_spacer(height=5)
+
+                with dpg.group(horizontal=True):
+                    btn = dpg.add_button(
+                        label="Check for Corrupt Files",
+                        tag=self.TAG_BTN_CHECK_CORRUPT,
+                        callback=self._on_check_corruption_click,
+                    )
+                    add_tooltip(
+                        btn,
+                        "Scan image files on the selected drive for corruption.\n"
+                        "Checks JPEG markers, truncation, and image integrity.",
+                    )
+                    btn = dpg.add_button(
+                        label="Recover All",
+                        tag=self.TAG_BTN_RECOVER_ALL,
+                        callback=self._on_recover_all_click,
+                        enabled=False,
+                    )
+                    add_tooltip(
+                        btn,
+                        "Attempt automated recovery on all corrupt files.\n"
+                        "Uses 6 progressive strategies from least to most aggressive.",
+                    )
+
+                dpg.add_spacer(height=5)
+                dpg.add_text("No corruption scan results yet.", tag=self.TAG_CORRUPT_COUNT)
+
+                # Corruption scan progress (hidden)
+                with dpg.group(tag=self.TAG_CORRUPT_PROGRESS, show=False):
+                    dpg.add_text("", tag=self.TAG_CORRUPT_PROGRESS_TEXT)
+                    dpg.add_progress_bar(tag=self.TAG_CORRUPT_PROGRESS_BAR, default_value=0.0, width=-1)
+
+                # Recovery progress (hidden)
+                with dpg.group(tag=self.TAG_RECOVERY_PROGRESS, show=False):
+                    dpg.add_text("", tag=self.TAG_RECOVERY_PROGRESS_TEXT)
+                    dpg.add_progress_bar(tag=self.TAG_RECOVERY_PROGRESS_BAR, default_value=0.0, width=-1)
+
+                dpg.add_spacer(height=5)
+
+                # Corrupt files table
+                with dpg.child_window(height=220, border=True):
+                    with dpg.table(
+                        tag=self.TAG_CORRUPT_TABLE,
+                        header_row=True,
+                        borders_innerH=True,
+                        borders_outerH=True,
+                        borders_innerV=True,
+                        borders_outerV=True,
+                        resizable=True,
+                        policy=dpg.mvTable_SizingStretchProp,
+                        row_background=True,
+                        scrollY=True,
+                        height=190,
+                    ):
+                        dpg.add_table_column(label="Filename", init_width_or_weight=180)
+                        dpg.add_table_column(label="Type", init_width_or_weight=100)
+                        dpg.add_table_column(label="Severity", init_width_or_weight=70)
+                        dpg.add_table_column(label="Size", init_width_or_weight=70)
+                        dpg.add_table_column(label="Action", width_fixed=True, init_width_or_weight=160)
+
             with dpg.collapsing_header(
                 label="Redundancy & Backups",
                 default_open=False,
@@ -423,6 +729,11 @@ class DrivesPanel:
                         callback=self._on_open_backup_target,
                     )
                     add_tooltip(btn, DRIVE_TOOLTIPS["open_targets"])
+                    dpg.add_spacer(width=20)
+                    dpg.add_button(
+                        label="Export Redundancy Report",
+                        callback=self._on_export_redundancy,
+                    )
 
                 dpg.add_spacer(height=5)
                 with dpg.group(horizontal=True):
@@ -439,9 +750,11 @@ class DrivesPanel:
                 dpg.add_spacer(height=5)
                 lbl = dpg.add_text("Backup targets:")
                 add_tooltip(lbl, DRIVE_TOOLTIPS["backup_targets"])
-                with dpg.child_window(height=80, border=True):
-                    with dpg.group(tag=self.TAG_BACKUP_TARGETS_GROUP):
-                        dpg.add_text("No drives registered.")
+                with (
+                    dpg.child_window(height=80, border=True),
+                    dpg.group(tag=self.TAG_BACKUP_TARGETS_GROUP),
+                ):
+                    dpg.add_text("No drives registered.")
 
                 dpg.add_spacer(height=5)
                 dpg.add_text("Exclude patterns (one per line):")
@@ -483,62 +796,59 @@ class DrivesPanel:
                 lbl = dpg.add_text("No redundancy report yet.", tag=self.TAG_REDUNDANCY_SUMMARY)
                 add_tooltip(lbl, DRIVE_TOOLTIPS["at_risk_table"])
 
-                with dpg.child_window(height=180, border=True):
-                    with dpg.table(
-                        tag=self.TAG_AT_RISK_TABLE,
-                        header_row=True,
-                        borders_innerH=True,
-                        borders_outerH=True,
-                        borders_innerV=True,
-                        borders_outerV=True,
-                        resizable=True,
-                        policy=dpg.mvTable_SizingStretchProp,
-                        row_background=True,
-                        scrollY=True,
-                        height=150,
-                    ):
-                        dpg.add_table_column(label="File", init_width_or_weight=160)
-                        dpg.add_table_column(label="Drive", init_width_or_weight=120)
-                        dpg.add_table_column(label="Size", init_width_or_weight=80)
-                        dpg.add_table_column(label="Path", init_width_or_weight=260)
+                with dpg.child_window(height=180, border=True), dpg.table(
+                    tag=self.TAG_AT_RISK_TABLE,
+                    header_row=True,
+                    borders_innerH=True,
+                    borders_outerH=True,
+                    borders_innerV=True,
+                    borders_outerV=True,
+                    resizable=True,
+                    policy=dpg.mvTable_SizingStretchProp,
+                    row_background=True,
+                    scrollY=True,
+                    height=150,
+                ):
+                    dpg.add_table_column(label="File", init_width_or_weight=160)
+                    dpg.add_table_column(label="Drive", init_width_or_weight=120)
+                    dpg.add_table_column(label="Size", init_width_or_weight=80)
+                    dpg.add_table_column(label="Path", init_width_or_weight=260)
 
                 dpg.add_spacer(height=5)
-                with dpg.child_window(height=140, border=True):
-                    with dpg.table(
-                        tag=self.TAG_BACKUP_EXCLUDE_TABLE,
-                        header_row=True,
-                        borders_innerH=True,
-                        borders_outerH=True,
-                        borders_innerV=True,
-                        borders_outerV=True,
-                        resizable=True,
-                        policy=dpg.mvTable_SizingStretchProp,
-                        row_background=True,
-                        scrollY=True,
-                        height=110,
-                    ):
-                        dpg.add_table_column(label="Pattern", init_width_or_weight=240)
-                        dpg.add_table_column(label="Files", init_width_or_weight=80)
-                        dpg.add_table_column(label="Size", init_width_or_weight=100)
+                with dpg.child_window(height=140, border=True), dpg.table(
+                    tag=self.TAG_BACKUP_EXCLUDE_TABLE,
+                    header_row=True,
+                    borders_innerH=True,
+                    borders_outerH=True,
+                    borders_innerV=True,
+                    borders_outerV=True,
+                    resizable=True,
+                    policy=dpg.mvTable_SizingStretchProp,
+                    row_background=True,
+                    scrollY=True,
+                    height=110,
+                ):
+                    dpg.add_table_column(label="Pattern", init_width_or_weight=240)
+                    dpg.add_table_column(label="Files", init_width_or_weight=80)
+                    dpg.add_table_column(label="Size", init_width_or_weight=100)
 
                 dpg.add_spacer(height=5)
-                with dpg.child_window(height=160, border=True):
-                    with dpg.table(
-                        tag=self.TAG_BACKUP_PLAN_TABLE,
-                        header_row=True,
-                        borders_innerH=True,
-                        borders_outerH=True,
-                        borders_innerV=True,
-                        borders_outerV=True,
-                        resizable=True,
-                        policy=dpg.mvTable_SizingStretchProp,
-                        row_background=True,
-                        scrollY=True,
-                        height=130,
-                    ):
-                        dpg.add_table_column(label="Source", init_width_or_weight=160)
-                        dpg.add_table_column(label="Target", init_width_or_weight=260)
-                        dpg.add_table_column(label="Size", init_width_or_weight=80)
+                with dpg.child_window(height=160, border=True), dpg.table(
+                    tag=self.TAG_BACKUP_PLAN_TABLE,
+                    header_row=True,
+                    borders_innerH=True,
+                    borders_outerH=True,
+                    borders_innerV=True,
+                    borders_outerV=True,
+                    resizable=True,
+                    policy=dpg.mvTable_SizingStretchProp,
+                    row_background=True,
+                    scrollY=True,
+                    height=130,
+                ):
+                    dpg.add_table_column(label="Source", init_width_or_weight=160)
+                    dpg.add_table_column(label="Target", init_width_or_weight=260)
+                    dpg.add_table_column(label="Size", init_width_or_weight=80)
 
                 dpg.add_spacer(height=5)
                 with dpg.group(tag=self.TAG_BACKUP_PROGRESS_GROUP, show=False):
@@ -549,10 +859,97 @@ class DrivesPanel:
                         dpg.add_button(label="Pause", tag=self.TAG_BACKUP_PAUSE_BUTTON, callback=self._on_backup_pause)
                         dpg.add_button(label="Cancel", tag=self.TAG_BACKUP_CANCEL_BUTTON, callback=self._on_backup_cancel)
 
+            with dpg.collapsing_header(
+                label="Storage Analytics",
+                default_open=False,
+                tag="analytics_header",
+            ):
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="Compute Analytics",
+                        tag="analytics_compute_btn",
+                        callback=self._on_compute_analytics,
+                    )
+                    dpg.add_button(
+                        label="Export Analytics",
+                        tag="analytics_export_btn",
+                        callback=self._on_export_analytics,
+                    )
+
+                dpg.add_spacer(height=5)
+
+                # Summary cards
+                with dpg.group(horizontal=True, tag="analytics_summary"):
+                    with dpg.child_window(width=200, height=60, border=True, tag="analytics_card_files"):
+                        dpg.add_text("Total Files", color=get_accent_color())
+                        dpg.add_text("--", tag="analytics_total_files")
+                    with dpg.child_window(width=200, height=60, border=True, tag="analytics_card_size"):
+                        dpg.add_text("Total Size", color=get_accent_color())
+                        dpg.add_text("--", tag="analytics_total_size")
+                    with dpg.child_window(width=200, height=60, border=True, tag="analytics_card_waste"):
+                        dpg.add_text("Duplicate Waste", color=get_accent_color())
+                        dpg.add_text("--", tag="analytics_dup_waste")
+                    with dpg.child_window(width=200, height=60, border=True, tag="analytics_card_risk"):
+                        dpg.add_text("At-Risk Data", color=get_accent_color())
+                        dpg.add_text("--", tag="analytics_at_risk")
+
+                dpg.add_spacer(height=10)
+
+                # File type breakdown chart
+                with dpg.plot(
+                    label="Storage by File Type",
+                    height=200,
+                    width=-1,
+                    tag="analytics_type_plot",
+                    no_mouse_pos=True,
+                ):
+                    dpg.add_plot_legend()
+                    dpg.add_plot_axis(dpg.mvXAxis, label="", tag="analytics_type_x",
+                                     no_tick_labels=True)
+                    dpg.add_plot_axis(dpg.mvYAxis, label="Size (GB)", tag="analytics_type_y")
+
+                dpg.add_spacer(height=10)
+
+                # Year breakdown chart
+                with dpg.plot(
+                    label="Storage by Year",
+                    height=200,
+                    width=-1,
+                    tag="analytics_year_plot",
+                    no_mouse_pos=True,
+                ):
+                    dpg.add_plot_legend()
+                    dpg.add_plot_axis(dpg.mvXAxis, label="Year", tag="analytics_year_x")
+                    dpg.add_plot_axis(dpg.mvYAxis, label="Size (GB)", tag="analytics_year_y")
+
+                dpg.add_spacer(height=10)
+
+                # Quick wins table
+                dpg.add_text("Quick Wins - Recoverable Space", color=get_accent_color())
+                with dpg.child_window(height=120, border=True):
+                    with dpg.table(
+                        tag="analytics_quickwins_table",
+                        header_row=True,
+                        borders_innerH=True,
+                        borders_outerH=True,
+                        borders_innerV=True,
+                        borders_outerV=True,
+                        resizable=True,
+                        policy=dpg.mvTable_SizingStretchProp,
+                        row_background=True,
+                    ):
+                        dpg.add_table_column(label="Category", init_width_or_weight=150)
+                        dpg.add_table_column(label="Description", init_width_or_weight=300)
+                        dpg.add_table_column(label="Files", init_width_or_weight=80)
+                        dpg.add_table_column(label="Recoverable", init_width_or_weight=100)
+
         # Create add drive dialog
         self._create_add_drive_dialog()
         self._create_backup_source_dialog()
         self._create_scan_all_dialog()
+        self._create_summarize_folder_dialog()
+        self._create_watch_add_dialog()
+        self._create_watch_folder_browse_dialog()
         self._update_background_status()
 
         # Initial refresh (fast, no probing)
@@ -627,11 +1024,23 @@ class DrivesPanel:
                 dpg.add_button(label="Start", callback=self._on_scan_all_confirm, width=100)
                 dpg.add_button(label="Cancel", callback=lambda: dpg.hide_item(self.TAG_SCAN_ALL_DIALOG), width=100)
 
+    def _create_summarize_folder_dialog(self) -> None:
+        """Create the summarize folder browser dialog."""
+        with dpg.file_dialog(
+            tag=self.TAG_SUMMARIZE_DIALOG,
+            directory_selector=True,
+            show=False,
+            callback=self._on_summarize_folder_selected,
+            width=700,
+            height=400,
+        ):
+            dpg.add_file_extension(".*", color=(255, 255, 255, 255))
+
     def _set_section_visibility(self, has_drives: bool) -> None:
         """Toggle visibility for empty state and advanced sections."""
         if dpg.does_item_exist(self.TAG_GETTING_STARTED):
             dpg.configure_item(self.TAG_GETTING_STARTED, show=not has_drives)
-        for tag in (self.TAG_ANALYSIS_HEADER, self.TAG_ADVANCED_HEADER, self.TAG_BACKUP_HEADER):
+        for tag in (self.TAG_ANALYSIS_HEADER, self.TAG_SUMMARIZE_HEADER, self.TAG_WATCH_HEADER, self.TAG_ADVANCED_HEADER, self.TAG_CORRUPT_HEADER, self.TAG_BACKUP_HEADER):
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, show=has_drives)
 
@@ -646,7 +1055,7 @@ class DrivesPanel:
         else:
             dpg.set_value(self.TAG_SELECTED_SUMMARY, "Selected drive: None")
 
-    def _refresh_action_states(self, has_drives: Optional[bool] = None) -> None:
+    def _refresh_action_states(self, has_drives: bool | None = None) -> None:
         """Enable/disable action buttons based on current state."""
         if has_drives is None:
             has_drives = bool(self.drive_manager.get_all_drives())
@@ -813,6 +1222,7 @@ class DrivesPanel:
         self._refresh_resume_button()
         self._update_selected_summary()
         self._refresh_action_states()
+        self._refresh_corrupt_table(drive_id)
 
         # Ensure only one checkbox is active
         self._suppress_selection_events = True
@@ -850,12 +1260,20 @@ class DrivesPanel:
         dpg.add_text(f"Path: {drive.path}", parent="drive_details")
         dpg.add_text(f"Status: {drive_info.status.value.title()}", parent="drive_details")
 
+        if drive_info.status == DriveStatus.DISCONNECTED:
+            btn = dpg.add_button(
+                label="Remap Path...",
+                callback=lambda: self._on_remap_drive_click(),
+                parent="drive_details",
+            )
+            add_tooltip(btn, DRIVE_TOOLTIPS["remap_drive"])
+
         if drive_info.is_network:
-            dpg.add_text(f"Type: Network Share", parent="drive_details")
+            dpg.add_text("Type: Network Share", parent="drive_details")
             if drive_info.server:
                 dpg.add_text(f"Server: {drive_info.server}", parent="drive_details")
         else:
-            dpg.add_text(f"Type: Local Drive", parent="drive_details")
+            dpg.add_text("Type: Local Drive", parent="drive_details")
             if drive_info.volume_label:
                 dpg.add_text(f"Volume: {drive_info.volume_label}", parent="drive_details")
             if drive_info.filesystem:
@@ -865,6 +1283,15 @@ class DrivesPanel:
 
         if drive.last_scan:
             dpg.add_text(f"Last Scan: {drive.last_scan.strftime('%Y-%m-%d %H:%M:%S')}", parent="drive_details")
+
+        # Show corrupt file count if any
+        corrupt_files = self.drive_manager.db.get_corrupt_files(drive_id=drive_id)
+        if corrupt_files:
+            dpg.add_text(
+                f"Corrupt Files: {len(corrupt_files)}",
+                parent="drive_details",
+                color=(255, 180, 60),
+            )
 
     def _on_add_drive_click(self) -> None:
         """Handle add drive button click."""
@@ -933,12 +1360,12 @@ class DrivesPanel:
         if dpg.does_item_exist(tag):
             dpg.delete_item(tag)
 
-        def confirm(sender=None, app_data=None, user_data=None):
+        def confirm(_sender=None, _app_data=None, _user_data=None):
             dpg.configure_item(tag, show=False)
             if callable(on_confirm):
                 on_confirm()
 
-        def cancel(sender=None, app_data=None, user_data=None):
+        def cancel(_sender=None, _app_data=None, _user_data=None):
             dpg.configure_item(tag, show=False)
 
         with dpg.window(
@@ -1119,7 +1546,7 @@ class DrivesPanel:
 
         self._start_scan(drive, mode, resume_state=resume_state)
 
-    def _start_scan(self, drive: Drive, mode: ScanMode, resume_state: Optional[dict]) -> None:
+    def _start_scan(self, drive: Drive, mode: ScanMode, resume_state: dict | None) -> None:
         """Start a scan (new or resume) in background thread."""
         self._current_scan_drive = drive.id
         self._scan_thread = threading.Thread(
@@ -1220,7 +1647,7 @@ class DrivesPanel:
             if self.on_status_update:
                 self.on_status_update(f"Analysis failed: {exc}")
 
-    def _run_scan(self, drive: Drive, mode: ScanMode, resume_state: Optional[dict]) -> None:
+    def _run_scan(self, drive: Drive, mode: ScanMode, resume_state: dict | None) -> None:
         """Run scan in background thread."""
         scan_state = None
         try:
@@ -1695,7 +2122,7 @@ class DrivesPanel:
             if self.on_status_update:
                 self.on_status_update(f"Backup plan exported to {export_path}")
         except PermissionError:
-            logger.error(f"Permission denied exporting backup plan")
+            logger.error("Permission denied exporting backup plan")
             self._show_error_dialog("Export Plan", "Permission denied. Close the file if it's open in another program.")
         except Exception as e:
             logger.error(f"Failed to export backup plan: {e}")
@@ -1865,6 +2292,69 @@ class DrivesPanel:
             dpg.add_spacer(height=10)
             dpg.add_button(label="OK", callback=lambda: dpg.configure_item(tag, show=False))
 
+    def _on_remap_drive_click(self) -> None:
+        """Handle remap drive button click."""
+        if not self._selected_drive_id:
+            self._show_error_dialog("Remap Path", "Select a drive first.")
+            return
+
+        drive = self.drive_manager.get_drive(self._selected_drive_id)
+        if not drive:
+            self._show_error_dialog("Remap Path", "Drive not found.")
+            return
+
+        self._show_remap_dialog(drive)
+
+    def _show_remap_dialog(self, drive: Drive) -> None:
+        """Show dialog to remap a drive's root path."""
+        tag = self.TAG_REMAP_DIALOG
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+
+        def confirm():
+            new_path = dpg.get_value(self.TAG_REMAP_PATH).strip()
+            if not new_path:
+                self._show_error_dialog("Remap Path", "No path provided.")
+                return
+            try:
+                count = self.drive_manager.remap_drive_path(drive.id, new_path)
+                dpg.configure_item(tag, show=False)
+                if self.on_status_update:
+                    self.on_status_update(
+                        f"Remapped '{drive.label}' to {new_path} ({count} files updated)"
+                    )
+                self._refresh_drive_list()
+            except ValueError as e:
+                self._show_error_dialog("Remap Path", str(e))
+
+        def cancel():
+            dpg.configure_item(tag, show=False)
+
+        with dpg.window(
+            label="Remap Drive Path",
+            tag=tag,
+            modal=True,
+            show=True,
+            width=520,
+            height=250,
+            no_resize=True,
+            pos=[250, 180],
+        ):
+            dpg.add_text(f"Drive: {drive.label}")
+            dpg.add_text(f"Current path: {drive.path}")
+            dpg.add_spacer(height=5)
+            dpg.add_text(
+                "All scan data, faces, metadata, and AI results will be preserved.\n"
+                "Only the file paths in the database will be updated."
+            )
+            dpg.add_spacer(height=5)
+            dpg.add_text("New path:")
+            dpg.add_input_text(tag=self.TAG_REMAP_PATH, width=-1)
+            dpg.add_spacer(height=10)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Remap", callback=confirm)
+                dpg.add_button(label="Cancel", callback=cancel)
+
     def _confirm_remove_drive(self, drive_label: str) -> None:
         """Show confirmation dialog for removing a drive."""
         tag = "confirm_remove_drive"
@@ -1953,10 +2443,8 @@ class DrivesPanel:
 
     def _on_drive_status_change(self, drive_id: str, status: DriveStatus) -> None:
         """Handle drive status changes for auto-sync."""
-        try:
+        with contextlib.suppress(Exception):
             self._refresh_drive_list()
-        except Exception:
-            pass
         if status != DriveStatus.CONNECTED:
             return
         if drive_id not in self.config.backup.target_drive_ids:
@@ -1981,3 +2469,1355 @@ class DrivesPanel:
         self._backup_plan = plan
         self._populate_backup_plan_table(plan)
         self._on_execute_backup_plan()
+
+    def _on_summarize_browse_click(self) -> None:
+        """Show folder browser for summarization."""
+        dpg.show_item(self.TAG_SUMMARIZE_DIALOG)
+
+    def _on_summarize_folder_selected(self, sender, app_data) -> None:
+        """Handle folder selection from browser."""
+        selections = app_data.get("selections", {})
+        if selections:
+            folder_path = list(selections.values())[0]
+            dpg.set_value(self.TAG_SUMMARIZE_FOLDER, folder_path)
+
+    def _on_summarize_click(self) -> None:
+        """Start summarization for the selected folder or drive."""
+        # Get folder path from input OR use selected drive
+        folder_path = dpg.get_value(self.TAG_SUMMARIZE_FOLDER).strip().strip('"')
+
+        # Get selected drive if no folder path provided
+        selected_drive = None
+        if not folder_path and self._selected_drive_id:
+            selected_drive = self.drive_manager.get_drive(self._selected_drive_id)
+
+        # Determine target path: folder input takes precedence, then selected drive
+        target_path = None
+        if folder_path:
+            target_path = folder_path
+        elif selected_drive:
+            target_path = selected_drive.path
+        else:
+            if self.on_status_update:
+                self.on_status_update(
+                    "Select a drive or enter a folder path to summarize",
+                    level="warning"
+                )
+            return
+
+        if not os.path.exists(target_path):
+            if self.on_status_update:
+                self.on_status_update(f"Path not found: {target_path}", level="error")
+            return
+
+        provider = dpg.get_value(self.TAG_SUMMARIZE_PROVIDER)
+        model = dpg.get_value(self.TAG_SUMMARIZE_MODEL).strip()
+        file_types_str = dpg.get_value(self.TAG_SUMMARIZE_FILE_TYPES).strip()
+        limit_str = dpg.get_value(self.TAG_SUMMARIZE_LIMIT).strip()
+        batch_mode = dpg.get_value(self.TAG_SUMMARIZE_BATCH_MODE)
+
+        try:
+            limit = int(limit_str) if limit_str else 500
+        except ValueError:
+            if self.on_status_update:
+                self.on_status_update("Limit must be a number", level="error")
+            return
+
+        file_types = None
+        if file_types_str:
+            file_types = [
+                ext.strip() if ext.startswith(".") else f".{ext.strip()}"
+                for ext in file_types_str.split(",")
+            ]
+
+        # Check LMStudio model status if using LMStudio provider
+        if provider == "lmstudio":
+            self._update_lmstudio_model_status()
+
+        if self.on_status_update:
+            mode_str = "batch mode" if batch_mode else "sequential mode"
+            source_str = "selected drive" if (not folder_path and selected_drive) else "folder"
+            self.on_status_update(
+                f"Starting summarization ({mode_str}) for {source_str}: {target_path}..."
+            )
+
+        dpg.configure_item(self.TAG_BTN_SUMMARIZE, enabled=False)
+        dpg.configure_item(self.TAG_SUMMARIZE_PROGRESS, show=True)
+        dpg.set_value(self.TAG_SUMMARIZE_PROGRESS_TEXT, "Checking if path is scanned...")
+        dpg.set_value(self.TAG_SUMMARIZE_PROGRESS_BAR, 0.0)
+
+        thread = threading.Thread(
+            target=self._run_summarization_with_auto_scan,
+            args=(target_path, provider, model, file_types, limit, batch_mode),
+            daemon=True
+        )
+        thread.start()
+
+    def _run_summarization_with_auto_scan(
+        self,
+        target_path: str,
+        provider: str,
+        model: str,
+        file_types: list[str] | None,
+        limit: int,
+        batch_mode: bool
+    ) -> None:
+        """Run summarization with automatic scanning if path not in database."""
+        try:
+            # Check if path is within any scanned drive
+            drives = self.drive_manager.get_all_drives()
+            matching_drive = None
+
+            for drive in drives:
+                if target_path == drive.path or target_path.startswith(drive.path + os.sep):
+                    matching_drive = drive
+                    break
+
+            # Check if we have files in database for this path
+            files_in_db = self.drive_manager.db.get_files_needing_summary_in_directory(
+                target_path,
+                limit=1,  # Just check if any exist
+                file_types=file_types
+            )
+
+            # If no files in database, we need to scan
+            if not files_in_db:
+                if matching_drive:
+                    # Path is within a registered drive but not scanned yet
+                    dpg.configure_item(
+                        self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                        default_value="Path in registered drive but not scanned. Scanning now..."
+                    )
+                    if self.on_status_update:
+                        self.on_status_update(f"Scanning {target_path} before summarization...")
+
+                    # Run scan on the drive
+                    self._scan_drive_for_summarization(matching_drive.id, target_path)
+
+                else:
+                    # Path is not in any registered drive - register and scan it
+                    dpg.configure_item(
+                        self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                        default_value="Path not registered. Adding as drive and scanning..."
+                    )
+                    if self.on_status_update:
+                        self.on_status_update(f"Registering and scanning {target_path}...")
+
+                    # Add as new drive
+                    import uuid
+                    drive_id = str(uuid.uuid4())
+                    drive_label = os.path.basename(target_path) or target_path
+
+                    # Use DriveManager to add the drive properly
+                    success = self.drive_manager.add_drive(
+                        drive_id=drive_id,
+                        label=drive_label,
+                        path=target_path
+                    )
+
+                    if success:
+                        # Scan the newly added drive
+                        self._scan_drive_for_summarization(drive_id, target_path)
+                        # Refresh drive list in UI
+                        self._populate_drive_list()
+                    else:
+                        dpg.configure_item(
+                            self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                            default_value="Failed to register drive"
+                        )
+                        dpg.configure_item(self.TAG_BTN_SUMMARIZE, enabled=True)
+                        return
+
+            # Now run summarization (path is guaranteed to be scanned)
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value="Starting summarization..."
+            )
+            self._run_summarization(target_path, provider, model, file_types, limit, batch_mode)
+
+        except Exception as exc:
+            logger.error(f"Auto-scan summarization failed: {exc}")
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value=f"Error: {exc}"
+            )
+            dpg.configure_item(self.TAG_BTN_SUMMARIZE, enabled=True)
+            if self.on_status_update:
+                self.on_status_update(f"Summarization failed: {exc}", level="error")
+
+    def _scan_drive_for_summarization(self, drive_id: int, path: str) -> None:
+        """Run a quick scan on a drive/folder before summarization."""
+        from duplicleaner.core.scanner import ScanMode, Scanner
+
+        dpg.configure_item(
+            self.TAG_SUMMARIZE_PROGRESS_TEXT,
+            default_value=f"Scanning {path}..."
+        )
+
+        drive = self.drive_manager.get_drive(drive_id)
+        if not drive:
+            raise Exception("Drive not found for summarization scan")
+
+        def on_progress(progress: ScanProgress) -> None:
+            dpg.set_value(self.TAG_SUMMARIZE_PROGRESS_BAR, 0.0)
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value=f"Scanning: {progress.files_found} files found..."
+            )
+
+        scanner = Scanner(self.drive_manager.db, progress_callback=on_progress)
+        result = scanner.scan(drive, mode=ScanMode.QUICK, resume_state=None)
+
+        if scanner.state == ScanState.COMPLETED:
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value=f"Scan complete: {result.total_files} files indexed"
+            )
+            if self.on_status_update:
+                self.on_status_update(f"Scan complete: {result.total_files} files found")
+        elif scanner.state == ScanState.CANCELLED:
+            raise Exception("Scan cancelled")
+        else:
+            raise Exception(f"Scan failed: {scanner.state.value}")
+
+    def _update_lmstudio_model_status(self) -> None:
+        """Update the model status text with current LMStudio model."""
+        try:
+            from duplicleaner.utils.lmstudio_manager import LMStudioManager
+
+            manager = LMStudioManager()
+            if manager.is_available():
+                current_model = manager.get_current_model()
+                if current_model:
+                    status_text = f"Current model: {current_model.name} ({current_model.type.value})"
+                    dpg.set_value(self.TAG_SUMMARIZE_MODEL_STATUS, status_text)
+                else:
+                    dpg.set_value(self.TAG_SUMMARIZE_MODEL_STATUS, "No model loaded in LMStudio")
+            else:
+                dpg.set_value(self.TAG_SUMMARIZE_MODEL_STATUS, "LMStudioMonitorService not available")
+        except Exception as exc:
+            logger.debug(f"Could not check LMStudio status: {exc}")
+            dpg.set_value(self.TAG_SUMMARIZE_MODEL_STATUS, "")
+
+    def _run_summarization(
+        self,
+        folder_path: str,
+        provider: str,
+        model: str,
+        file_types: list[str] | None,
+        limit: int,
+        batch_mode: bool = True
+    ) -> None:
+        """Run summarization in background thread with optional intelligent batch processing."""
+        try:
+            original_provider = self.config.ai.summary_provider
+            try:
+                self.config.ai.summary_provider = provider
+                if model:
+                    if provider == "lmstudio":
+                        self.config.ai.summary_model_lmstudio = model
+                    elif provider == "openai":
+                        self.config.ai.summary_model_openai = model
+                    elif provider == "anthropic":
+                        self.config.ai.summary_model_anthropic = model
+                    elif provider == "local":
+                        self.config.ai.summary_model_local = model
+
+                if batch_mode:
+                    self._run_batch_summarization(folder_path, provider, file_types, limit)
+                else:
+                    self._run_sequential_summarization(folder_path, file_types, limit)
+
+
+            finally:
+                self.config.ai.summary_provider = original_provider
+                dpg.configure_item(self.TAG_BTN_SUMMARIZE, enabled=True)
+
+        except Exception as exc:
+            logger.error(f"Summarization failed: {exc}")
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value=f"Error: {exc}"
+            )
+            dpg.configure_item(self.TAG_BTN_SUMMARIZE, enabled=True)
+            if self.on_status_update:
+                self.on_status_update(f"Summarization failed: {exc}", level="error")
+
+    def _run_batch_summarization(
+        self,
+        folder_path: str,
+        provider: str,
+        file_types: list[str] | None,
+        limit: int
+    ) -> None:
+        """Run intelligent batch summarization with model detection."""
+        from duplicleaner.ai.content_summarizer import ContentSummarizer
+
+        summarizer = ContentSummarizer(self.drive_manager.db)
+
+        # Check if LMStudio Monitor Service is available
+        if provider == "lmstudio" and summarizer.lmstudio_manager:
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value="LMStudio Monitor detected - automatic model management enabled"
+            )
+            time.sleep(1)
+
+        # Convert file_types list to set for ContentSummarizer
+        file_types_set = set(file_types) if file_types else None
+
+        dpg.configure_item(
+            self.TAG_SUMMARIZE_PROGRESS_TEXT,
+            default_value="Analyzing files and grouping by type..."
+        )
+
+        # Run batch summarization
+        progress = summarizer.summarize_directory_batch(
+            directory=folder_path,
+            file_types=file_types_set,
+            limit=limit,
+        )
+
+        # Update UI with file type breakdown
+        breakdown_text = (
+            f"File breakdown: "
+            f"text={progress.text_files}, "
+            f"images={progress.image_files}, "
+            f"docs={progress.visual_doc_files}, "
+            f"skipped={progress.skipped_files}"
+        )
+        dpg.configure_item(
+            self.TAG_SUMMARIZE_PROGRESS_TEXT,
+            default_value=breakdown_text
+        )
+        time.sleep(2)
+
+        # Monitor progress
+        last_processed = 0
+        while progress.current_phase != "complete":
+            current_processed = progress.processed_files
+            if current_processed != last_processed:
+                pct = progress.percent_complete
+                dpg.set_value(self.TAG_SUMMARIZE_PROGRESS_BAR, pct / 100.0)
+
+                phase_name = progress.current_phase.replace("_", " ").title()
+                dpg.configure_item(
+                    self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                    default_value=f"{phase_name}: {current_processed}/{progress.total_files} - {os.path.basename(progress.current_file)}"
+                )
+                last_processed = current_processed
+
+            time.sleep(0.5)
+
+        # Final results
+        dpg.set_value(self.TAG_SUMMARIZE_PROGRESS_BAR, 1.0)
+        dpg.configure_item(
+            self.TAG_SUMMARIZE_PROGRESS_TEXT,
+            default_value=f"Complete: {progress.successful} successful, {progress.failed} failed, {progress.skipped_files} skipped"
+        )
+
+        if self.on_status_update:
+            self.on_status_update(
+                f"Summarization complete: {progress.successful} generated, {progress.failed} failed"
+            )
+
+    def _run_sequential_summarization(
+        self,
+        folder_path: str,
+        file_types: list[str] | None,
+        limit: int
+    ) -> None:
+        """Run sequential file-by-file summarization (original behavior)."""
+        from duplicleaner.ai.summaries import SummaryEngine
+
+        files = self.drive_manager.db.get_files_needing_summary_in_directory(
+            folder_path,
+            limit=limit,
+            file_types=file_types
+        )
+
+        if not files:
+            dpg.configure_item(self.TAG_SUMMARIZE_PROGRESS_TEXT, default_value="No files found that need summaries")
+            if self.on_status_update:
+                self.on_status_update("No files found that need summaries", level="warning")
+            return
+
+        dpg.configure_item(
+            self.TAG_SUMMARIZE_PROGRESS_TEXT,
+            default_value=f"Found {len(files)} files to summarize"
+        )
+
+        engine = SummaryEngine(self.drive_manager.db)
+        if not engine.is_available():
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value="Provider not available"
+            )
+            if self.on_status_update:
+                self.on_status_update(
+                    "Provider not available. Check LMStudio/Ollama is running or API keys are set.",
+                    level="error"
+                )
+            return
+
+        generated = 0
+        failed = 0
+        for i, file_record in enumerate(files, 1):
+            progress = i / len(files)
+            dpg.set_value(self.TAG_SUMMARIZE_PROGRESS_BAR, progress)
+            dpg.configure_item(
+                self.TAG_SUMMARIZE_PROGRESS_TEXT,
+                default_value=f"Processing {i}/{len(files)}: {os.path.basename(file_record.path)}"
+            )
+
+            try:
+                summary = engine.analyze_file(file_record)
+                if summary:
+                    generated += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                logger.warning(f"Failed to summarize {file_record.path}: {exc}")
+                failed += 1
+
+        dpg.configure_item(
+            self.TAG_SUMMARIZE_PROGRESS_TEXT,
+            default_value=f"Complete: {generated} generated, {failed} failed"
+        )
+        if self.on_status_update:
+            self.on_status_update(
+                f"Summarization complete: {generated} generated, {failed} failed"
+            )
+
+    # ─── Corrupt Files & Recovery ─────────────────────────────────────
+
+    def _on_check_corruption_click(self) -> None:
+        """Start a corruption scan on the selected drive."""
+        if self._corrupt_scan_thread and self._corrupt_scan_thread.is_alive():
+            self._show_error_dialog("Corruption Scan", "A corruption scan is already running.")
+            return
+
+        drive_id = self._selected_drive_id
+        if not drive_id:
+            self._show_error_dialog("Corruption Scan", "Select a drive first.")
+            return
+
+        dpg.configure_item(self.TAG_BTN_CHECK_CORRUPT, enabled=False)
+        dpg.configure_item(self.TAG_CORRUPT_PROGRESS, show=True)
+        dpg.set_value(self.TAG_CORRUPT_PROGRESS_TEXT, "Starting corruption scan...")
+        dpg.set_value(self.TAG_CORRUPT_PROGRESS_BAR, 0.0)
+        dpg.set_value(self.TAG_CORRUPT_COUNT, "Scanning...")
+
+        self._corrupt_scan_thread = threading.Thread(
+            target=self._run_corruption_scan,
+            args=(drive_id,),
+            daemon=True,
+        )
+        self._corrupt_scan_thread.start()
+
+    def _run_corruption_scan(self, drive_id: str) -> None:
+        """Run corruption scan in background thread."""
+        try:
+            scanner = Scanner()
+
+            def progress(processed: int, total: int, path: str) -> None:
+                if total > 0:
+                    pct = processed / total
+                    dpg.set_value(self.TAG_CORRUPT_PROGRESS_BAR, pct)
+                filename = os.path.basename(path)
+                dpg.set_value(
+                    self.TAG_CORRUPT_PROGRESS_TEXT,
+                    f"Checking {processed:,}/{total:,}: {filename}",
+                )
+
+            corrupt_count = scanner.detect_corrupt_images(
+                drive_id=drive_id,
+                progress_callback=progress,
+            )
+
+            dpg.set_value(self.TAG_CORRUPT_PROGRESS_TEXT, f"Done: {corrupt_count} corrupt files found")
+            dpg.set_value(self.TAG_CORRUPT_PROGRESS_BAR, 1.0)
+
+            self._refresh_corrupt_table(drive_id)
+
+            if self.on_status_update:
+                self.on_status_update(f"Corruption scan complete: {corrupt_count} corrupt files found")
+
+        except Exception as e:
+            logger.error(f"Corruption scan error: {e}")
+            dpg.set_value(self.TAG_CORRUPT_PROGRESS_TEXT, f"Error: {e}")
+        finally:
+            dpg.configure_item(self.TAG_BTN_CHECK_CORRUPT, enabled=True)
+            self._corrupt_scan_thread = None
+
+    def _refresh_corrupt_table(self, drive_id: str | None = None) -> None:
+        """Refresh the corrupt files table from the database."""
+        db = self.drive_manager.db
+        corrupt_files = db.get_corrupt_files(drive_id=drive_id)
+        self._corrupt_files_cache = corrupt_files
+
+        count = len(corrupt_files)
+        if count == 0:
+            dpg.set_value(self.TAG_CORRUPT_COUNT, "No corrupt files found.")
+            dpg.configure_item(self.TAG_BTN_RECOVER_ALL, enabled=False)
+        else:
+            total_size = sum(cf.get("size", 0) for cf in corrupt_files)
+            dpg.set_value(
+                self.TAG_CORRUPT_COUNT,
+                f"{count} corrupt file{'s' if count != 1 else ''} ({self._fmt_size(total_size)})",
+            )
+            dpg.configure_item(self.TAG_BTN_RECOVER_ALL, enabled=True)
+
+        # Clear table
+        children = dpg.get_item_children(self.TAG_CORRUPT_TABLE, slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+        severity_colors = {
+            "high": (255, 80, 80),
+            "medium": (255, 180, 60),
+            "low": (180, 220, 100),
+        }
+
+        for cf in corrupt_files:
+            with dpg.table_row(parent=self.TAG_CORRUPT_TABLE):
+                # Filename
+                filename = cf.get("filename", os.path.basename(cf.get("path", "")))
+                dpg.add_text(filename)
+                add_tooltip(dpg.last_item(), cf.get("path", ""))
+
+                # Corruption type
+                ctype = cf.get("corruption_type", "unknown")
+                dpg.add_text(ctype.replace("_", " ").title())
+
+                # Severity
+                sev = cf.get("severity", "medium")
+                dpg.add_text(sev.upper(), color=severity_colors.get(sev, (200, 200, 200)))
+
+                # Size
+                dpg.add_text(self._fmt_size(cf.get("size", 0)))
+
+                # Action buttons
+                file_id = cf["file_id"]
+                path = cf["path"]
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="Recover",
+                        callback=lambda s, a, u: self._on_recover_file_click(u[0], u[1]),
+                        user_data=(file_id, path),
+                    )
+                    dpg.add_button(
+                        label="Preview",
+                        callback=lambda s, a, u: self._on_preview_corrupt_click(u[0], u[1]),
+                        user_data=(file_id, path),
+                    )
+
+    @staticmethod
+    def _fmt_size(size_bytes: int) -> str:
+        """Format bytes as human readable size."""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+    def _on_recover_file_click(self, file_id: int, file_path: str) -> None:
+        """Attempt recovery on a single corrupt file."""
+        if self._recovery_thread and self._recovery_thread.is_alive():
+            self._show_error_dialog("Recovery", "A recovery operation is already running.")
+            return
+
+        self._recovery_thread = threading.Thread(
+            target=self._run_single_recovery,
+            args=(file_id, file_path),
+            daemon=True,
+        )
+        self._recovery_thread.start()
+
+    def _run_single_recovery(self, file_id: int, file_path: str) -> None:
+        """Run single file recovery in background."""
+        try:
+            dpg.configure_item(self.TAG_RECOVERY_PROGRESS, show=True)
+            dpg.set_value(
+                self.TAG_RECOVERY_PROGRESS_TEXT,
+                f"Recovering: {os.path.basename(file_path)}...",
+            )
+            dpg.set_value(self.TAG_RECOVERY_PROGRESS_BAR, 0.5)
+
+            if not self._recovery_manager:
+                self._recovery_manager = RecoveryManager(db=self.drive_manager.db)
+
+            result = self._recovery_manager.recover_file(file_id, file_path)
+
+            if result.success:
+                msg = f"Recovered using {result.strategy_used}: {os.path.basename(result.recovered_path or '')}"
+                dpg.set_value(self.TAG_RECOVERY_PROGRESS_TEXT, msg)
+                if self.on_status_update:
+                    self.on_status_update(msg)
+                # Show before/after preview
+                self._show_recovery_preview(file_path, result.recovered_path)
+            else:
+                msg = f"Recovery failed: {result.error or 'All strategies exhausted'}"
+                dpg.set_value(self.TAG_RECOVERY_PROGRESS_TEXT, msg)
+                if self.on_status_update:
+                    self.on_status_update(msg)
+
+            dpg.set_value(self.TAG_RECOVERY_PROGRESS_BAR, 1.0)
+
+            # Refresh table
+            self._refresh_corrupt_table(self._selected_drive_id)
+
+        except Exception as e:
+            logger.error(f"Recovery error: {e}")
+            dpg.set_value(self.TAG_RECOVERY_PROGRESS_TEXT, f"Error: {e}")
+        finally:
+            self._recovery_thread = None
+
+    def _on_recover_all_click(self) -> None:
+        """Start batch recovery on all corrupt files."""
+        if self._recovery_thread and self._recovery_thread.is_alive():
+            self._show_error_dialog("Recovery", "A recovery operation is already running.")
+            return
+
+        if not self._corrupt_files_cache:
+            self._show_error_dialog("Recovery", "No corrupt files to recover.")
+            return
+
+        dpg.configure_item(self.TAG_BTN_RECOVER_ALL, enabled=False)
+        dpg.configure_item(self.TAG_RECOVERY_PROGRESS, show=True)
+        dpg.set_value(self.TAG_RECOVERY_PROGRESS_TEXT, "Starting batch recovery...")
+        dpg.set_value(self.TAG_RECOVERY_PROGRESS_BAR, 0.0)
+
+        self._recovery_thread = threading.Thread(
+            target=self._run_batch_recovery,
+            daemon=True,
+        )
+        self._recovery_thread.start()
+
+    def _run_batch_recovery(self) -> None:
+        """Run batch recovery in background thread."""
+        try:
+            if not self._recovery_manager:
+                self._recovery_manager = RecoveryManager(db=self.drive_manager.db)
+
+            corrupt_files = list(self._corrupt_files_cache)
+
+            def progress(processed: int, total: int, filename: str, success: bool) -> None:
+                pct = processed / total if total > 0 else 0
+                dpg.set_value(self.TAG_RECOVERY_PROGRESS_BAR, pct)
+                status = "OK" if success else "FAILED"
+                dpg.set_value(
+                    self.TAG_RECOVERY_PROGRESS_TEXT,
+                    f"[{processed}/{total}] {filename}: {status}",
+                )
+
+            success_count, fail_count = self._recovery_manager.recover_batch(
+                corrupt_files, progress_callback=progress,
+            )
+
+            dpg.set_value(
+                self.TAG_RECOVERY_PROGRESS_TEXT,
+                f"Batch complete: {success_count} recovered, {fail_count} failed",
+            )
+            dpg.set_value(self.TAG_RECOVERY_PROGRESS_BAR, 1.0)
+
+            if self.on_status_update:
+                self.on_status_update(
+                    f"Batch recovery: {success_count} recovered, {fail_count} failed"
+                )
+
+            # Refresh table
+            self._refresh_corrupt_table(self._selected_drive_id)
+
+        except Exception as e:
+            logger.error(f"Batch recovery error: {e}")
+            dpg.set_value(self.TAG_RECOVERY_PROGRESS_TEXT, f"Error: {e}")
+        finally:
+            dpg.configure_item(self.TAG_BTN_RECOVER_ALL, enabled=True)
+            self._recovery_thread = None
+
+    def _on_preview_corrupt_click(self, file_id: int, file_path: str) -> None:
+        """Show a preview of the corrupt file."""
+        if not os.path.exists(file_path):
+            self._show_error_dialog("Preview", f"File not found:\n{file_path}")
+            return
+
+        # Check if there's already a successful recovery
+        attempts = self.drive_manager.db.get_recovery_attempts(file_id)
+        recovered_path = None
+        for attempt in attempts:
+            if attempt.get("success") and attempt.get("recovered_path"):
+                rp = attempt["recovered_path"]
+                if os.path.exists(rp):
+                    recovered_path = rp
+                    break
+
+        if recovered_path:
+            self._show_recovery_preview(file_path, recovered_path)
+        else:
+            self._show_corrupt_preview(file_path)
+
+    def _show_corrupt_preview(self, file_path: str) -> None:
+        """Show a preview dialog for a corrupt file."""
+        tag = "corrupt_preview_dialog"
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+
+        # Try to load image (even partially)
+        texture_tag = "corrupt_preview_tex"
+        tex_loaded = False
+        try:
+            from PIL import Image, ImageOps
+            import numpy as np
+
+            with Image.open(file_path) as img:
+                img.load()
+                img = ImageOps.exif_transpose(img)
+                img = img.convert("RGBA")
+                # Scale to fit preview
+                max_dim = 400
+                w, h = img.size
+                if w > max_dim or h > max_dim:
+                    ratio = min(max_dim / w, max_dim / h)
+                    img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+                w, h = img.size
+                data = np.array(img).flatten().astype(np.float32) / 255.0
+
+                if dpg.does_item_exist(texture_tag):
+                    dpg.delete_item(texture_tag)
+                with dpg.texture_registry():
+                    dpg.add_static_texture(w, h, data.tolist(), tag=texture_tag)
+                tex_loaded = True
+        except Exception:
+            tex_loaded = False
+
+        with dpg.window(
+            label="Corrupt File Preview",
+            tag=tag,
+            modal=True,
+            show=True,
+            width=480,
+            height=550 if tex_loaded else 180,
+            no_resize=True,
+            pos=[200, 100],
+        ):
+            dpg.add_text(f"File: {os.path.basename(file_path)}")
+            dpg.add_text(f"Path: {file_path}", wrap=450, color=(180, 180, 180))
+            dpg.add_spacer(height=5)
+
+            if tex_loaded:
+                dpg.add_text("Preview (may show partial/corrupted image):")
+                dpg.add_image(texture_tag)
+            else:
+                dpg.add_text("Cannot load preview - file is too corrupted.", color=(255, 80, 80))
+
+            dpg.add_spacer(height=10)
+            dpg.add_button(label="Close", callback=lambda: dpg.configure_item(tag, show=False))
+
+    def _show_recovery_preview(self, original_path: str, recovered_path: str | None) -> None:
+        """Show before/after recovery preview dialog."""
+        if not recovered_path or not os.path.exists(recovered_path):
+            return
+
+        tag = "recovery_preview_dialog"
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+
+        orig_tex_tag = "recovery_orig_tex"
+        recv_tex_tag = "recovery_recv_tex"
+        orig_loaded = False
+        recv_loaded = False
+
+        # Helper to load image texture
+        def load_tex(path: str, tex_tag: str) -> bool:
+            try:
+                from PIL import Image, ImageOps
+                import numpy as np
+
+                with Image.open(path) as img:
+                    img.load()
+                    img = ImageOps.exif_transpose(img)
+                    img = img.convert("RGBA")
+                    max_dim = 350
+                    w, h = img.size
+                    if w > max_dim or h > max_dim:
+                        ratio = min(max_dim / w, max_dim / h)
+                        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+                    w, h = img.size
+                    data = np.array(img).flatten().astype(np.float32) / 255.0
+
+                    if dpg.does_item_exist(tex_tag):
+                        dpg.delete_item(tex_tag)
+                    with dpg.texture_registry():
+                        dpg.add_static_texture(w, h, data.tolist(), tag=tex_tag)
+                    return True
+            except Exception:
+                return False
+
+        orig_loaded = load_tex(original_path, orig_tex_tag)
+        recv_loaded = load_tex(recovered_path, recv_tex_tag)
+
+        dialog_width = 760 if (orig_loaded and recv_loaded) else 440
+        dialog_height = 520
+
+        with dpg.window(
+            label="Recovery Preview - Before / After",
+            tag=tag,
+            modal=True,
+            show=True,
+            width=dialog_width,
+            height=dialog_height,
+            no_resize=True,
+            pos=[120, 80],
+        ):
+            dpg.add_text(f"Original: {os.path.basename(original_path)}")
+            dpg.add_text(f"Recovered: {os.path.basename(recovered_path)}", color=(100, 255, 100))
+            dpg.add_spacer(height=5)
+
+            with dpg.group(horizontal=True):
+                # Original
+                with dpg.child_window(width=360, height=400, border=True):
+                    dpg.add_text("ORIGINAL (corrupt)", color=(255, 120, 80))
+                    if orig_loaded:
+                        dpg.add_image(orig_tex_tag)
+                    else:
+                        dpg.add_text("Cannot load", color=(255, 80, 80))
+
+                dpg.add_spacer(width=10)
+
+                # Recovered
+                with dpg.child_window(width=360, height=400, border=True):
+                    dpg.add_text("RECOVERED", color=(100, 255, 100))
+                    if recv_loaded:
+                        dpg.add_image(recv_tex_tag)
+                    else:
+                        dpg.add_text("Cannot load", color=(255, 80, 80))
+
+            dpg.add_spacer(height=10)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Close", callback=lambda: dpg.configure_item(tag, show=False))
+                if os.path.exists(recovered_path):
+                    dpg.add_button(
+                        label="Open Recovered File",
+                        callback=lambda: os.startfile(recovered_path),
+                    )
+
+    # --- Watch Folders ---------------------------------------------------
+
+    def _create_watch_add_dialog(self) -> None:
+        """Create the add watch folder dialog."""
+        tag = self.TAG_WATCH_ADD_DIALOG
+        with dpg.window(
+            tag=tag,
+            label="Add Watch Folder",
+            modal=True,
+            show=False,
+            width=520,
+            height=320,
+            no_resize=True,
+            pos=[140, 120],
+        ):
+            dpg.add_text("Configure a folder to monitor for new files.")
+            dpg.add_spacer(height=10)
+
+            with dpg.group(horizontal=True):
+                dpg.add_text("Path:")
+                dpg.add_input_text(
+                    tag=self.TAG_WATCH_PATH_INPUT,
+                    width=350,
+                    hint="C:\\Photos\\Inbox or \\\\NAS\\incoming",
+                )
+                dpg.add_button(
+                    label="Browse...",
+                    callback=lambda: dpg.show_item(self.TAG_WATCH_FOLDER_DIALOG),
+                )
+
+            dpg.add_spacer(height=5)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Poll interval (seconds):")
+                dpg.add_input_int(
+                    tag=self.TAG_WATCH_POLL_INTERVAL,
+                    default_value=self.config.watch.default_poll_interval,
+                    min_value=5,
+                    max_value=3600,
+                    width=100,
+                )
+                dpg.add_text("  Debounce (seconds):")
+                dpg.add_input_int(
+                    tag=self.TAG_WATCH_DEBOUNCE,
+                    default_value=self.config.watch.default_debounce,
+                    min_value=5,
+                    max_value=600,
+                    width=100,
+                )
+
+            dpg.add_spacer(height=5)
+            with dpg.group(horizontal=True):
+                dpg.add_checkbox(
+                    label="Auto-scan new files",
+                    tag=self.TAG_WATCH_AUTO_SCAN,
+                    default_value=True,
+                )
+                dpg.add_checkbox(
+                    label="Auto-organize",
+                    tag=self.TAG_WATCH_AUTO_ORGANIZE,
+                    default_value=False,
+                )
+                dpg.add_checkbox(
+                    label="Auto-AI analysis",
+                    tag=self.TAG_WATCH_AUTO_AI,
+                    default_value=False,
+                )
+
+            dpg.add_spacer(height=5)
+            with dpg.group(horizontal=True):
+                dpg.add_text("Organize format:")
+                dpg.add_combo(
+                    tag=self.TAG_WATCH_ORG_FORMAT,
+                    items=["YYYY/MM", "YYYY/MM/DD", "YYYY-MM", "YYYY"],
+                    default_value="YYYY/MM",
+                    width=150,
+                )
+
+            dpg.add_spacer(height=20)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Add", callback=self._on_watch_add_confirm, width=100)
+                dpg.add_button(
+                    label="Cancel",
+                    callback=lambda: dpg.configure_item(tag, show=False),
+                    width=100,
+                )
+
+    def _create_watch_folder_browse_dialog(self) -> None:
+        """Create the folder browse dialog for watch folder path."""
+        with dpg.file_dialog(
+            tag=self.TAG_WATCH_FOLDER_DIALOG,
+            directory_selector=True,
+            show=False,
+            callback=self._on_watch_folder_selected,
+            width=700,
+            height=400,
+        ):
+            dpg.add_file_extension(".*", color=(255, 255, 255, 255))
+
+    def _on_watch_folder_selected(self, sender, app_data) -> None:
+        """Handle folder selection from browse dialog."""
+        selections = app_data.get("selections", {})
+        if selections:
+            path = list(selections.values())[0]
+        else:
+            path = app_data.get("file_path_name", "")
+        if path:
+            dpg.set_value(self.TAG_WATCH_PATH_INPUT, path)
+
+    def _on_watch_add_click(self) -> None:
+        """Show the add watch folder dialog."""
+        dpg.set_value(self.TAG_WATCH_PATH_INPUT, "")
+        dpg.set_value(self.TAG_WATCH_POLL_INTERVAL, self.config.watch.default_poll_interval)
+        dpg.set_value(self.TAG_WATCH_DEBOUNCE, self.config.watch.default_debounce)
+        dpg.set_value(self.TAG_WATCH_AUTO_SCAN, True)
+        dpg.set_value(self.TAG_WATCH_AUTO_ORGANIZE, False)
+        dpg.set_value(self.TAG_WATCH_AUTO_AI, False)
+        dpg.set_value(self.TAG_WATCH_ORG_FORMAT, "YYYY/MM")
+        dpg.show_item(self.TAG_WATCH_ADD_DIALOG)
+
+    def _on_watch_add_confirm(self) -> None:
+        """Add a new watch folder from dialog values."""
+        from duplicleaner.utils.config import WatchFolderEntry, save_config
+
+        path = dpg.get_value(self.TAG_WATCH_PATH_INPUT).strip()
+        if not path:
+            self._show_error_dialog("Add Watch Folder", "No path provided.")
+            return
+
+        if not os.path.isdir(path):
+            self._show_error_dialog("Add Watch Folder", f"Path not found:\n{path}")
+            return
+
+        entry = WatchFolderEntry(
+            path=path,
+            enabled=True,
+            poll_interval_seconds=dpg.get_value(self.TAG_WATCH_POLL_INTERVAL),
+            debounce_seconds=dpg.get_value(self.TAG_WATCH_DEBOUNCE),
+            auto_scan=dpg.get_value(self.TAG_WATCH_AUTO_SCAN),
+            auto_organize=dpg.get_value(self.TAG_WATCH_AUTO_ORGANIZE),
+            auto_ai_analysis=dpg.get_value(self.TAG_WATCH_AUTO_AI),
+            organize_format=dpg.get_value(self.TAG_WATCH_ORG_FORMAT),
+        )
+
+        try:
+            if self._folder_watcher:
+                self._folder_watcher.add_watch_folder(entry)
+            else:
+                # No watcher instance, just save to config
+                self.config.watch.watch_folders.append(entry)
+                save_config()
+            dpg.configure_item(self.TAG_WATCH_ADD_DIALOG, show=False)
+            self._refresh_watch_table()
+            if self.on_status_update:
+                self.on_status_update(f"Added watch folder: {path}")
+        except ValueError as e:
+            self._show_error_dialog("Add Watch Folder", str(e))
+
+    def _on_watch_enabled_toggle(self, sender, app_data) -> None:
+        """Toggle global watch folder enabled state."""
+        from duplicleaner.utils.config import save_config
+
+        self.config.watch.global_enabled = bool(app_data)
+        save_config()
+        self._update_watch_status()
+
+    def _on_watch_start_stop_click(self) -> None:
+        """Start or stop the folder watcher."""
+        if not self._folder_watcher:
+            self._show_error_dialog("Watch Folders", "No folder watcher available.")
+            return
+
+        if self._folder_watcher.is_running:
+            self._folder_watcher.stop()
+            dpg.configure_item(self.TAG_BTN_WATCH_START, label="Start Watcher")
+        else:
+            if not self.config.watch.global_enabled:
+                self.config.watch.global_enabled = True
+                dpg.set_value(self.TAG_WATCH_ENABLED, True)
+                from duplicleaner.utils.config import save_config
+                save_config()
+            self._folder_watcher.start()
+            dpg.configure_item(self.TAG_BTN_WATCH_START, label="Stop Watcher")
+
+        self._update_watch_status()
+
+    def _on_watch_remove_click(self, path: str) -> None:
+        """Remove a watch folder."""
+        if self._folder_watcher:
+            self._folder_watcher.remove_watch_folder(path)
+        else:
+            from duplicleaner.utils.config import save_config
+            normalized = os.path.normpath(path)
+            self.config.watch.watch_folders = [
+                wf for wf in self.config.watch.watch_folders
+                if os.path.normpath(wf.path) != normalized
+            ]
+            save_config()
+        self._refresh_watch_table()
+
+    def _on_watch_toggle_click(self, path: str, enabled: bool) -> None:
+        """Toggle a watch folder enabled/disabled."""
+        if self._folder_watcher:
+            self._folder_watcher.toggle_folder(path, enabled)
+        else:
+            from duplicleaner.utils.config import save_config
+            normalized = os.path.normpath(path)
+            for wf in self.config.watch.watch_folders:
+                if os.path.normpath(wf.path) == normalized:
+                    wf.enabled = enabled
+                    break
+            save_config()
+        self._refresh_watch_table()
+
+    def _refresh_watch_table(self) -> None:
+        """Refresh the watch folders table."""
+        if not dpg.does_item_exist(self.TAG_WATCH_TABLE):
+            return
+
+        # Clear table rows
+        children = dpg.get_item_children(self.TAG_WATCH_TABLE, slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+        folders = self.config.watch.watch_folders
+        for wf in folders:
+            with dpg.table_row(parent=self.TAG_WATCH_TABLE):
+                # Path
+                display_path = wf.path
+                if len(display_path) > 40:
+                    display_path = "..." + display_path[-37:]
+                dpg.add_text(display_path)
+                add_tooltip(dpg.last_item(), wf.path)
+
+                # Poll interval
+                dpg.add_text(str(wf.poll_interval_seconds))
+
+                # Auto-scan
+                dpg.add_text("Yes" if wf.auto_scan else "No")
+
+                # Auto-organize
+                dpg.add_text("Yes" if wf.auto_organize else "No")
+
+                # Enabled
+                enabled_color = (100, 255, 100) if wf.enabled else (180, 180, 180)
+                dpg.add_text("ON" if wf.enabled else "OFF", color=enabled_color)
+
+                # Actions
+                path = wf.path
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="X",
+                        callback=lambda s, a, u: self._on_watch_remove_click(u),
+                        user_data=path,
+                        width=25,
+                    )
+                    is_on = wf.enabled
+                    dpg.add_button(
+                        label="Off" if is_on else "On",
+                        callback=lambda s, a, u: self._on_watch_toggle_click(u[0], u[1]),
+                        user_data=(path, not is_on),
+                        width=35,
+                    )
+
+        self._update_watch_status()
+
+    def _update_watch_status(self) -> None:
+        """Update watch status text."""
+        if not dpg.does_item_exist(self.TAG_WATCH_STATUS):
+            return
+
+        if self._folder_watcher and self._folder_watcher.is_running:
+            count = self._folder_watcher.get_watched_folder_count()
+            dpg.set_value(
+                self.TAG_WATCH_STATUS,
+                f"Running: monitoring {count} folder{'s' if count != 1 else ''}",
+            )
+            dpg.configure_item(self.TAG_WATCH_STATUS, color=(100, 255, 100))
+            dpg.configure_item(self.TAG_BTN_WATCH_START, label="Stop Watcher")
+        else:
+            enabled_count = sum(1 for wf in self.config.watch.watch_folders if wf.enabled)
+            if enabled_count > 0 and self.config.watch.global_enabled:
+                dpg.set_value(
+                    self.TAG_WATCH_STATUS,
+                    f"Stopped ({enabled_count} folder{'s' if enabled_count != 1 else ''} configured)",
+                )
+                dpg.configure_item(self.TAG_WATCH_STATUS, color=(255, 180, 60))
+            else:
+                dpg.set_value(self.TAG_WATCH_STATUS, "Not running")
+                dpg.configure_item(self.TAG_WATCH_STATUS, color=(180, 180, 180))
+            dpg.configure_item(self.TAG_BTN_WATCH_START, label="Start Watcher")
+
+    # --- Export ---
+
+    def _on_export_redundancy(self) -> None:
+        """Export redundancy report to CSV."""
+        from duplicleaner.utils.export_manager import (
+            export_csv,
+            format_size,
+            get_default_export_dir,
+            get_timestamped_filename,
+        )
+
+        if not self._redundancy_report:
+            if self.on_status_update:
+                self.on_status_update("No redundancy report to export. Generate one first.")
+            return
+
+        report = self._redundancy_report
+        export_dir = get_default_export_dir()
+        filepath = export_dir / get_timestamped_filename("redundancy_report", "csv")
+
+        rows = []
+        for group in report.at_risk_groups:
+            for file in group.files:
+                drive = self.drive_manager.get_drive(file.drive_id)
+                rows.append({
+                    "status": "AT_RISK",
+                    "content_hash": group.content_hash,
+                    "drive_id": file.drive_id,
+                    "drive_label": drive.label if drive else file.drive_id,
+                    "filename": file.filename,
+                    "path": file.path,
+                    "size": file.size,
+                    "size_human": format_size(file.size),
+                })
+
+        for group in report.redundant_groups:
+            rows.append({
+                "status": "REDUNDANT",
+                "content_hash": group.content_hash,
+                "drive_id": "",
+                "drive_label": f"{group.drive_count} drives",
+                "filename": f"{group.file_count} copies",
+                "path": "",
+                "size": group.size,
+                "size_human": format_size(group.size),
+            })
+
+        count = export_csv(rows, filepath)
+        msg = (
+            f"Exported redundancy report ({report.at_risk_files} at-risk files, "
+            f"{len(report.redundant_groups)} redundant groups) to {filepath}"
+        )
+        logger.info(msg)
+        if self.on_status_update:
+            self.on_status_update(msg)
+
+    # --- Storage Analytics ---
+
+    def _on_compute_analytics(self) -> None:
+        """Compute and display storage analytics."""
+        from duplicleaner.core.storage_analytics import compute_storage_report
+        from duplicleaner.utils.export_manager import format_size
+
+        if self.on_status_update:
+            self.on_status_update("Computing storage analytics...")
+
+        try:
+            report = compute_storage_report(self.db)
+            self._analytics_report = report
+
+            # Update summary cards
+            dpg.set_value("analytics_total_files", f"{report.total_files:,}")
+            dpg.set_value("analytics_total_size", format_size(report.total_size))
+            dpg.set_value("analytics_dup_waste", format_size(report.duplicate_waste))
+            dpg.set_value("analytics_at_risk", format_size(report.at_risk_size))
+
+            # Update type breakdown chart
+            if report.type_breakdown:
+                # Clear existing series
+                for child in dpg.get_item_children("analytics_type_y", slot=1) or []:
+                    dpg.delete_item(child)
+
+                top_types = report.type_breakdown[:15]
+                labels = [t.extension for t in top_types]
+                sizes_gb = [t.total_size / (1024**3) for t in top_types]
+                x_vals = list(range(len(labels)))
+
+                dpg.add_bar_series(
+                    x_vals, sizes_gb,
+                    parent="analytics_type_y",
+                    label="Size (GB)",
+                )
+                dpg.set_axis_limits("analytics_type_x", -0.5, len(labels) - 0.5)
+                dpg.set_axis_ticks("analytics_type_x", tuple(zip(labels, x_vals)))
+
+            # Update year breakdown chart
+            if report.year_breakdown:
+                for child in dpg.get_item_children("analytics_year_y", slot=1) or []:
+                    dpg.delete_item(child)
+
+                # Sort by year ascending for chart
+                years_sorted = sorted(report.year_breakdown, key=lambda y: y.year)
+                years = [float(y.year) for y in years_sorted]
+                sizes_gb = [y.total_size / (1024**3) for y in years_sorted]
+
+                dpg.add_bar_series(
+                    years, sizes_gb,
+                    parent="analytics_year_y",
+                    label="Size (GB)",
+                )
+                if years:
+                    dpg.set_axis_limits("analytics_year_x", min(years) - 0.5, max(years) + 0.5)
+
+            # Update quick wins table
+            children = dpg.get_item_children("analytics_quickwins_table", slot=1)
+            if children:
+                for child in children:
+                    dpg.delete_item(child)
+
+            if report.quick_wins:
+                for qw in report.quick_wins:
+                    with dpg.table_row(parent="analytics_quickwins_table"):
+                        dpg.add_text(qw.category)
+                        dpg.add_text(qw.description)
+                        dpg.add_text(f"{qw.file_count:,}")
+                        dpg.add_text(format_size(qw.recoverable_bytes))
+            else:
+                with dpg.table_row(parent="analytics_quickwins_table"):
+                    dpg.add_text("No quick wins identified.")
+                    dpg.add_text("")
+                    dpg.add_text("")
+                    dpg.add_text("")
+
+            if self.on_status_update:
+                self.on_status_update(
+                    f"Analytics computed: {report.total_files:,} files, "
+                    f"{format_size(report.total_size)}"
+                )
+
+        except Exception as exc:
+            logger.error("Failed to compute analytics: %s", exc)
+            if self.on_status_update:
+                self.on_status_update(f"Analytics failed: {exc}")
+
+    def _on_export_analytics(self) -> None:
+        """Export analytics report to HTML."""
+        from duplicleaner.utils.export_manager import (
+            export_html,
+            format_size,
+            get_default_export_dir,
+            get_timestamped_filename,
+        )
+
+        report = getattr(self, "_analytics_report", None)
+        if not report:
+            if self.on_status_update:
+                self.on_status_update("No analytics to export. Compute analytics first.")
+            return
+
+        export_dir = get_default_export_dir()
+        filepath = export_dir / get_timestamped_filename("analytics", "html")
+
+        summary_stats = {
+            "Total Files": f"{report.total_files:,}",
+            "Total Size": format_size(report.total_size),
+            "Duplicate Waste": format_size(report.duplicate_waste),
+            "At-Risk Data": format_size(report.at_risk_size),
+        }
+
+        sections = []
+
+        # Type breakdown
+        if report.type_breakdown:
+            type_rows = [{
+                "Extension": t.extension,
+                "Count": f"{t.count:,}",
+                "Size": format_size(t.total_size),
+                "Percentage": f"{t.percentage:.1f}%",
+            } for t in report.type_breakdown[:30]]
+            sections.append({
+                "heading": "Storage by File Type",
+                "columns": ["Extension", "Count", "Size", "Percentage"],
+                "rows": type_rows,
+            })
+
+        # Year breakdown
+        if report.year_breakdown:
+            year_rows = [{
+                "Year": y.year,
+                "Files": f"{y.count:,}",
+                "Size": format_size(y.total_size),
+            } for y in sorted(report.year_breakdown, key=lambda x: x.year, reverse=True)]
+            sections.append({
+                "heading": "Storage by Year",
+                "columns": ["Year", "Files", "Size"],
+                "rows": year_rows,
+            })
+
+        # Quick wins
+        if report.quick_wins:
+            qw_rows = [{
+                "Category": qw.category,
+                "Description": qw.description,
+                "Files": f"{qw.file_count:,}",
+                "Recoverable": format_size(qw.recoverable_bytes),
+            } for qw in report.quick_wins]
+            sections.append({
+                "heading": "Quick Wins",
+                "columns": ["Category", "Description", "Files", "Recoverable"],
+                "rows": qw_rows,
+            })
+
+        export_html(
+            "DupliCleaner - Storage Analytics Report",
+            sections,
+            filepath,
+            summary_stats=summary_stats,
+        )
+
+        msg = f"Analytics exported to {filepath}"
+        logger.info(msg)
+        if self.on_status_update:
+            self.on_status_update(msg)

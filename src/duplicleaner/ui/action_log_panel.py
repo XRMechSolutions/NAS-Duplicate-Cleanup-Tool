@@ -6,21 +6,21 @@ Dear PyGui UI component for viewing action history and managing undo operations.
 import csv
 import json
 import os
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Callable, Optional
 
 import dearpygui.dearpygui as dpg
 
 from duplicleaner.core.actions import ActionEngine, ActionResult, ActionStatus
 from duplicleaner.db.database import get_database
 from duplicleaner.db.models import ActionLogEntry, ActionType
+from duplicleaner.ui.theme import get_accent_color, get_status_color, get_text_color
 from duplicleaner.utils.logging import get_logger
-from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
 
-def format_size(size_bytes: Optional[int]) -> str:
+def format_size(size_bytes: int | None) -> str:
     """Format bytes as human readable size."""
     if size_bytes is None:
         return "-"
@@ -34,7 +34,7 @@ def format_size(size_bytes: Optional[int]) -> str:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
-def format_timestamp(ts: Optional[datetime]) -> str:
+def format_timestamp(ts: datetime | None) -> str:
     """Format timestamp for display."""
     if ts is None:
         return "-"
@@ -52,6 +52,9 @@ class ActionLogPanel:
     TAG_UNDO_DIALOG = "undo_dialog"
     TAG_EXPORT_DIALOG = "export_dialog"
     TAG_EMPTY_QUARANTINE_DIALOG = "empty_quarantine_dialog"
+    TAG_CLEAR_OLD_DIALOG = "clear_old_dialog"
+    TAG_QUARANTINE_PANEL = "quarantine_panel"
+    TAG_QUARANTINE_TABLE = "quarantine_table"
 
     # Action type display names
     ACTION_LABELS = {
@@ -67,9 +70,9 @@ class ActionLogPanel:
     def __init__(
         self,
         parent: int | str,
-        action_engine: Optional[ActionEngine] = None,
-        on_undo_complete: Optional[Callable[[ActionResult], None]] = None,
-        on_status_update: Optional[Callable[[str], None]] = None,
+        action_engine: ActionEngine | None = None,
+        on_undo_complete: Callable[[ActionResult], None] | None = None,
+        on_status_update: Callable[[str], None] | None = None,
     ):
         """Initialize the action log panel.
 
@@ -93,9 +96,9 @@ class ActionLogPanel:
         self._total_count = 0
 
         # Filters
-        self._filter_type: Optional[ActionType] = None
+        self._filter_type: ActionType | None = None
         self._filter_date_range: str = "All Time"
-        self._filter_status: Optional[bool] = None  # None=all, True=undone, False=not undone
+        self._filter_status: bool | None = None  # None=all, True=undone, False=not undone
 
         # Build UI
         self._build_ui()
@@ -301,6 +304,75 @@ class ActionLogPanel:
                 dpg.add_button(label="Empty Quarantine", callback=self._confirm_empty_quarantine)
                 dpg.add_button(label="Cancel", callback=lambda: dpg.configure_item(self.TAG_EMPTY_QUARANTINE_DIALOG, show=False))
 
+        # Clear old entries dialog
+        with dpg.window(
+            label="Clear Old Entries",
+            tag=self.TAG_CLEAR_OLD_DIALOG,
+            modal=True,
+            show=False,
+            width=420,
+            height=230,
+            no_resize=True,
+            pos=[240, 180],
+        ):
+            dpg.add_text("Delete action log entries older than:")
+            dpg.add_combo(
+                items=["30 days", "90 days", "180 days", "365 days"],
+                default_value="90 days",
+                width=140,
+                tag="clear_old_age",
+            )
+            dpg.add_spacer(height=8)
+            dpg.add_checkbox(
+                label="Only delete entries already undone",
+                default_value=True,
+                tag="clear_old_reversed_only",
+            )
+            dpg.add_spacer(height=10)
+            dpg.add_text("", tag="clear_old_preview", color=get_text_color("secondary"))
+            dpg.add_spacer(height=15)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Delete Entries", callback=self._confirm_clear_old)
+                dpg.add_button(label="Cancel", callback=lambda: dpg.configure_item(self.TAG_CLEAR_OLD_DIALOG, show=False))
+
+        # Quarantine browser panel
+        with dpg.window(
+            label="Quarantine Browser",
+            tag=self.TAG_QUARANTINE_PANEL,
+            modal=False,
+            show=False,
+            width=900,
+            height=500,
+            no_resize=False,
+            pos=[120, 120],
+        ):
+            dpg.add_text("Quarantine Items", color=get_accent_color())
+            dpg.add_spacer(height=5)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Refresh", callback=self._refresh_quarantine_panel)
+                dpg.add_button(label="Restore Selected", callback=self._restore_selected_quarantine)
+                dpg.add_button(label="Close", callback=lambda: dpg.configure_item(self.TAG_QUARANTINE_PANEL, show=False))
+            dpg.add_spacer(height=8)
+            with dpg.table(
+                tag=self.TAG_QUARANTINE_TABLE,
+                header_row=True,
+                borders_innerH=True,
+                borders_outerH=True,
+                borders_innerV=True,
+                borders_outerV=True,
+                resizable=True,
+                policy=dpg.mvTable_SizingStretchProp,
+                row_background=True,
+                scrollY=True,
+                height=380,
+            ):
+                dpg.add_table_column(label="", width_fixed=True, init_width_or_weight=30)
+                dpg.add_table_column(label="Time", width_fixed=True, init_width_or_weight=140)
+                dpg.add_table_column(label="Original Path", init_width_or_weight=280)
+                dpg.add_table_column(label="Quarantine Path", init_width_or_weight=260)
+                dpg.add_table_column(label="Size", width_fixed=True, init_width_or_weight=80)
+                dpg.add_table_column(label="Restore", width_fixed=True, init_width_or_weight=80)
+
     def _on_filter_type_change(self, sender, app_data, user_data) -> None:
         """Handle action type filter change."""
         type_map = {
@@ -334,7 +406,7 @@ class ActionLogPanel:
         self._current_page = 0
         self._refresh_log()
 
-    def _get_date_filter(self) -> tuple[Optional[datetime], Optional[datetime]]:
+    def _get_date_filter(self) -> tuple[datetime | None, datetime | None]:
         """Get start/end dates from filter selection."""
         now = datetime.now()
         if self._filter_date_range == "Today":
@@ -725,7 +797,7 @@ class ActionLogPanel:
             ".restore { color: #44ff44; }",
             "</style>",
             "</head><body>",
-            f"<h1>DupliCleaner Action Log</h1>",
+            "<h1>DupliCleaner Action Log</h1>",
             f"<p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>",
             f"<p>Total entries: {len(entries)}</p>",
             "<table>",
@@ -756,9 +828,8 @@ class ActionLogPanel:
         if not self.action_engine:
             return
 
-        stats = self.action_engine.get_quarantine_stats()
-        logger.info(f"Quarantine stats: {stats}")
-        # TODO: Could open a detailed quarantine browser panel
+        self._refresh_quarantine_panel()
+        dpg.configure_item(self.TAG_QUARANTINE_PANEL, show=True)
 
     def _on_browse_quarantine(self) -> None:
         """Open quarantine folder in file explorer."""
@@ -817,9 +888,77 @@ class ActionLogPanel:
             self._update_quarantine_stats()
 
     def _on_clear_old(self) -> None:
-        """Clear old log entries (placeholder for now)."""
-        # TODO: Implement dialog to select cutoff date
-        logger.info("Clear old entries not yet implemented")
+        """Open clear-old-entries dialog."""
+        dpg.set_value("clear_old_preview", "")
+        dpg.configure_item(self.TAG_CLEAR_OLD_DIALOG, show=True)
+
+    def _confirm_clear_old(self) -> None:
+        """Delete old action log entries based on dialog selection."""
+        age_value = dpg.get_value("clear_old_age")
+        reversed_only = bool(dpg.get_value("clear_old_reversed_only"))
+        days_map = {
+            "30 days": 30,
+            "90 days": 90,
+            "180 days": 180,
+            "365 days": 365,
+        }
+        days = days_map.get(age_value, 90)
+        cutoff = datetime.now() - timedelta(days=days)
+
+        deleted = self.db.delete_action_log_before(cutoff, only_reversed=reversed_only)
+        dpg.configure_item(self.TAG_CLEAR_OLD_DIALOG, show=False)
+        if self.on_status_update:
+            scope = "undone entries" if reversed_only else "all entries"
+            self.on_status_update(f"Deleted {deleted} {scope} older than {days} days.")
+        self._refresh_log()
+
+    def _refresh_quarantine_panel(self) -> None:
+        """Populate the quarantine browser table."""
+        if not dpg.does_item_exist(self.TAG_QUARANTINE_TABLE):
+            return
+
+        self._selected_ids.clear()
+
+        # Clear existing rows
+        for child in dpg.get_item_children(self.TAG_QUARANTINE_TABLE, 1):
+            dpg.delete_item(child)
+
+        entries = self.db.get_action_log(
+            action_type=ActionType.QUARANTINE,
+            reversed=False,
+            limit=100000,
+        )
+
+        for entry in entries:
+            if entry.id is None:
+                continue
+            with dpg.table_row(parent=self.TAG_QUARANTINE_TABLE):
+                dpg.add_checkbox(
+                    default_value=False,
+                    callback=lambda s, a, u: self._toggle_selection(u),
+                    user_data=entry.id,
+                )
+                dpg.add_text(format_timestamp(entry.timestamp))
+                dpg.add_text(entry.source_path)
+                dpg.add_text(entry.dest_path or "-")
+                dpg.add_text(format_size(entry.file_size))
+                if entry.reversible and not entry.reversed:
+                    dpg.add_button(
+                        label="Restore",
+                        small=True,
+                        callback=lambda s, a, u: self._on_undo_single(u),
+                        user_data=entry.id,
+                    )
+                else:
+                    dpg.add_text("-")
+
+    def _restore_selected_quarantine(self) -> None:
+        """Restore selected quarantine items using undo."""
+        if not self._selected_ids:
+            if self.on_status_update:
+                self.on_status_update("Select one or more quarantine entries to restore.")
+            return
+        self._on_undo_selected()
 
     def refresh(self) -> None:
         """Public method to refresh the panel."""

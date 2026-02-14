@@ -3,29 +3,32 @@
 Dear PyGui UI component for organizing photos into date/location-based folder structures.
 """
 
+import os
+import subprocess
 import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import dearpygui.dearpygui as dpg
 
 from duplicleaner.core.organizer import (
-    Organizer,
-    OrganizeSettings,
+    BurstHandling,
+    ConflictResolution,
+    DateFormat,
+    LivePhotoHandling,
     OrganizePreview,
     OrganizeProgress,
+    Organizer,
     OrganizeResult,
-    DateFormat,
+    OrganizeSettings,
     ScreenshotHandling,
-    BurstHandling,
-    LivePhotoHandling,
-    ConflictResolution,
     UndatedHandling,
 )
+from duplicleaner.ui.theme import get_accent_color, get_status_color, get_text_color
+from duplicleaner.ui.tooltips import ORGANIZE_TOOLTIPS, add_tooltip
 from duplicleaner.utils.logging import get_logger
-from duplicleaner.ui.tooltips import add_tooltip, ORGANIZE_TOOLTIPS
-from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
@@ -60,12 +63,13 @@ class OrganizePanel:
     TAG_EXPORT_DIALOG = "org_export_dialog"
     TAG_PREVIEW_BTN = "org_preview_btn"
     TAG_TEXTURE_REGISTRY = "org_texture_registry"
+    TAG_CONTEXT_MENU = "org_context_menu"
 
     def __init__(
         self,
         parent: int | str,
-        on_organize_complete: Optional[Callable[[list[OrganizeResult]], None]] = None,
-        on_status_update: Optional[Callable[[str], None]] = None,
+        on_organize_complete: Callable[[list[OrganizeResult]], None] | None = None,
+        on_status_update: Callable[[str], None] | None = None,
     ):
         """Initialize the organize panel.
 
@@ -78,10 +82,10 @@ class OrganizePanel:
         self.on_status_update = on_status_update
 
         # Organizer instance
-        self._organizer: Optional[Organizer] = None
-        self._organize_thread: Optional[threading.Thread] = None
-        self._preview_thread: Optional[threading.Thread] = None
-        self._current_preview: Optional[OrganizePreview] = None
+        self._organizer: Organizer | None = None
+        self._organize_thread: threading.Thread | None = None
+        self._preview_thread: threading.Thread | None = None
+        self._current_preview: OrganizePreview | None = None
         self._operation_in_progress = False
 
         # Settings
@@ -91,8 +95,15 @@ class OrganizePanel:
         self._texture_registry: dict[str, int | str] = {}
         self._thumbnail_registry: dict[str, Any] = {}
 
+        # Context menu state
+        self._context_menu_shown = False
+        self._context_menu_open_time = 0.0
+        self._ctx_source_path: str | None = None
+        self._preview_row_handler_registries: list[int | str] = []
+
         # Build UI
         self._build_ui()
+        self._create_context_menu()
 
     def _build_ui(self) -> None:
         """Build the panel UI."""
@@ -135,172 +146,188 @@ class OrganizePanel:
             dpg.add_spacer(height=10)
 
             # Settings collapsible section
-            with dpg.collapsing_header(label="Organization Settings", default_open=True):
-                with dpg.group(horizontal=True):
-                    # Left column - Folder structure
-                    with dpg.child_window(width=350, height=320, border=False):
-                        dpg.add_text("Folder Structure", color=get_accent_color())
-                        dpg.add_separator()
+            with (
+                dpg.collapsing_header(label="Organization Settings", default_open=True),
+                dpg.group(horizontal=True),
+            ):
+                # Left column - Folder structure
+                with dpg.child_window(width=350, height=320, border=False):
+                    dpg.add_text("Folder Structure", color=get_accent_color())
+                    dpg.add_separator()
 
-                        ctrl = dpg.add_combo(
-                            label="Date Format",
-                            items=["YYYY/MM", "YYYY/MM-Month", "YYYY/MM/DD", "YYYY/YYYY-MM-DD"],
-                            default_value="YYYY/MM-Month",
-                            callback=self._on_date_format_change,
-                            tag="org_date_format"
+                    ctrl = dpg.add_combo(
+                        label="Date Format",
+                        items=["YYYY/MM", "YYYY/MM-Month", "YYYY/MM/DD", "YYYY/YYYY-MM-DD"],
+                        default_value="YYYY/MM-Month",
+                        callback=self._on_date_format_change,
+                        tag="org_date_format"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["date_format"])
+
+                    ctrl = dpg.add_checkbox(
+                        label="Include Location in Folders",
+                        default_value=False,
+                        callback=self._on_location_toggle,
+                        tag="org_include_location"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["include_location"])
+
+                    ctrl = dpg.add_combo(
+                        label="Location Detail",
+                        items=["City Only", "City + Country", "City + State + Country"],
+                        default_value="City Only",
+                        callback=self._on_location_level_change,
+                        tag="org_location_level"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["location_level"])
+
+                    ctrl = dpg.add_checkbox(
+                        label="Event Clustering",
+                        default_value=False,
+                        callback=self._on_event_toggle,
+                        tag="org_event_clustering"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["event_clustering"])
+
+                    with dpg.group(horizontal=True):
+                        dpg.add_text("Event Gap (hours):")
+                        ctrl = dpg.add_input_int(
+                            default_value=4,
+                            min_value=1,
+                            max_value=48,
+                            width=100,
+                            callback=self._on_event_gap_change,
+                            tag="org_event_gap"
                         )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["date_format"])
+                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["event_gap"])
 
-                        ctrl = dpg.add_checkbox(
-                            label="Include Location in Folders",
-                            default_value=False,
-                            callback=self._on_location_toggle,
-                            tag="org_include_location"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["include_location"])
+                # Middle column - File naming
+                with dpg.child_window(width=350, height=320, border=False):
+                    dpg.add_text("File Naming", color=get_accent_color())
+                    dpg.add_separator()
 
-                        ctrl = dpg.add_combo(
-                            label="Location Detail",
-                            items=["City Only", "City + Country", "City + State + Country"],
-                            default_value="City Only",
-                            callback=self._on_location_level_change,
-                            tag="org_location_level"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["location_level"])
+                    ctrl = dpg.add_checkbox(
+                        label="Rename Files",
+                        default_value=True,
+                        callback=self._on_rename_toggle,
+                        tag="org_rename_files"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["rename_files"])
 
-                        ctrl = dpg.add_checkbox(
-                            label="Event Clustering",
-                            default_value=False,
-                            callback=self._on_event_toggle,
-                            tag="org_event_clustering"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["event_clustering"])
+                    ctrl = dpg.add_combo(
+                        label="Rename Pattern",
+                        items=[
+                            "{date}_{seq}",
+                            "{date}_{location}_{seq}",
+                            "{date}_{time}_{seq}",
+                            "{original}"
+                        ],
+                        default_value="{date}_{seq}",
+                        callback=self._on_pattern_change,
+                        tag="org_rename_pattern"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["rename_pattern"])
 
-                        with dpg.group(horizontal=True):
-                            dpg.add_text("Event Gap (hours):")
-                            ctrl = dpg.add_input_int(
-                                default_value=4,
-                                min_value=1,
-                                max_value=48,
-                                width=100,
-                                callback=self._on_event_gap_change,
-                                tag="org_event_gap"
-                            )
-                            add_tooltip(ctrl, ORGANIZE_TOOLTIPS["event_gap"])
+                    ctrl = dpg.add_combo(
+                        label="Conflict Resolution",
+                        items=["Add Sequence Number", "Add Timestamp", "Skip", "Overwrite if Identical"],
+                        default_value="Add Sequence Number",
+                        callback=self._on_conflict_change,
+                        tag="org_conflict"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["conflict_resolution"])
 
-                    # Middle column - File naming
-                    with dpg.child_window(width=350, height=320, border=False):
-                        dpg.add_text("File Naming", color=get_accent_color())
-                        dpg.add_separator()
+                # Right column - Special handling
+                with dpg.child_window(width=350, height=320, border=False):
+                    dpg.add_text("Special Handling", color=get_accent_color())
+                    dpg.add_separator()
 
-                        ctrl = dpg.add_checkbox(
-                            label="Rename Files",
-                            default_value=True,
-                            callback=self._on_rename_toggle,
-                            tag="org_rename_files"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["rename_files"])
+                    ctrl = dpg.add_combo(
+                        label="Screenshots",
+                        items=["Mix with Photos", "Separate Folder"],
+                        default_value="Separate Folder",
+                        callback=self._on_screenshot_change,
+                        tag="org_screenshots"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["screenshots"])
 
-                        ctrl = dpg.add_combo(
-                            label="Rename Pattern",
-                            items=[
-                                "{date}_{seq}",
-                                "{date}_{location}_{seq}",
-                                "{date}_{time}_{seq}",
-                                "{original}"
-                            ],
-                            default_value="{date}_{seq}",
-                            callback=self._on_pattern_change,
-                            tag="org_rename_pattern"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["rename_pattern"])
+                    ctrl = dpg.add_combo(
+                        label="Burst Photos",
+                        items=["Keep All", "Keep Best", "Subfolder", "Flag for Review"],
+                        default_value="Keep All",
+                        callback=self._on_burst_change,
+                        tag="org_bursts"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["bursts"])
 
-                        ctrl = dpg.add_combo(
-                            label="Conflict Resolution",
-                            items=["Add Sequence Number", "Add Timestamp", "Skip", "Overwrite if Identical"],
-                            default_value="Add Sequence Number",
-                            callback=self._on_conflict_change,
-                            tag="org_conflict"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["conflict_resolution"])
+                    ctrl = dpg.add_combo(
+                        label="Live Photos",
+                        items=["Keep Together", "Video Subfolder"],
+                        default_value="Keep Together",
+                        callback=self._on_livephoto_change,
+                        tag="org_livephotos"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["live_photos"])
 
-                    # Right column - Special handling
-                    with dpg.child_window(width=350, height=320, border=False):
-                        dpg.add_text("Special Handling", color=get_accent_color())
-                        dpg.add_separator()
+                    ctrl = dpg.add_checkbox(
+                        label="Match Live Photos across directories",
+                        default_value=False,
+                        callback=self._on_livephoto_change,
+                        tag="org_livephoto_cross_dir"
+                    )
+                    add_tooltip(ctrl, "Match photo+video pairs even if they are in different folders. Slower but catches separated Live Photo pairs.")
 
-                        ctrl = dpg.add_combo(
-                            label="Screenshots",
-                            items=["Mix with Photos", "Separate Folder"],
-                            default_value="Separate Folder",
-                            callback=self._on_screenshot_change,
-                            tag="org_screenshots"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["screenshots"])
+                    ctrl = dpg.add_combo(
+                        label="Undated Photos",
+                        items=["Undated Folder", "Use File Date", "Skip"],
+                        default_value="Undated Folder",
+                        callback=self._on_undated_change,
+                        tag="org_undated"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["undated"])
 
-                        ctrl = dpg.add_combo(
-                            label="Burst Photos",
-                            items=["Keep All", "Subfolder", "Flag for Review"],
-                            default_value="Keep All",
-                            callback=self._on_burst_change,
-                            tag="org_bursts"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["bursts"])
+                    dpg.add_spacer(height=10)
 
-                        ctrl = dpg.add_combo(
-                            label="Live Photos",
-                            items=["Keep Together", "Video Subfolder"],
-                            default_value="Keep Together",
-                            callback=self._on_livephoto_change,
-                            tag="org_livephotos"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["live_photos"])
+                    ctrl = dpg.add_checkbox(
+                        label="Move Files (uncheck to copy)",
+                        default_value=True,
+                        callback=self._on_move_toggle,
+                        tag="org_move_files"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["move_files"])
 
-                        ctrl = dpg.add_combo(
-                            label="Undated Photos",
-                            items=["Undated Folder", "Use File Date", "Skip"],
-                            default_value="Undated Folder",
-                            callback=self._on_undated_change,
-                            tag="org_undated"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["undated"])
+                    ctrl = dpg.add_checkbox(
+                        label="Dry Run (preview only)",
+                        default_value=False,
+                        callback=self._on_dryrun_toggle,
+                        tag="org_dry_run"
+                    )
+                    add_tooltip(ctrl, ORGANIZE_TOOLTIPS["dry_run"])
 
-                        dpg.add_spacer(height=10)
-
-                        ctrl = dpg.add_checkbox(
-                            label="Move Files (uncheck to copy)",
-                            default_value=True,
-                            callback=self._on_move_toggle,
-                            tag="org_move_files"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["move_files"])
-
-                        ctrl = dpg.add_checkbox(
-                            label="Dry Run (preview only)",
-                            default_value=False,
-                            callback=self._on_dryrun_toggle,
-                            tag="org_dry_run"
-                        )
-                        add_tooltip(ctrl, ORGANIZE_TOOLTIPS["dry_run"])
-
-                    # AI column - New
-                    with dpg.child_window(width=350, height=320, border=False):
-                        dpg.add_text("AI Analysis", color=get_accent_color())
-                        dpg.add_separator()
-                        ctrl = dpg.add_checkbox(
-                            label="Run Object Detection",
-                            default_value=False,
-                            callback=self._on_ai_settings_change,
-                            tag="org_run_object_detection"
-                        )
-                        add_tooltip(ctrl, "Analyzes image content to generate searchable tags (e.g., 'dog', 'car'). Can be slow.")
-                        ctrl = dpg.add_checkbox(
-                            label="Run Document Classification",
-                            default_value=False,
-                            callback=self._on_ai_settings_change,
-                            tag="org_run_doc_classification"
-                        )
-                        add_tooltip(ctrl, "Uses OCR to determine if an image is a document or a photo. Can be slow.")
+                # AI column - New
+                with dpg.child_window(width=350, height=320, border=False):
+                    dpg.add_text("AI Analysis", color=get_accent_color())
+                    dpg.add_separator()
+                    ctrl = dpg.add_checkbox(
+                        label="Run Object Detection",
+                        default_value=False,
+                        callback=self._on_ai_settings_change,
+                        tag="org_run_object_detection"
+                    )
+                    add_tooltip(
+                        ctrl,
+                        "Analyzes image content to generate searchable tags (e.g., 'dog', 'car'). Can be slow.",
+                    )
+                    ctrl = dpg.add_checkbox(
+                        label="Run Document Classification",
+                        default_value=False,
+                        callback=self._on_ai_settings_change,
+                        tag="org_run_doc_classification"
+                    )
+                    add_tooltip(
+                        ctrl,
+                        "Uses OCR to determine if an image is a document or a photo. Can be slow.",
+                    )
 
             dpg.add_spacer(height=10)
 
@@ -347,43 +374,50 @@ class OrganizePanel:
             dpg.add_spacer(height=5)
 
             with dpg.tab_bar(tag="org_preview_tab_bar"):
-                with dpg.tab(label="File List"):
+                with (
+                    dpg.tab(label="File List"),
+                    dpg.group(horizontal=True),
+                ):
                     # Two-column layout: folder tree and file list
-                    with dpg.group(horizontal=True):
-                        # Folder tree
-                        with dpg.child_window(width=300, height=400, border=True):
-                            dpg.add_text("Folders to Create", color=get_accent_color())
-                            dpg.add_separator()
-                            with dpg.tree_node(label="Organized Photos", tag=self.TAG_FOLDER_TREE, default_open=True):
-                                dpg.add_text("Run preview to see folder structure", color=get_text_color("disabled"))
+                    # Folder tree
+                    with dpg.child_window(width=300, height=400, border=True):
+                        dpg.add_text("Folders to Create", color=get_accent_color())
+                        dpg.add_separator()
+                        with dpg.tree_node(label="Organized Photos", tag=self.TAG_FOLDER_TREE, default_open=True):
+                            dpg.add_text("Run preview to see folder structure", color=get_text_color("disabled"))
 
-                        # File list table
-                        with dpg.child_window(width=-1, height=400, border=True):
-                            dpg.add_text("Files to Organize", color=get_accent_color())
-                            dpg.add_separator()
-                            with dpg.table(
-                                tag=self.TAG_PREVIEW_TABLE,
-                                header_row=True,
-                                borders_innerH=True,
-                                borders_outerH=True,
-                                borders_innerV=True,
-                                borders_outerV=True,
-                                resizable=True,
-                                policy=dpg.mvTable_SizingStretchProp,
-                                row_background=True,
-                                scrollY=True,
-                                height=350,
-                            ):
-                                dpg.add_table_column(label="Source", init_width_or_weight=200)
-                                dpg.add_table_column(label="Destination", init_width_or_weight=300)
-                                dpg.add_table_column(label="Date", init_width_or_weight=50)
-                                dpg.add_table_column(label="Location", init_width_or_weight=80)
-                                dpg.add_table_column(label="Burst", init_width_or_weight=50)
-                                dpg.add_table_column(label="Live", init_width_or_weight=40)
-                
-                with dpg.tab(label="Image Gallery"):
-                    with dpg.child_window(tag=self.TAG_PREVIEW_GALLERY, width=-1, height=400):
-                        dpg.add_text("Run preview with AI analysis to see image gallery.", color=get_text_color("disabled"))
+                    # File list table
+                    with dpg.child_window(width=-1, height=400, border=True):
+                        dpg.add_text("Files to Organize", color=get_accent_color())
+                        dpg.add_separator()
+                        with dpg.table(
+                            tag=self.TAG_PREVIEW_TABLE,
+                            header_row=True,
+                            borders_innerH=True,
+                            borders_outerH=True,
+                            borders_innerV=True,
+                            borders_outerV=True,
+                            resizable=True,
+                            policy=dpg.mvTable_SizingStretchProp,
+                            row_background=True,
+                            scrollY=True,
+                            height=350,
+                        ):
+                            dpg.add_table_column(label="Source", init_width_or_weight=200)
+                            dpg.add_table_column(label="Destination", init_width_or_weight=300)
+                            dpg.add_table_column(label="Date", init_width_or_weight=50)
+                            dpg.add_table_column(label="Location", init_width_or_weight=80)
+                            dpg.add_table_column(label="Burst", init_width_or_weight=50)
+                            dpg.add_table_column(label="Live", init_width_or_weight=40)
+
+                with (
+                    dpg.tab(label="Image Gallery"),
+                    dpg.child_window(tag=self.TAG_PREVIEW_GALLERY, width=-1, height=400),
+                ):
+                    dpg.add_text(
+                        "Run preview with AI analysis to see image gallery.",
+                        color=get_text_color("disabled"),
+                    )
 
 
         # File dialogs
@@ -515,6 +549,7 @@ class OrganizePanel:
         # Burst handling
         burst_map = {
             "Keep All": BurstHandling.KEEP_ALL,
+            "Keep Best": BurstHandling.KEEP_BEST,
             "Subfolder": BurstHandling.SUBFOLDER,
             "Flag for Review": BurstHandling.FLAG,
         }
@@ -530,6 +565,7 @@ class OrganizePanel:
         self._settings.live_photo_handling = livephoto_map.get(
             dpg.get_value("org_livephotos"), LivePhotoHandling.KEEP_TOGETHER
         )
+        self._settings.live_photo_cross_directory = dpg.get_value("org_livephoto_cross_dir")
 
         # Undated
         undated_map = {
@@ -729,13 +765,22 @@ class OrganizePanel:
                 count = value.get('__count__', 0)
                 label = f"{key} ({count} files)" if count else key
 
-                if any(k != '__count__' for k in value.keys()):
+                if any(k != '__count__' for k in value):
                     with dpg.tree_node(label=label, parent=parent, default_open=False):
                         add_tree_nodes(dpg.last_item(), value, full_path)
                 else:
                     dpg.add_text(f"  {label}", parent=parent)
 
         add_tree_nodes(self.TAG_FOLDER_TREE, folder_tree)
+
+        # Clean up old handler registries
+        for hr in self._preview_row_handler_registries:
+            try:
+                if dpg.does_item_exist(hr):
+                    dpg.delete_item(hr)
+            except Exception:
+                pass
+        self._preview_row_handler_registries.clear()
 
         # Update file list table
         dpg.delete_item(self.TAG_PREVIEW_TABLE, children_only=True, slot=1)
@@ -747,7 +792,19 @@ class OrganizePanel:
         # Add first 500 files to table
         for change in preview.changes[:500]:
             with dpg.table_row(parent=self.TAG_PREVIEW_TABLE):
-                dpg.add_text(Path(change.source_path).name)
+                # Source filename with right-click context menu
+                fname_sel = dpg.add_selectable(
+                    label=Path(change.source_path).name,
+                    span_columns=False,
+                )
+                with dpg.item_handler_registry() as hr:
+                    dpg.add_item_clicked_handler(
+                        button=dpg.mvMouseButton_Right,
+                        callback=self._on_preview_row_right_click,
+                        user_data=change.source_path,
+                    )
+                dpg.bind_item_handler_registry(fname_sel, hr)
+                self._preview_row_handler_registries.append(hr)
                 dpg.add_text(change.dest_path)
                 dpg.add_text(change.date_source or "")
                 dpg.add_text(change.location or "")
@@ -783,7 +840,7 @@ class OrganizePanel:
         dpg.delete_item(self.TAG_PREVIEW_GALLERY, children_only=True)
 
         # Unload previous textures
-        for path, texture_id in self._texture_registry.items():
+        for _path, texture_id in self._texture_registry.items():
             if dpg.does_item_exist(texture_id):
                 dpg.delete_item(texture_id)
         self._texture_registry.clear()
@@ -813,6 +870,10 @@ class OrganizePanel:
                         dpg.add_text(Path(change.source_path).name, wrap=400)
                         if change.is_document:
                             dpg.add_text("Type: Document", color=get_status_color("info"))
+                        else:
+                            ext = Path(change.source_path).suffix.lower()
+                            if ext in Organizer.VIDEO_FILE_TYPES:
+                                dpg.add_text("Type: Video (frame)", color=get_status_color("info"))
                         if change.ai_tags:
                             dpg.add_text(f"Tags: {', '.join(change.ai_tags)}", wrap=400)
                         dpg.add_text(f"-> {change.dest_path}", wrap=400, color=get_text_color("disabled"))
@@ -1034,6 +1095,95 @@ class OrganizePanel:
         self._current_preview = None
         dpg.configure_item(self.TAG_PROGRESS_GROUP, show=False)
         dpg.configure_item("org_export_btn", enabled=False)
+
+    # ------------------------------------------------------------------
+    # Context menu
+    # ------------------------------------------------------------------
+
+    def _create_context_menu(self) -> None:
+        """Create right-click context menu for preview table rows."""
+        with dpg.window(
+            tag=self.TAG_CONTEXT_MENU,
+            show=False,
+            no_title_bar=True,
+            no_resize=True,
+            no_move=True,
+            no_scrollbar=True,
+            autosize=True,
+        ):
+            dpg.add_selectable(label="Open Source File", callback=self._ctx_open_source)
+            dpg.add_selectable(label="Show in Explorer", callback=self._ctx_show_in_explorer)
+            dpg.add_separator()
+            dpg.add_selectable(label="Copy Source Path", callback=self._ctx_copy_path)
+
+        with dpg.handler_registry():
+            dpg.add_mouse_click_handler(callback=self._on_dismiss_context_menu)
+
+    def _on_preview_row_right_click(self, sender=None, app_data=None, user_data=None) -> None:
+        """Show context menu on right-click of a preview row."""
+        import time
+
+        if user_data is not None:
+            self._ctx_source_path = user_data
+        mouse_pos = dpg.get_mouse_pos(local=False)
+        dpg.configure_item(
+            self.TAG_CONTEXT_MENU,
+            show=True,
+            pos=[int(mouse_pos[0]), int(mouse_pos[1])],
+        )
+        self._context_menu_shown = True
+        self._context_menu_open_time = time.time()
+
+    def _on_dismiss_context_menu(self, sender=None, app_data=None) -> None:
+        """Hide context menu on left-click outside."""
+        import time
+
+        if not self._context_menu_shown:
+            return
+        if time.time() - self._context_menu_open_time < 0.15:
+            return
+        try:
+            if dpg.is_item_hovered(self.TAG_CONTEXT_MENU):
+                return
+        except (KeyError, SystemError):
+            pass
+        dpg.configure_item(self.TAG_CONTEXT_MENU, show=False)
+        self._context_menu_shown = False
+
+    def _hide_context_menu(self) -> None:
+        dpg.configure_item(self.TAG_CONTEXT_MENU, show=False)
+        self._context_menu_shown = False
+
+    def _ctx_open_source(self, sender=None, app_data=None) -> None:
+        self._hide_context_menu()
+        if not self._ctx_source_path:
+            return
+        try:
+            if os.path.exists(self._ctx_source_path):
+                os.startfile(self._ctx_source_path)
+        except Exception as exc:
+            logger.error(f"Failed to open file: {exc}")
+
+    def _ctx_show_in_explorer(self, sender=None, app_data=None) -> None:
+        self._hide_context_menu()
+        if not self._ctx_source_path:
+            return
+        try:
+            if os.path.exists(self._ctx_source_path):
+                subprocess.Popen(["explorer", "/select,", self._ctx_source_path])
+        except Exception as exc:
+            logger.error(f"Failed to open explorer: {exc}")
+
+    def _ctx_copy_path(self, sender=None, app_data=None) -> None:
+        self._hide_context_menu()
+        if not self._ctx_source_path:
+            return
+        try:
+            subprocess.run(["clip"], input=self._ctx_source_path.encode(), check=True)
+            if self.on_status_update:
+                self.on_status_update(f"Copied: {self._ctx_source_path}")
+        except Exception as exc:
+            logger.error(f"Failed to copy path: {exc}")
 
     def destroy(self) -> None:
         """Clean up resources."""

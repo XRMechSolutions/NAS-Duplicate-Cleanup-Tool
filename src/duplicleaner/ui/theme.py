@@ -4,8 +4,8 @@ Provides light and dark theme definitions with modern styling.
 Themes can be switched at runtime.
 """
 
+import contextlib
 from dataclasses import dataclass
-from typing import Optional
 
 import dearpygui.dearpygui as dpg
 
@@ -315,7 +315,7 @@ class ThemeManager:
 
     def __init__(self) -> None:
         self._current_theme: str = "dark"
-        self._theme_id: Optional[int] = None
+        self._theme_id: int | None = None
         self._colors: ThemeColors = DARK_COLORS
         self._styles: ThemeStyles = DEFAULT_STYLES
 
@@ -349,16 +349,13 @@ class ThemeManager:
 
         # Delete old theme if it exists
         if self._theme_id is not None:
-            try:
+            with contextlib.suppress(Exception):
                 dpg.delete_item(self._theme_id)
-            except Exception:
-                pass
 
         # Create new theme
-        with dpg.theme() as self._theme_id:
-            with dpg.theme_component(dpg.mvAll):
-                self._apply_colors()
-                self._apply_styles()
+        with dpg.theme() as self._theme_id, dpg.theme_component(dpg.mvAll):
+            self._apply_colors()
+            self._apply_styles()
 
         dpg.bind_theme(self._theme_id)
         logger.info(f"Applied {theme_name} theme")
@@ -371,11 +368,9 @@ class ThemeManager:
             if not hasattr(dpg, name):
                 return
             theme_col = getattr(dpg, name)
-            try:
+            # Some DearPyGui versions may not support certain colors/categories.
+            with contextlib.suppress(Exception):
                 dpg.add_theme_color(theme_col, color, category=category)
-            except Exception:
-                # Some DearPyGui versions may not support certain colors/categories.
-                pass
 
         # Window backgrounds
         safe_add_theme_color("mvThemeCol_WindowBg", c.window_bg[:3], dpg.mvThemeCat_Core)
@@ -529,7 +524,7 @@ class ThemeManager:
 
 
 # Global theme manager instance
-_theme_manager: Optional[ThemeManager] = None
+_theme_manager: ThemeManager | None = None
 
 
 def get_theme_manager() -> ThemeManager:

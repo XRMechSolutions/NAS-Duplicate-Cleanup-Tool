@@ -8,25 +8,27 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
 
 import dearpygui.dearpygui as dpg
 
 try:
-    from PIL import Image
     import numpy as np
+    from PIL import Image, ImageOps
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
 
+import contextlib
+
 from duplicleaner.ai.scenes import SceneClassifier, SearchResult
 from duplicleaner.db.database import get_database
 from duplicleaner.db.models import FileRecord
+from duplicleaner.ui.theme import get_accent_color, get_status_color, get_text_color
 from duplicleaner.utils.logging import get_logger
-from duplicleaner.ui.theme import get_status_color, get_accent_color, get_text_color
 
 logger = get_logger(__name__)
 
@@ -37,9 +39,9 @@ class SearchItem:
     file_id: int
     file_path: str
     source: str
-    similarity: Optional[float] = None
-    categories: Optional[dict[str, float]] = None
-    file: Optional[FileRecord] = None
+    similarity: float | None = None
+    categories: dict[str, float] | None = None
+    file: FileRecord | None = None
 
 
 class SearchPanel:
@@ -53,18 +55,24 @@ class SearchPanel:
     TAG_FILTER_DATE_FROM = "search_filter_date_from"
     TAG_FILTER_DATE_TO = "search_filter_date_to"
     TAG_FILTER_PERSON = "search_filter_person"
+    TAG_FILTER_FAMILY = "search_filter_family"
     TAG_ENABLE_SEMANTIC = "search_enable_semantic"
     TAG_ENABLE_TEXT = "search_enable_text"
     TAG_LIMIT = "search_limit"
     TAG_SORT_BY = "search_sort_by"
+    TAG_CORPUS_DIALOG = "corpus_analysis_dialog"
+    TAG_CORPUS_FOLDER = "corpus_folder_input"
+    TAG_CORPUS_RESULTS = "corpus_results_container"
+    TAG_CORPUS_STATUS = "corpus_status_text"
     TAG_RESULTS_CONTAINER = "search_results_container"
     TAG_PREVIEW_DIALOG = "search_preview_dialog"
     TAG_PREVIEW_IMAGE = "search_preview_image"
     TAG_PREVIEW_INFO = "search_preview_info"
     TAG_TEXTURE_REGISTRY = "search_texture_registry"
+    TAG_CONTEXT_MENU = "search_context_menu"
 
     # Image file extensions for preview
-    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.heic', '.heif'}
 
     # Thumbnail size for results list
     THUMBNAIL_SIZE = 60
@@ -79,14 +87,14 @@ class SearchPanel:
     TAG_SEARCH_BUTTON = "search_search_button"
     TAG_CLEAR_BUTTON = "search_clear_button"
 
-    def __init__(self, parent: int | str, on_status_update: Optional[Callable[[str], None]] = None):
+    def __init__(self, parent: int | str, on_status_update: Callable[[str], None] | None = None):
         """Initialize search panel."""
         self.parent = parent
         self.db = get_database()
         self.on_status_update = on_status_update
 
-        self._scene_classifier: Optional[SceneClassifier] = None
-        self._search_thread: Optional[threading.Thread] = None
+        self._scene_classifier: SceneClassifier | None = None
+        self._search_thread: threading.Thread | None = None
 
         # Current results and state
         self._current_results: list[SearchItem] = []
@@ -97,11 +105,18 @@ class SearchPanel:
         self._texture_cache: dict[str, str] = {}
         self._texture_lru: list[str] = []  # Track access order for LRU eviction
         self._texture_counter = 0
-        self._preview_texture_tag: Optional[str] = None
-        self._preview_file_path: Optional[str] = None
+        self._preview_texture_tag: str | None = None
+        self._preview_file_path: str | None = None
 
         # Operation state
         self._search_in_progress = False
+
+        # Context menu state
+        self._context_menu_shown = False
+        self._context_menu_open_time = 0.0
+        self._ctx_file_id: int | None = None
+        self._ctx_file_path: str | None = None
+        self._result_handler_registries: list[int | str] = []
 
         self._build_ui()
 
@@ -176,6 +191,9 @@ class SearchPanel:
                 dpg.add_spacer(width=10)
                 dpg.add_text("Person:")
                 dpg.add_input_text(tag=self.TAG_FILTER_PERSON, hint="Name contains...", width=160)
+                dpg.add_spacer(width=10)
+                dpg.add_text("Family:")
+                dpg.add_combo(tag=self.TAG_FILTER_FAMILY, items=["(any)"], default_value="(any)", width=140, callback=self._on_family_filter_change)
 
             dpg.add_spacer(height=10)
 
@@ -185,6 +203,10 @@ class SearchPanel:
                 dpg.add_spacer(width=20)
                 dpg.add_button(label="Select All", callback=self._select_all_results, small=True)
                 dpg.add_button(label="Select None", callback=self._deselect_all_results, small=True)
+                dpg.add_spacer(width=10)
+                dpg.add_button(label="Export Results", callback=self._on_export_results, small=True)
+                dpg.add_spacer(width=10)
+                dpg.add_button(label="Corpus Analysis", callback=self._on_open_corpus_analysis, small=True)
 
             dpg.add_spacer(height=5)
 
@@ -198,8 +220,29 @@ class SearchPanel:
 
         # Create preview dialog
         self._create_preview_dialog()
+        self._create_corpus_dialog()
 
-    def _set_status(self, message: str, color: Optional[tuple[int, int, int]] = None) -> None:
+        # Context menu
+        with dpg.window(
+            tag=self.TAG_CONTEXT_MENU,
+            show=False,
+            no_title_bar=True,
+            no_resize=True,
+            no_move=True,
+            no_scrollbar=True,
+            autosize=True,
+        ):
+            dpg.add_selectable(label="Preview", callback=self._ctx_preview)
+            dpg.add_selectable(label="Open File", callback=self._ctx_open_file)
+            dpg.add_selectable(label="Show in Explorer", callback=self._ctx_show_in_explorer)
+            dpg.add_separator()
+            dpg.add_selectable(label="Copy Path", callback=self._ctx_copy_path)
+
+        # Dismiss handler
+        with dpg.handler_registry():
+            dpg.add_mouse_click_handler(callback=self._on_dismiss_context_menu)
+
+    def _set_status(self, message: str, color: tuple[int, int, int] | None = None) -> None:
         """Update status text."""
         dpg.split_frame()
         if color:
@@ -212,6 +255,7 @@ class SearchPanel:
         dpg.set_value(self.TAG_FILTER_PERSON, "")
         dpg.set_value(self.TAG_FILTER_DATE_FROM, "")
         dpg.set_value(self.TAG_FILTER_DATE_TO, "")
+        dpg.set_value(self.TAG_FILTER_FAMILY, "(any)")
         self._current_results = []
         self._selected_result_ids.clear()
         self._result_checkbox_tags.clear()
@@ -220,6 +264,15 @@ class SearchPanel:
 
     def _clear_results(self) -> None:
         """Clear results container."""
+        # Clean up handler registries
+        for hr in self._result_handler_registries:
+            try:
+                if dpg.does_item_exist(hr):
+                    dpg.delete_item(hr)
+            except Exception:
+                pass
+        self._result_handler_registries.clear()
+
         children = dpg.get_item_children(self.TAG_RESULTS_CONTAINER, slot=1)
         if children:
             for child in children:
@@ -353,15 +406,21 @@ class SearchPanel:
         return "+".join(sorted(sources))
 
     def _apply_filters(self, results: list[SearchItem]) -> list[SearchItem]:
-        """Apply type, date, and person filters."""
+        """Apply type, date, person, and family group filters."""
         filter_type = dpg.get_value(self.TAG_FILTER_TYPE)
         date_from = self._parse_date(dpg.get_value(self.TAG_FILTER_DATE_FROM))
         date_to = self._parse_date(dpg.get_value(self.TAG_FILTER_DATE_TO))
         person_query = dpg.get_value(self.TAG_FILTER_PERSON).strip().lower()
+        family_filter = dpg.get_value(self.TAG_FILTER_FAMILY)
 
-        person_file_ids: Optional[set[int]] = None
+        person_file_ids: set[int] | None = None
         if person_query:
             person_file_ids = self._get_files_for_person_query(person_query)
+
+        # Family group filter
+        family_file_ids: set[int] | None = None
+        if family_filter and family_filter != "(any)":
+            family_file_ids = self._get_files_for_family_group(family_filter)
 
         filtered = []
         for item in results:
@@ -376,6 +435,9 @@ class SearchPanel:
                 continue
 
             if person_file_ids is not None and file_record.id not in person_file_ids:
+                continue
+
+            if family_file_ids is not None and file_record.id not in family_file_ids:
                 continue
 
             filtered.append(item)
@@ -398,8 +460,8 @@ class SearchPanel:
     def _passes_date_filter(
         self,
         file_record: FileRecord,
-        date_from: Optional[datetime],
-        date_to: Optional[datetime],
+        date_from: datetime | None,
+        date_to: datetime | None,
     ) -> bool:
         if not date_from and not date_to:
             return True
@@ -410,10 +472,7 @@ class SearchPanel:
 
         if date_from and file_date < date_from:
             return False
-        if date_to and file_date > date_to:
-            return False
-
-        return True
+        return not (date_to and file_date > date_to)
 
     def _get_files_for_person_query(self, query: str) -> set[int]:
         matches = [p for p in self.db.get_all_persons(named_only=True) if p.name and query in p.name.lower()]
@@ -427,6 +486,26 @@ class SearchPanel:
                 file_ids.add(face.file_id)
 
         return file_ids
+
+    def _get_files_for_family_group(self, group_name: str) -> set[int]:
+        """Get all file IDs containing faces of any member of the named family group."""
+        groups = self.db.get_all_family_groups()
+        group = next((g for g in groups if g.name == group_name), None)
+        if not group or group.id is None:
+            return set()
+        return set(self.db.get_family_group_file_ids(group.id))
+
+    def _on_family_filter_change(self, sender=None, app_data=None) -> None:
+        """Re-run search when family filter changes."""
+        if self._current_results:
+            self._on_search()
+
+    def refresh_family_groups(self) -> None:
+        """Refresh the family group combo items from the database."""
+        groups = self.db.get_all_family_groups()
+        names = ["(any)"] + [g.name for g in groups]
+        if dpg.does_item_exist(self.TAG_FILTER_FAMILY):
+            dpg.configure_item(self.TAG_FILTER_FAMILY, items=names)
 
     def _apply_sort(self, results: list[SearchItem]) -> list[SearchItem]:
         """Apply sorting based on user selection."""
@@ -479,101 +558,116 @@ class SearchPanel:
             return
 
         # Card container with border
-        with dpg.child_window(
-            parent=self.TAG_RESULTS_CONTAINER,
-            height=90,
-            border=True,
-            no_scrollbar=True,
+        with (
+            dpg.child_window(
+                parent=self.TAG_RESULTS_CONTAINER,
+                height=90,
+                border=True,
+                no_scrollbar=True,
+            ),
+            dpg.group(horizontal=True),
         ):
-            with dpg.group(horizontal=True):
-                # Checkbox for selection
-                checkbox_tag = f"search_result_checkbox_{item.file_id}"
-                self._result_checkbox_tags[item.file_id] = checkbox_tag
-                dpg.add_checkbox(
-                    tag=checkbox_tag,
-                    default_value=item.file_id in self._selected_result_ids,
-                    callback=self._on_result_checkbox_toggled,
+            # Checkbox for selection
+            checkbox_tag = f"search_result_checkbox_{item.file_id}"
+            self._result_checkbox_tags[item.file_id] = checkbox_tag
+            dpg.add_checkbox(
+                tag=checkbox_tag,
+                default_value=item.file_id in self._selected_result_ids,
+                callback=self._on_result_checkbox_toggled,
+                user_data=item.file_id,
+            )
+
+            # Thumbnail preview (for images)
+            if self._is_image_file(item.file_path):
+                texture_tag = self._load_image_texture(item.file_path, size=self.THUMBNAIL_SIZE)
+                if texture_tag:
+                    dpg.add_image(
+                        texture_tag,
+                        width=self.THUMBNAIL_SIZE,
+                        height=self.THUMBNAIL_SIZE,
+                    )
+                else:
+                    # Placeholder for failed load
+                    with dpg.group():
+                        dpg.add_text("[Image]", color=get_text_color("disabled"))
+                        dpg.add_spacer(width=self.THUMBNAIL_SIZE - 40)
+            else:
+                # Non-image placeholder
+                with dpg.group():
+                    ext = Path(item.file_path).suffix.upper()
+                    dpg.add_text(ext if ext else "[File]", color=get_text_color("disabled"))
+                    dpg.add_spacer(width=self.THUMBNAIL_SIZE - 40)
+
+            dpg.add_spacer(width=10)
+
+            # File info column
+            with dpg.group():
+                # Filename (clickable for preview, right-click for context menu)
+                name = Path(item.file_path).name
+                display_name = name[:45] + "..." if len(name) > 45 else name
+                fname_sel = dpg.add_selectable(
+                    label=display_name,
+                    callback=lambda s, a, u: self._show_preview(u),
                     user_data=item.file_id,
+                    span_columns=False,
+                )
+                with dpg.item_handler_registry() as hr:
+                    dpg.add_item_clicked_handler(
+                        button=dpg.mvMouseButton_Right,
+                        callback=self._on_result_right_click,
+                        user_data=(item.file_id, item.file_path),
+                    )
+                dpg.bind_item_handler_registry(fname_sel, hr)
+                self._result_handler_registries.append(hr)
+
+                # Size and date
+                size_str = self._format_size(file.size)
+                date_str = file.modified.strftime('%Y-%m-%d %H:%M') if file.modified else "Unknown date"
+                dpg.add_text(f"{size_str}  |  {date_str}", color=get_text_color("disabled"))
+
+                # Source and score
+                score_str = f"  |  Score: {item.similarity:.3f}" if item.similarity is not None else ""
+                dpg.add_text(f"Source: {item.source}{score_str}", color=get_text_color("secondary"))
+
+                # Categories if available
+                if item.categories:
+                    cats = self._format_categories(item.categories)
+                    if cats:
+                        dpg.add_text(
+                            cats[:60] + "..." if len(cats) > 60 else cats,
+                            color=get_text_color("secondary"),
+                            wrap=250,
+                        )
+
+            dpg.add_spacer(width=20)
+
+            # Action buttons column
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Preview",
+                    callback=lambda s, a, u: self._show_preview(u),
+                    user_data=item.file_id,
+                    width=65,
+                    small=True,
+                )
+                dpg.add_button(
+                    label="Open",
+                    callback=lambda s, a, u: self._open_file(u),
+                    user_data=item.file_path,
+                    width=50,
+                    small=True,
+                )
+                dpg.add_button(
+                    label="Explorer",
+                    callback=lambda s, a, u: self._open_in_explorer(u),
+                    user_data=item.file_path,
+                    width=65,
+                    small=True,
                 )
 
-                # Thumbnail preview (for images)
-                if self._is_image_file(item.file_path):
-                    texture_tag = self._load_image_texture(item.file_path, size=self.THUMBNAIL_SIZE)
-                    if texture_tag:
-                        dpg.add_image(
-                            texture_tag,
-                            width=self.THUMBNAIL_SIZE,
-                            height=self.THUMBNAIL_SIZE,
-                        )
-                    else:
-                        # Placeholder for failed load
-                        with dpg.group():
-                            dpg.add_text("[Image]", color=get_text_color("disabled"))
-                            dpg.add_spacer(width=self.THUMBNAIL_SIZE - 40)
-                else:
-                    # Non-image placeholder
-                    with dpg.group():
-                        ext = Path(item.file_path).suffix.upper()
-                        dpg.add_text(ext if ext else "[File]", color=get_text_color("disabled"))
-                        dpg.add_spacer(width=self.THUMBNAIL_SIZE - 40)
 
-                dpg.add_spacer(width=10)
 
-                # File info column
-                with dpg.group():
-                    # Filename (clickable for preview)
-                    name = Path(item.file_path).name
-                    display_name = name[:45] + "..." if len(name) > 45 else name
-                    dpg.add_selectable(
-                        label=display_name,
-                        callback=lambda s, a, u: self._show_preview(u),
-                        user_data=item.file_id,
-                        span_columns=False,
-                    )
-
-                    # Size and date
-                    size_str = self._format_size(file.size)
-                    date_str = file.modified.strftime('%Y-%m-%d %H:%M') if file.modified else "Unknown date"
-                    dpg.add_text(f"{size_str}  |  {date_str}", color=get_text_color("disabled"))
-
-                    # Source and score
-                    score_str = f"  |  Score: {item.similarity:.3f}" if item.similarity is not None else ""
-                    dpg.add_text(f"Source: {item.source}{score_str}", color=get_text_color("secondary"))
-
-                dpg.add_spacer(width=20)
-
-                # Action buttons column
-                with dpg.group():
-                    with dpg.group(horizontal=True):
-                        dpg.add_button(
-                            label="Preview",
-                            callback=lambda s, a, u: self._show_preview(u),
-                            user_data=item.file_id,
-                            width=65,
-                            small=True,
-                        )
-                        dpg.add_button(
-                            label="Open",
-                            callback=lambda s, a, u: self._open_file(u),
-                            user_data=item.file_path,
-                            width=50,
-                            small=True,
-                        )
-                        dpg.add_button(
-                            label="Explorer",
-                            callback=lambda s, a, u: self._open_in_explorer(u),
-                            user_data=item.file_path,
-                            width=65,
-                            small=True,
-                        )
-
-                    # Categories if available
-                    if item.categories:
-                        cats = self._format_categories(item.categories)
-                        if cats:
-                            dpg.add_text(cats[:60] + "..." if len(cats) > 60 else cats, color=get_text_color("secondary"), wrap=250)
-
-    def _format_categories(self, categories: Optional[dict[str, float]]) -> str:
+    def _format_categories(self, categories: dict[str, float] | None) -> str:
         if not categories:
             return ""
 
@@ -596,7 +690,7 @@ class SearchPanel:
         ext = Path(file_path).suffix.lower()
         return ext in self.IMAGE_EXTENSIONS
 
-    def _load_image_texture(self, file_path: str, size: int = None) -> Optional[str]:
+    def _load_image_texture(self, file_path: str, size: int = None) -> str | None:
         """Load an image file as a Dear PyGui texture.
 
         Args:
@@ -626,6 +720,7 @@ class SearchPanel:
         try:
             # Load and resize image
             img = Image.open(file_path)
+            img = ImageOps.exif_transpose(img)
             img.thumbnail((size, size), Image.Resampling.LANCZOS)
 
             # Convert to RGBA
@@ -809,10 +904,8 @@ class SearchPanel:
 
         # Clean up previous preview texture
         if self._preview_texture_tag and dpg.does_item_exist(self._preview_texture_tag):
-            try:
+            with contextlib.suppress(Exception):
                 dpg.delete_item(self._preview_texture_tag)
-            except Exception:
-                pass
             self._preview_texture_tag = None
 
         # Load preview image
@@ -848,13 +941,14 @@ class SearchPanel:
         self._center_dialog(self.TAG_PREVIEW_DIALOG, 650, 600)
         dpg.show_item(self.TAG_PREVIEW_DIALOG)
 
-    def _load_preview_image(self, file_path: str) -> Optional[str]:
+    def _load_preview_image(self, file_path: str) -> str | None:
         """Load a larger preview image for the dialog."""
         if not HAS_PIL or not os.path.exists(file_path):
             return None
 
         try:
             img = Image.open(file_path)
+            img = ImageOps.exif_transpose(img)
             img.thumbnail((self.PREVIEW_SIZE, self.PREVIEW_SIZE), Image.Resampling.LANCZOS)
 
             if img.mode != 'RGBA':
@@ -891,7 +985,7 @@ class SearchPanel:
         if self._preview_file_path:
             self._open_in_explorer(self._preview_file_path)
 
-    def _parse_date(self, value: str) -> Optional[datetime]:
+    def _parse_date(self, value: str) -> datetime | None:
         text = (value or "").strip()
         if not text:
             return None
@@ -919,6 +1013,70 @@ class SearchPanel:
         self._clear_results()
         self._set_status("Ready to search.", color=get_text_color("disabled"))
 
+    # ------------------------------------------------------------------
+    # Context menu
+    # ------------------------------------------------------------------
+
+    def _on_result_right_click(self, sender=None, app_data=None, user_data=None) -> None:
+        """Show context menu on right-click of a result."""
+        import time
+
+        if user_data:
+            self._ctx_file_id, self._ctx_file_path = user_data
+        mouse_pos = dpg.get_mouse_pos(local=False)
+        dpg.configure_item(
+            self.TAG_CONTEXT_MENU,
+            show=True,
+            pos=[int(mouse_pos[0]), int(mouse_pos[1])],
+        )
+        self._context_menu_shown = True
+        self._context_menu_open_time = time.time()
+
+    def _on_dismiss_context_menu(self, sender=None, app_data=None) -> None:
+        """Hide context menu on left-click outside."""
+        import time
+
+        if not self._context_menu_shown:
+            return
+        if time.time() - self._context_menu_open_time < 0.15:
+            return
+        try:
+            if dpg.is_item_hovered(self.TAG_CONTEXT_MENU):
+                return
+        except (KeyError, SystemError):
+            pass
+        dpg.configure_item(self.TAG_CONTEXT_MENU, show=False)
+        self._context_menu_shown = False
+
+    def _hide_context_menu(self) -> None:
+        dpg.configure_item(self.TAG_CONTEXT_MENU, show=False)
+        self._context_menu_shown = False
+
+    def _ctx_preview(self, sender=None, app_data=None) -> None:
+        self._hide_context_menu()
+        if self._ctx_file_id is not None:
+            self._show_preview(self._ctx_file_id)
+
+    def _ctx_open_file(self, sender=None, app_data=None) -> None:
+        self._hide_context_menu()
+        if self._ctx_file_path:
+            self._open_file(self._ctx_file_path)
+
+    def _ctx_show_in_explorer(self, sender=None, app_data=None) -> None:
+        self._hide_context_menu()
+        if self._ctx_file_path:
+            self._open_in_explorer(self._ctx_file_path)
+
+    def _ctx_copy_path(self, sender=None, app_data=None) -> None:
+        self._hide_context_menu()
+        if not self._ctx_file_path:
+            return
+        try:
+            subprocess.run(["clip"], input=self._ctx_file_path.encode(), check=True)
+            self._notify_status(f"Copied: {self._ctx_file_path}")
+        except Exception as exc:
+            logger.error(f"Failed to copy path: {exc}")
+
     def cleanup(self) -> None:
         """Clean up resources (textures, threads, etc.)."""
         # Wait for search thread to finish (with timeout)
@@ -942,15 +1100,298 @@ class SearchPanel:
 
         # Clean up preview texture
         if self._preview_texture_tag and dpg.does_item_exist(self._preview_texture_tag):
-            try:
+            with contextlib.suppress(Exception):
                 dpg.delete_item(self._preview_texture_tag)
-            except Exception:
-                pass
             self._preview_texture_tag = None
 
         # Delete texture registry
         if dpg.does_item_exist(self.TAG_TEXTURE_REGISTRY):
-            try:
+            with contextlib.suppress(Exception):
                 dpg.delete_item(self.TAG_TEXTURE_REGISTRY)
-            except Exception:
-                pass
+
+    # --- Export ---
+
+    def _on_export_results(self) -> None:
+        """Export current search results to CSV."""
+        from duplicleaner.utils.export_manager import (
+            export_csv,
+            format_size,
+            get_default_export_dir,
+            get_timestamped_filename,
+        )
+
+        if not self._current_results:
+            if self.on_status_update:
+                self.on_status_update("No search results to export.")
+            return
+
+        query = dpg.get_value(self.TAG_QUERY) if dpg.does_item_exist(self.TAG_QUERY) else ""
+        export_dir = get_default_export_dir()
+        filepath = export_dir / get_timestamped_filename("search_results", "csv")
+
+        rows = []
+        for item in self._current_results:
+            f = item.file
+            rows.append({
+                "file_id": item.file_id,
+                "file_path": item.file_path,
+                "source": item.source,
+                "similarity": f"{item.similarity:.3f}" if item.similarity is not None else "",
+                "filename": f.filename if f else "",
+                "size": f.size if f else 0,
+                "size_human": format_size(f.size) if f else "",
+                "file_type": f.file_type if f else "",
+                "modified": str(f.modified) if f and f.modified else "",
+            })
+
+        count = export_csv(rows, filepath)
+        msg = f"Exported {count} search results (query: '{query}') to {filepath}"
+        logger.info(msg)
+        if self.on_status_update:
+            self.on_status_update(msg)
+
+    # --- Corpus Analysis ---
+
+    def _create_corpus_dialog(self) -> None:
+        """Create the corpus analysis dialog."""
+        with dpg.window(
+            tag=self.TAG_CORPUS_DIALOG,
+            label="Document Corpus Analysis",
+            modal=False,
+            show=False,
+            width=800,
+            height=600,
+            no_resize=False,
+        ):
+            dpg.add_text("Corpus Analysis", color=get_accent_color())
+            dpg.add_text(
+                "Analyze term frequency, entities, and patterns across your document collection.",
+                color=get_text_color("secondary"), wrap=760,
+            )
+            dpg.add_separator()
+            dpg.add_spacer(height=5)
+
+            with dpg.group(horizontal=True):
+                dpg.add_text("Folder filter (optional):")
+                dpg.add_input_text(
+                    tag=self.TAG_CORPUS_FOLDER,
+                    hint="Leave empty for all documents",
+                    width=400,
+                )
+
+            dpg.add_spacer(height=5)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Run Analysis", callback=self._on_run_corpus_analysis)
+                dpg.add_button(label="Export Report", callback=self._on_export_corpus)
+                dpg.add_text("", tag=self.TAG_CORPUS_STATUS, color=get_text_color("disabled"))
+
+            dpg.add_spacer(height=10)
+
+            # Results area with tabs
+            with dpg.tab_bar(tag="corpus_tab_bar"):
+                with dpg.tab(label="Top Terms (TF-IDF)"):
+                    with dpg.child_window(height=380, border=True, tag="corpus_terms_container"):
+                        dpg.add_text("Run analysis to see results.", color=get_text_color("disabled"))
+
+                with dpg.tab(label="Phrases"):
+                    with dpg.child_window(height=380, border=True, tag="corpus_phrases_container"):
+                        dpg.add_text("Run analysis to see results.", color=get_text_color("disabled"))
+
+                with dpg.tab(label="Entities"):
+                    with dpg.child_window(height=380, border=True, tag="corpus_entities_container"):
+                        dpg.add_text("Run analysis to see results.", color=get_text_color("disabled"))
+
+                with dpg.tab(label="Co-Occurrences"):
+                    with dpg.child_window(height=380, border=True, tag="corpus_cooc_container"):
+                        dpg.add_text("Run analysis to see results.", color=get_text_color("disabled"))
+
+    def _on_open_corpus_analysis(self) -> None:
+        """Open the corpus analysis dialog."""
+        dpg.configure_item(self.TAG_CORPUS_DIALOG, show=True)
+
+    def _on_run_corpus_analysis(self) -> None:
+        """Run corpus analysis on documents in the database."""
+        from duplicleaner.ai.corpus_analyzer import CorpusAnalyzer, gather_corpus_documents
+
+        folder = dpg.get_value(self.TAG_CORPUS_FOLDER).strip() or None
+        dpg.set_value(self.TAG_CORPUS_STATUS, "Gathering documents...")
+
+        documents = gather_corpus_documents(self.db, folder_path=folder)
+        if not documents:
+            dpg.set_value(self.TAG_CORPUS_STATUS, "No documents with text found.")
+            return
+
+        dpg.set_value(self.TAG_CORPUS_STATUS, f"Analyzing {len(documents)} documents...")
+
+        analyzer = CorpusAnalyzer()
+        self._corpus_report = analyzer.analyze_corpus(documents, include_entities=True)
+
+        # Also try communication network
+        self._corpus_report.communication_edges = analyzer.build_communication_network(documents)
+
+        dpg.set_value(
+            self.TAG_CORPUS_STATUS,
+            f"Done: {self._corpus_report.total_documents} docs, "
+            f"{self._corpus_report.total_words:,} words, "
+            f"{len(self._corpus_report.entities)} entities",
+        )
+
+        self._populate_corpus_results()
+
+    def _populate_corpus_results(self) -> None:
+        """Populate the corpus analysis results tabs."""
+        report = self._corpus_report
+
+        # Terms tab
+        self._clear_container("corpus_terms_container")
+        if report.top_terms:
+            with dpg.table(
+                parent="corpus_terms_container",
+                header_row=True,
+                borders_innerH=True, borders_outerH=True,
+                borders_innerV=True, borders_outerV=True,
+                resizable=True, policy=dpg.mvTable_SizingStretchProp,
+                row_background=True, scrollY=True, height=350,
+            ):
+                dpg.add_table_column(label="Term", init_width_or_weight=150)
+                dpg.add_table_column(label="Count", init_width_or_weight=80)
+                dpg.add_table_column(label="Documents", init_width_or_weight=80)
+                dpg.add_table_column(label="TF-IDF", init_width_or_weight=100)
+
+                for t in report.top_terms[:100]:
+                    with dpg.table_row():
+                        dpg.add_text(t.term)
+                        dpg.add_text(f"{t.count:,}")
+                        dpg.add_text(f"{t.doc_count:,}")
+                        dpg.add_text(f"{t.tf_idf:.6f}")
+
+        # Phrases tab
+        self._clear_container("corpus_phrases_container")
+        all_phrases = report.top_bigrams + report.top_trigrams
+        all_phrases.sort(key=lambda x: x.count, reverse=True)
+        if all_phrases:
+            with dpg.table(
+                parent="corpus_phrases_container",
+                header_row=True,
+                borders_innerH=True, borders_outerH=True,
+                borders_innerV=True, borders_outerV=True,
+                resizable=True, policy=dpg.mvTable_SizingStretchProp,
+                row_background=True, scrollY=True, height=350,
+            ):
+                dpg.add_table_column(label="Phrase", init_width_or_weight=250)
+                dpg.add_table_column(label="Count", init_width_or_weight=80)
+                dpg.add_table_column(label="Documents", init_width_or_weight=80)
+
+                for p in all_phrases[:100]:
+                    with dpg.table_row():
+                        dpg.add_text(p.phrase)
+                        dpg.add_text(f"{p.count:,}")
+                        dpg.add_text(f"{p.doc_count:,}")
+
+        # Entities tab
+        self._clear_container("corpus_entities_container")
+        if report.entities:
+            with dpg.table(
+                parent="corpus_entities_container",
+                header_row=True,
+                borders_innerH=True, borders_outerH=True,
+                borders_innerV=True, borders_outerV=True,
+                resizable=True, policy=dpg.mvTable_SizingStretchProp,
+                row_background=True, scrollY=True, height=350,
+            ):
+                dpg.add_table_column(label="Entity", init_width_or_weight=200)
+                dpg.add_table_column(label="Type", init_width_or_weight=100)
+                dpg.add_table_column(label="Count", init_width_or_weight=80)
+                dpg.add_table_column(label="Documents", init_width_or_weight=80)
+
+                for e in report.entities[:100]:
+                    with dpg.table_row():
+                        dpg.add_text(e.text)
+                        dpg.add_text(e.entity_type)
+                        dpg.add_text(f"{e.count:,}")
+                        dpg.add_text(f"{len(e.source_file_ids):,}")
+        else:
+            dpg.add_text("No entities found. Install spaCy for NER: pip install spacy && python -m spacy download en_core_web_sm",
+                         parent="corpus_entities_container", wrap=700, color=get_text_color("disabled"))
+
+        # Co-occurrences tab
+        self._clear_container("corpus_cooc_container")
+        if report.co_occurrences:
+            with dpg.table(
+                parent="corpus_cooc_container",
+                header_row=True,
+                borders_innerH=True, borders_outerH=True,
+                borders_innerV=True, borders_outerV=True,
+                resizable=True, policy=dpg.mvTable_SizingStretchProp,
+                row_background=True, scrollY=True, height=350,
+            ):
+                dpg.add_table_column(label="Entity A", init_width_or_weight=200)
+                dpg.add_table_column(label="Entity B", init_width_or_weight=200)
+                dpg.add_table_column(label="Co-occurrences", init_width_or_weight=100)
+
+                for c in report.co_occurrences[:100]:
+                    with dpg.table_row():
+                        dpg.add_text(c.entity_a)
+                        dpg.add_text(c.entity_b)
+                        dpg.add_text(f"{c.count:,}")
+
+    def _clear_container(self, tag: str) -> None:
+        """Clear all children from a container."""
+        children = dpg.get_item_children(tag, slot=1)
+        if children:
+            for child in children:
+                dpg.delete_item(child)
+
+    def _on_export_corpus(self) -> None:
+        """Export corpus analysis report."""
+        from duplicleaner.utils.export_manager import (
+            export_csv,
+            get_default_export_dir,
+            get_timestamped_filename,
+        )
+
+        report = getattr(self, "_corpus_report", None)
+        if not report:
+            if self.on_status_update:
+                self.on_status_update("No corpus analysis to export. Run analysis first.")
+            return
+
+        export_dir = get_default_export_dir()
+
+        # Export terms
+        if report.top_terms:
+            filepath = export_dir / get_timestamped_filename("corpus_terms", "csv")
+            rows = [{
+                "term": t.term,
+                "count": t.count,
+                "doc_count": t.doc_count,
+                "tf_idf": f"{t.tf_idf:.6f}",
+            } for t in report.top_terms]
+            export_csv(rows, filepath)
+
+        # Export entities
+        if report.entities:
+            filepath = export_dir / get_timestamped_filename("corpus_entities", "csv")
+            rows = [{
+                "entity": e.text,
+                "type": e.entity_type,
+                "count": e.count,
+                "doc_count": len(e.source_file_ids),
+            } for e in report.entities]
+            export_csv(rows, filepath)
+
+        # Export phrases
+        all_phrases = report.top_bigrams + report.top_trigrams
+        if all_phrases:
+            filepath = export_dir / get_timestamped_filename("corpus_phrases", "csv")
+            rows = [{
+                "phrase": p.phrase,
+                "count": p.count,
+                "doc_count": p.doc_count,
+            } for p in sorted(all_phrases, key=lambda x: x.count, reverse=True)]
+            export_csv(rows, filepath)
+
+        msg = f"Corpus analysis exported to {export_dir}"
+        logger.info(msg)
+        if self.on_status_update:
+            self.on_status_update(msg)
